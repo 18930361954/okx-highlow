@@ -11,11 +11,22 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from scripts.backtest import DEFAULT_CONFIG, load_csv, simulate  # noqa: E402
+
+
+def _load_config(path: Path | None) -> dict:
+    """优先从 config.yaml 读；找不到就 fallback 到 backtest 的 DEFAULT_CONFIG。"""
+    if path is None:
+        path = ROOT / "config.yaml"
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    return DEFAULT_CONFIG
 
 
 def main():
@@ -24,6 +35,12 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--window", type=int, default=30)
     ap.add_argument("--step", type=int, default=7)
+    ap.add_argument("--config", default=None,
+                    help="config.yaml 路径；默认项目根 config.yaml。传 'default' 强制走 backtest DEFAULT_CONFIG")
+    ap.add_argument("--float-pct", type=float, default=None,
+                    help="临时覆盖 float_pct（pair_overrides 里的也一并覆盖），用于 A/B 对比")
+    ap.add_argument("--reentry-floats", default=None,
+                    help='逗号分隔的浮动列表如 "0.002,0.005,0.008"，启用日内重挂')
     args = ap.parse_args()
 
     if args.csv:
@@ -36,6 +53,27 @@ def main():
         print(f"[err] CSV not found: {csv_path}")
         sys.exit(1)
 
+    # 加载 config
+    if args.config == "default":
+        cfg = DEFAULT_CONFIG
+    else:
+        cfg_path = Path(args.config) if args.config else None
+        cfg = _load_config(cfg_path)
+
+    # 临时覆盖 float_pct（同时清掉 pair_overrides 里的 float_pct 以免冲突）
+    if args.float_pct is not None:
+        cfg = {**cfg, "strategy": {**cfg["strategy"], "float_pct": args.float_pct}}
+        # 清理 pair_overrides.float_pct 避免覆盖回去
+        ov = dict(cfg["strategy"].get("pair_overrides") or {})
+        for p, po in ov.items():
+            if "float_pct" in po:
+                ov[p] = {k: v for k, v in po.items() if k != "float_pct"}
+        cfg["strategy"]["pair_overrides"] = ov
+
+    reentry = None
+    if args.reentry_floats:
+        reentry = [float(x) for x in args.reentry_floats.split(",")]
+
     df = load_csv(csv_path)
     dates = sorted(df["date"].unique())
     n = len(dates)
@@ -44,6 +82,15 @@ def main():
         print(f"[err] not enough days ({n})")
         sys.exit(1)
 
+    # 显示实际用到的关键参数（对每 pair 唯一有效值）
+    strat_cfg = cfg["strategy"]
+    ov_for_pair = (strat_cfg.get("pair_overrides") or {}).get(args.pair, {})
+    eff_float = ov_for_pair.get("float_pct", strat_cfg["float_pct"])
+    eff_sl = ov_for_pair.get("sl_pct", strat_cfg["sl_pct"])
+    eff_tp = ov_for_pair.get("tp_pct", strat_cfg["tp_pct"])
+    print(f"[config] {args.pair}  float={eff_float*100:g}%  sl={eff_sl*100:g}%  tp={eff_tp*100:g}%"
+          + (f"  reentry={reentry}" if reentry else ""))
+
     results: list[dict] = []
     for start in range(0, n - args.window, args.step):
         end = start + args.window
@@ -51,7 +98,7 @@ def main():
         sub_df = df[df["date"].isin(sub_dates)].reset_index(drop=True)
         if len(sub_df) < args.window * 20:
             continue
-        res = simulate(sub_df, args.pair, DEFAULT_CONFIG)
+        res = simulate(sub_df, args.pair, cfg, reentry_floats=reentry)
         results.append({
             "from": str(dates[start]),
             "to": str(dates[end]),

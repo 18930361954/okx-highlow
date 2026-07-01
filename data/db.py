@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_time TEXT,
     exit_time TEXT,
     okx_order_id TEXT,
+    attempt INTEGER DEFAULT 1,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -57,6 +58,10 @@ class DB:
             c.execute(_SCHEMA_STATE)
             c.execute(_INDEX_TRADES_DATE)
             c.execute(_INDEX_TRADES_PAIR)
+            # 迁移：既有库补 attempt 列
+            cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
+            if "attempt" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN attempt INTEGER DEFAULT 1")
 
     def insert_trade(
         self,
@@ -72,15 +77,16 @@ class DB:
         entry_time: str | None = None,
         exit_time: str | None = None,
         okx_order_id: str | None = None,
+        attempt: int = 1,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO trades
                 (signal_date, pair, side, entry_price, exit_price, exit_reason,
-                 margin, mode, pnl, entry_time, exit_time, okx_order_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (signal_date, pair, side, entry_price, exit_price, exit_reason,
-                 margin, mode, pnl, entry_time, exit_time, okx_order_id),
+                 margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
             )
             return int(cur.lastrowid)
 

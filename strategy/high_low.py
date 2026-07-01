@@ -56,6 +56,77 @@ class HighLowStrategy:
             float(ov.get("sl_pct", self.sl_pct)),
         )
 
+    def _float_for(self, pair: str) -> float:
+        ov = self.pair_overrides.get(pair) or {}
+        return float(ov.get("float_pct", self.float_pct))
+
+    def reentry_floats_for(self, pair: str) -> list[float]:
+        """pair 的日内重挂浮动序列。若无配置或为空 → 返回 []（不启用重挂）。
+        序列长度即最大入场次数（含第 1 次）。例如 [0.0015, 0.006] 表示：
+        第 1 次挂单用 0.15%，若 SL 后第 2 次用 0.6%。"""
+        ov = self.pair_overrides.get(pair) or {}
+        seq = ov.get("reentry_floats") or []
+        return [float(x) for x in seq]
+
+    def compute_reentry_signal(
+        self,
+        pair: str,
+        direction: str,
+        day_candles_so_far: list,
+        attempt: int,
+        signal_date: date | str | None = None,
+    ) -> dict | None:
+        """日内重挂：用"当日日初到现在"的 K 线段计算新的入场价。
+        - direction: 沿用前日方向（'long'/'short'），不重判
+        - day_candles_so_far: 今日 UTC 已发生的 1H K 列表（含或不含 partial 当前根均可，只用 high/low）
+        - attempt: 本次是第几次入场（1-indexed；attempt=2 用 reentry_floats[1]）
+        返回 {'pair','direction','entry_price','tp_price','sl_price','signal_date','reason'} 或 None
+        """
+        seq = self.reentry_floats_for(pair)
+        if not seq or attempt < 1 or attempt > len(seq):
+            return None
+        if not day_candles_so_far:
+            return None
+
+        normed = [_normalize_candle(c) for c in day_candles_so_far]
+        day_high = max(c["high"] for c in normed)
+        day_low = min(c["low"] for c in normed)
+
+        fp = seq[attempt - 1]
+        tp_pct, sl_pct = self._tp_sl_for(pair)
+
+        if direction == "long":
+            entry_price = round(day_low * (1 - fp), 6)
+            tp_price = round(entry_price * (1 + tp_pct), 6)
+            sl_price = round(entry_price * (1 - sl_pct), 6)
+            reason = (f"日内重挂#{attempt} fp={fp} low_so_far={day_low} "
+                      f"挂多 @ {entry_price}")
+        elif direction == "short":
+            entry_price = round(day_high * (1 + fp), 6)
+            tp_price = round(entry_price * (1 - tp_pct), 6)
+            sl_price = round(entry_price * (1 + sl_pct), 6)
+            reason = (f"日内重挂#{attempt} fp={fp} high_so_far={day_high} "
+                      f"挂空 @ {entry_price}")
+        else:
+            return None
+
+        sd = signal_date.isoformat() if isinstance(signal_date, date) else (signal_date or "")
+
+        return {
+            "pair": pair,
+            "direction": direction,
+            "entry_price": entry_price,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "day_open": None,
+            "day_close": None,
+            "day_high": day_high,
+            "day_low": day_low,
+            "signal_date": sd,
+            "reason": reason,
+            "attempt": attempt,
+        }
+
     def compute_signal(
         self,
         pair: str,
@@ -88,19 +159,20 @@ class HighLowStrategy:
             direction = direction
 
         tp_pct, sl_pct = self._tp_sl_for(pair)
+        float_pct = self._float_for(pair)
 
         if direction == "long":
-            entry_price = round(day_low * (1 - self.float_pct), 6)
+            entry_price = round(day_low * (1 - float_pct), 6)
             tp_price = round(entry_price * (1 + tp_pct), 6)
             sl_price = round(entry_price * (1 - sl_pct), 6)
             reason = (f"day阳 open={day_open} close={day_close} low={day_low} "
-                      f"挂多 @ {entry_price} (low×{1 - self.float_pct})")
+                      f"挂多 @ {entry_price} (low×{1 - float_pct})")
         else:
-            entry_price = round(day_high * (1 + self.float_pct), 6)
+            entry_price = round(day_high * (1 + float_pct), 6)
             tp_price = round(entry_price * (1 - tp_pct), 6)
             sl_price = round(entry_price * (1 + sl_pct), 6)
             reason = (f"day阴 open={day_open} close={day_close} high={day_high} "
-                      f"挂空 @ {entry_price} (high×{1 + self.float_pct})")
+                      f"挂空 @ {entry_price} (high×{1 + float_pct})")
 
         sd = signal_date.isoformat() if isinstance(signal_date, date) else (signal_date or "")
 

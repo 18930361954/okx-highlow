@@ -69,6 +69,7 @@ class OrderManager:
         margin: float,
         leverage: int,
         td_mode: str | None = None,
+        attempt: int = 1,
     ) -> str | None:
         pair = signal["pair"]
         direction = signal["direction"]
@@ -90,11 +91,11 @@ class OrderManager:
         else:
             order_px = round(entry_price * (1 - SLIP_PCT), 6)
 
-        # 幂等键：pair+signal_date+direction 唯一。OKX 保证同 clOrdId 不重复建单。
+        # 幂等键：pair+signal_date+direction+attempt 唯一。OKX 保证同 clOrdId 不重复建单。
         # 只允许字母数字/-/_/.，最长 32 字符。BTC-USDT-SWAP → BTC；ETH-USDT-SWAP → ETH。
         coin = pair.split("-")[0]  # 如 BTC / ETH
         sd = signal.get("signal_date", "").replace("-", "")  # 20260630
-        algo_cl_ord_id = f"hl{coin}{sd}{direction[0]}"[:32]  # 如 hlBTC20260630s
+        algo_cl_ord_id = f"hl{coin}{sd}{direction[0]}{attempt}"[:32]  # 如 hlBTC20260630s1
 
         if self.logger:
             self.logger.info(
@@ -154,6 +155,7 @@ class OrderManager:
             mode="FIXED" if margin >= 1000 else "PCT",
             okx_order_id=algo_id,
             entry_time=None,
+            attempt=attempt,
         )
         return algo_id
 

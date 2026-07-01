@@ -27,7 +27,7 @@ def test_place_uses_deterministic_algo_cl_ord_id(tmp_path):
     om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
     _, kw1 = okx.place_algo_order.call_args
     assert "algoClOrdId" in kw1
-    assert kw1["algoClOrdId"] == "hlBTC20260629l"
+    assert kw1["algoClOrdId"] == "hlBTC20260629l1"  # 末尾是 attempt 编号
     assert len(kw1["algoClOrdId"]) <= 32
 
     # 同参数第二次调用 → 同 clOrdId（OKX 服务端会拒第二次）

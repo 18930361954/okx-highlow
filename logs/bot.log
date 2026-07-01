@@ -15,3 +15,52 @@
 2026-07-01 10:44:34 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
 2026-07-01 11:14:21 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
 2026-07-01 11:14:21 [INFO] hl-bot: [shutdown] bye
+2026-07-01 11:23:16 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 11:23:16 [INFO] hl-bot: [init] balance bootstrapped from OKX: 25464.72 USDT
+2026-07-01 11:23:16 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 11:23:17 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 11:23:17 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
+2026-07-01 11:23:17 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 11:23:17 [INFO] hl-bot: [signal] day阴 open=59628.4 close=58920.0 high=59777.3 挂空 @ 59866.96595 (high×1.0015)
+2026-07-01 11:23:18 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 11:23:18 [INFO] hl-bot: [order] place algo BTC-USDT-SWAP dir=short entry=59866.96595 orderPx=59837.032467 tp=59148.562359 sl=60166.30078 margin=2546.47 lev=100 sz=425 mode=cross clOrdId=hlBTC20260630s
+2026-07-01 11:23:19 [WARNING] hl-bot: OKX error code=1 msg= endpoint=/api/v5/trade/order-algo
+2026-07-01 11:23:19 [ERROR] hl-bot: place_algo_order BTC-USDT-SWAP failed: OKX error code=1 msg= endpoint=/api/v5/trade/order-algo
+2026-07-01 11:23:19 [ERROR] hl-bot: [order] BTC-USDT-SWAP place_algo_orders returned no id
+2026-07-01 11:23:19 [INFO] hl-bot: [signal] day阴 open=1586.49 close=1582.5 high=1601.18 挂空 @ 1603.58177 (high×1.0015)
+2026-07-01 11:23:19 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 11:23:19 [INFO] hl-bot: [order] place algo ETH-USDT-SWAP dir=short entry=1603.58177 orderPx=1602.779979 tp=1571.510135 sl=1619.617588 margin=2546.47 lev=100 sz=1587 mode=cross clOrdId=hlETH20260630s
+2026-07-01 11:23:20 [INFO] hl-bot: [order] ETH-USDT-SWAP algoId=3703530146046058496
+2026-07-01 11:23:20 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 11:51:06 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 11:51:07 [INFO] hl-bot: [shutdown] bye
+2026-07-01 12:16:25 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 12:16:25 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:16:25 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:16:25 [INFO] hl-bot: [catchup] ETH-USDT-SWAP 今日已处理（db 有记录），跳过
+2026-07-01 12:16:25 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP']
+2026-07-01 12:16:25 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 12:16:25 [WARNING] hl-bot: BTC-USDT-SWAP: no candles returned
+2026-07-01 12:16:25 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 12:16:25 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 12:16:25 [INFO] hl-bot: [shutdown] bye
+2026-07-01 12:24:45 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 12:24:45 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:24:45 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:24:45 [INFO] hl-bot: [catchup] ETH-USDT-SWAP 今日已处理（db 有记录），跳过
+2026-07-01 12:24:45 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP']
+2026-07-01 12:24:45 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 12:24:45 [WARNING] hl-bot: BTC-USDT-SWAP: no candles returned
+2026-07-01 12:24:45 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 12:24:45 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 12:24:45 [INFO] hl-bot: [shutdown] bye
+2026-07-01 12:24:57 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 12:24:57 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:24:57 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 12:24:57 [INFO] hl-bot: [catchup] ETH-USDT-SWAP 今日已处理（db 有记录），跳过
+2026-07-01 12:24:57 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP']
+2026-07-01 12:24:57 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 12:24:57 [WARNING] hl-bot: BTC-USDT-SWAP: no candles returned
+2026-07-01 12:24:57 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 12:24:57 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 12:24:57 [INFO] hl-bot: [shutdown] bye

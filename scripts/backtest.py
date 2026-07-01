@@ -46,6 +46,68 @@ def load_csv(path: Path) -> pd.DataFrame:
     return df
 
 
+def _simulate_one_entry(bars, direction: str, entry: float, tp: float, sl: float,
+                         start_idx: int = 0) -> tuple[float | None, str | None, object, int | None]:
+    """
+    从 bars[start_idx:] 开始，找到第一根 low<=entry (long) 或 high>=entry (short) 的 K；
+    确定 entry_idx 后，逐根判 TP/SL（同根双触发保守 → SL 优先）。
+    返回 (exit_price, exit_reason, exit_ts, entry_bar_idx)
+    exit_reason: 'TP' / 'SL' / 'EOD' / 'NO_ENTRY'
+    未触发入场：(None, 'NO_ENTRY', None, None)
+    """
+    entry_idx = None
+    for j in range(start_idx, len(bars)):
+        c = bars[j]
+        if direction == "long" and c.low <= entry:
+            entry_idx = j
+            break
+        if direction == "short" and c.high >= entry:
+            entry_idx = j
+            break
+    if entry_idx is None:
+        return None, "NO_ENTRY", None, None
+
+    exit_price = None
+    exit_reason = None
+    exit_ts = None
+    entry_bar = bars[entry_idx]
+    # 入场这根 K：同根 SL+TP 同时穿 → SL 优先
+    if direction == "long":
+        if entry_bar.low <= sl:
+            exit_price, exit_reason, exit_ts = sl, "SL", entry_bar.ts
+        elif entry_bar.high >= tp:
+            exit_price, exit_reason, exit_ts = tp, "TP", entry_bar.ts
+    else:
+        if entry_bar.high >= sl:
+            exit_price, exit_reason, exit_ts = sl, "SL", entry_bar.ts
+        elif entry_bar.low <= tp:
+            exit_price, exit_reason, exit_ts = tp, "TP", entry_bar.ts
+
+    if exit_price is None:
+        for c in bars[entry_idx + 1:]:
+            if direction == "long":
+                if c.low <= sl:
+                    exit_price, exit_reason, exit_ts = sl, "SL", c.ts
+                    break
+                if c.high >= tp:
+                    exit_price, exit_reason, exit_ts = tp, "TP", c.ts
+                    break
+            else:
+                if c.high >= sl:
+                    exit_price, exit_reason, exit_ts = sl, "SL", c.ts
+                    break
+                if c.low <= tp:
+                    exit_price, exit_reason, exit_ts = tp, "TP", c.ts
+                    break
+
+    if exit_price is None:
+        last = bars[-1]
+        exit_price = last.close
+        exit_reason = "EOD"
+        exit_ts = last.ts
+    return exit_price, exit_reason, exit_ts, entry_idx
+
+
 def simulate(
     df: pd.DataFrame,
     pair: str,
@@ -53,7 +115,15 @@ def simulate(
     initial_balance: float = 75.0,
     days: int | None = None,
     verbose: bool = False,
+    reentry_floats: list[float] | None = None,
 ) -> dict:
+    """
+    reentry_floats: 若为 None → 旧行为（每日只挂 1 单，用 config.float_pct）
+                    若为 list → 每日按顺序用这些浮动值最多尝试 N 次入场，
+                    前一次 SL 才继续；TP/EOD/NO_ENTRY 立即停。
+                    N 次全 SL → consec_losses += 1（触发原熔断机制）
+                    N 次中任意一次 TP/EOD/NO_ENTRY 归零/不动 consec_losses
+    """
     strat = HighLowStrategy(config)
     leverage = int(config["strategy"]["leverage"])
     position_pct = float(config["strategy"]["position_pct"])
@@ -61,6 +131,11 @@ def simulate(
     fixed_margin = float(config["strategy"]["fixed_mode_margin"])
     max_losses = int(config["strategy"]["max_consecutive_losses"])
     cooldown_hours = int(config["strategy"]["cooldown_hours"])
+
+    # pair 级 tp/sl 覆盖：跟 HighLowStrategy 一致的读取
+    ov = (config["strategy"].get("pair_overrides") or {}).get(pair, {})
+    tp_pct = float(ov.get("tp_pct", config["strategy"]["tp_pct"]))
+    sl_pct = float(ov.get("sl_pct", config["strategy"]["sl_pct"]))
 
     grouped = list(df.groupby("date"))
     if days:
@@ -97,111 +172,140 @@ def simulate(
         if not signal:
             continue
 
-        # 计算保证金
-        if fixed_locked or balance >= fixed_thr:
-            fixed_locked = True
-            margin = fixed_margin
-            mode = "FIXED"
-        else:
-            margin = balance * position_pct
-            mode = "PCT"
-
-        entry = signal["entry_price"]
-        tp = signal["tp_price"]
-        sl = signal["sl_price"]
         direction = signal["direction"]
+        # 用于日内重挂：需要"日内到 SL 时刻"的新高低点。而入场价公式在阴线用 high、阳线用 low。
+        # 前日 high/low：用 signal 里带的
+        prev_high = signal["day_high"]
+        prev_low = signal["day_low"]
 
-        # 在 next_day 的 1H 数据里看是否触发
-        touched_entry = False
-        entry_idx = None
-        for j, c in enumerate(next_day_df.itertuples()):
-            if direction == "long" and c.low <= entry:
-                touched_entry = True
-                entry_idx = j
-                break
-            if direction == "short" and c.high >= entry:
-                touched_entry = True
-                entry_idx = j
-                break
+        # 每一次的入场浮动列表：默认走旧行为（单次，float_pct 来自 signal 已内嵌）
+        floats_seq = reentry_floats if reentry_floats is not None else [float(config["strategy"]["float_pct"])]
 
-        if not touched_entry:
+        bars = list(next_day_df.itertuples())
+        if not bars:
             continue
 
-        # 入场那根 K：入场后这根 K 内 close 已先穿到哪一侧用 close 判断；
-        # 否则进入后续 K 线逐根判 TP/SL（同根内 TP+SL 同时穿 → SL 优先保守）。
-        exit_price = None
-        exit_reason = None
-        exit_ts = None
-        bars = list(next_day_df.itertuples())
-        entry_bar = bars[entry_idx]
-        # 入场这根 K 内：用 close 相对 entry 看朝哪边走，避免双触发歧义
-        if direction == "long":
-            if entry_bar.low <= sl:
-                exit_price, exit_reason, exit_ts = sl, "SL", entry_bar.ts
-            elif entry_bar.high >= tp:
-                exit_price, exit_reason, exit_ts = tp, "TP", entry_bar.ts
-        else:
-            if entry_bar.high >= sl:
-                exit_price, exit_reason, exit_ts = sl, "SL", entry_bar.ts
-            elif entry_bar.low <= tp:
-                exit_price, exit_reason, exit_ts = tp, "TP", entry_bar.ts
+        # 逐次尝试入场
+        attempt_idx = 0
+        search_from = 0  # 下一次入场从哪根 K 开始搜 —— 上一次 SL 那根 K 之后
+        day_sl_count = 0
+        day_had_non_sl = False  # 只要出现 TP / EOD / NO_ENTRY 就置 True，当日不再重挂
 
-        if exit_price is None:
-            for c in bars[entry_idx + 1:]:
+        for attempt_idx, fp in enumerate(floats_seq):
+            # 重新计算保证金（每次入场都按当前 balance 算 PCT / FIXED）
+            if fixed_locked or balance >= fixed_thr:
+                fixed_locked = True
+                margin = fixed_margin
+                mode = "FIXED"
+            else:
+                margin = balance * position_pct
+                mode = "PCT"
+
+            # 计算本次入场价
+            if attempt_idx == 0:
+                # 第 1 次：沿用旧口径 —— 用前日 high/low × float
                 if direction == "long":
-                    if c.low <= sl:
-                        exit_price, exit_reason, exit_ts = sl, "SL", c.ts
-                        break
-                    if c.high >= tp:
-                        exit_price, exit_reason, exit_ts = tp, "TP", c.ts
-                        break
+                    entry = round(prev_low * (1 - fp), 6)
                 else:
-                    if c.high >= sl:
-                        exit_price, exit_reason, exit_ts = sl, "SL", c.ts
+                    entry = round(prev_high * (1 + fp), 6)
+            else:
+                # 重挂：用"当日日初 → 上一次 SL 那根 K"这段的新高低点
+                # search_from 已在上一次 SL 时被更新为 SL 那根 K 的 index+1
+                # 但"日内高低点"要用 bars[0..sl_bar_idx]（含 SL 那根 K）
+                # 我们保留一个变量 sl_bar_idx 追踪
+                # 为简单 —— 这里直接用 bars[:search_from] 作为"到 SL 为止"
+                seg = bars[:search_from] if search_from > 0 else []
+                if not seg:
+                    break  # 理论上不会发生
+                day_high_so_far = max(b.high for b in seg)
+                day_low_so_far = min(b.low for b in seg)
+                if direction == "long":
+                    entry = round(day_low_so_far * (1 - fp), 6)
+                else:
+                    entry = round(day_high_so_far * (1 + fp), 6)
+
+            tp = round(entry * (1 + tp_pct), 6) if direction == "long" else round(entry * (1 - tp_pct), 6)
+            sl = round(entry * (1 - sl_pct), 6) if direction == "long" else round(entry * (1 + sl_pct), 6)
+
+            exit_price, exit_reason, exit_ts, entry_bar_idx = _simulate_one_entry(
+                bars, direction, entry, tp, sl, start_idx=search_from
+            )
+
+            if exit_reason == "NO_ENTRY":
+                # 挂了没被触发 —— 当日不再重挂
+                day_had_non_sl = True
+                break
+
+            # 记录本次 trade
+            if direction == "long":
+                pct = (exit_price - entry) / entry
+            else:
+                pct = (entry - exit_price) / entry
+            pnl = margin * leverage * pct
+            balance += pnl
+            peak = max(peak, balance)
+            dd = (peak - balance) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+
+            trades.append({
+                "signal_date": str(sig_date),
+                "trade_date": str(next_date),
+                "attempt": attempt_idx + 1,
+                "float_pct": fp,
+                "direction": direction,
+                "entry": entry, "exit": exit_price, "reason": exit_reason,
+                "margin": margin, "mode": mode, "pnl": pnl, "balance_after": balance,
+            })
+
+            if verbose:
+                print(f"{sig_date} #{attempt_idx+1} fp={fp} {direction} entry={entry} "
+                      f"exit={exit_price} ({exit_reason}) pnl={pnl:+.2f} bal={balance:.2f}")
+
+            if exit_reason == "SL":
+                day_sl_count += 1
+                # 找到 SL 那根 K 的 index —— exit_ts 就是它
+                sl_bar_idx = None
+                for k in range(entry_bar_idx, len(bars)):
+                    if bars[k].ts == exit_ts:
+                        sl_bar_idx = k
                         break
-                    if c.low <= tp:
-                        exit_price, exit_reason, exit_ts = tp, "TP", c.ts
-                        break
+                if sl_bar_idx is None:
+                    break
+                search_from = sl_bar_idx + 1
+                if search_from >= len(bars):
+                    # 当日已无后续 K —— 无法重挂
+                    break
+                # 继续下一次尝试
+                continue
+            else:
+                # TP 或 EOD → 收工
+                day_had_non_sl = True
+                break
 
-        if exit_price is None:
-            # 当日未触发 TP/SL → 用收盘价平
-            last = list(next_day_df.itertuples())[-1]
-            exit_price = last.close
-            exit_reason = "EOD"
-            exit_ts = last.ts
-
-        # PnL
-        if direction == "long":
-            pct = (exit_price - entry) / entry
+        # 熔断计数：本日全 SL 且尝试次数 = 配置的次数 → +1，否则归零（若有 TP）
+        if reentry_floats is not None:
+            attempts_used = day_sl_count + (1 if day_had_non_sl else 0)
+            if day_sl_count >= len(floats_seq) and not day_had_non_sl:
+                # N 连 SL
+                consec_losses += 1
+            elif trades and trades[-1]["signal_date"] == str(sig_date):
+                # 当日最后一笔是 TP → 归零；EOD 视为不亏不算连亏但也不清零
+                last_reason = trades[-1]["reason"]
+                if last_reason == "TP":
+                    consec_losses = 0
         else:
-            pct = (entry - exit_price) / entry
-        pnl = margin * leverage * pct
-        balance += pnl
+            # 旧行为：单笔即算
+            if trades and trades[-1]["signal_date"] == str(sig_date):
+                if trades[-1]["pnl"] < 0:
+                    consec_losses += 1
+                else:
+                    consec_losses = 0
 
-        peak = max(peak, balance)
-        dd = (peak - balance) / peak if peak > 0 else 0
-        max_dd = max(max_dd, dd)
-
-        trades.append({
-            "signal_date": str(sig_date),
-            "trade_date": str(next_date),
-            "direction": direction,
-            "entry": entry, "exit": exit_price, "reason": exit_reason,
-            "margin": margin, "mode": mode, "pnl": pnl, "balance_after": balance,
-        })
-
-        if pnl < 0:
-            consec_losses += 1
-        else:
-            consec_losses = 0
-
+        # 熔断触发：以 next_date 当日结束为基准 + cooldown_hours（回测粒度够用）
         if consec_losses >= max_losses:
-            cooldown_until_ts = pd.Timestamp(exit_ts).tz_convert(UTC) + pd.Timedelta(hours=cooldown_hours)
+            base_ts = pd.Timestamp(next_date, tz=UTC) + pd.Timedelta(days=1)
+            cooldown_until_ts = base_ts + pd.Timedelta(hours=cooldown_hours)
             consec_losses = 0
-
-        if verbose:
-            print(f"{sig_date} {direction} entry={entry} exit={exit_price} ({exit_reason}) "
-                  f"pnl={pnl:+.2f} bal={balance:.2f}")
 
     wins = sum(1 for t in trades if t["pnl"] > 0)
     losses = sum(1 for t in trades if t["pnl"] < 0)

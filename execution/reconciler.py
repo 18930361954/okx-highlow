@@ -5,7 +5,7 @@
 匹配 key：db.trades.okx_order_id 存的是主 algo 单的 algoId；OKX orders-history
 的每条普通订单都带 algoId 字段（触发后落地的入场单 & tp/sl 平仓单都指向同一 algoId）。
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 UTC = timezone.utc
@@ -63,12 +63,15 @@ def _infer_exit_reason(exit_order: dict) -> str:
 
 
 class Reconciler:
-    def __init__(self, okx_client, db, account_state, config: dict, logger=None):
+    def __init__(self, okx_client, db, account_state, config: dict, logger=None,
+                 strategy=None, order_manager=None):
         self.okx = okx_client
         self.db = db
         self.account = account_state
         self.config = config
         self.logger = logger
+        self.strategy = strategy         # 用于日内重挂计算入场价
+        self.order_manager = order_manager  # 用于挂重挂单
         self.pairs: list[str] = list(config["strategy"]["pairs"])
         self.leverage = int(config["strategy"]["leverage"])
 
@@ -187,18 +190,127 @@ class Reconciler:
                         exit_dt = None
                     self.account.on_trade_filled(pnl=pnl, exit_time=exit_dt)
                     processed += 1
+
+                    # 日内重挂：只有 SL 平仓 + pair 启用 reentry_floats + attempt<最大 + 当日 UTC 未跨天
+                    if reason == "SL":
+                        try:
+                            self._try_reentry(t, exit_dt)
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.error(
+                                    f"[reconcile] reentry after trade#{t.get('id')} failed: {e}"
+                                )
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"[reconcile] settle trade#{t.get('id')} failed: {e}")
 
         return processed
 
+    def _try_reentry(self, sl_trade: dict, sl_time: datetime | None) -> None:
+        """SL 平仓后决定是否日内重挂。前提：
+        - strategy 和 order_manager 都已注入
+        - pair 在 config 启用 reentry_floats
+        - 当日已入场次数 < len(reentry_floats)
+        - 当前 UTC 与该 signal_date 对应的"挂单日"是同一天（signal_date + 1）
+        - 账户未熔断
+        """
+        if not self.strategy or not self.order_manager:
+            return
+        pair = sl_trade.get("pair")
+        if not pair:
+            return
+        reentry_floats = self.strategy.reentry_floats_for(pair)
+        if len(reentry_floats) < 2:
+            return  # 未启用重挂
+
+        # 判定当日已入场几次（用 signal_date 分组）
+        sig_date = sl_trade.get("signal_date")
+        if not sig_date:
+            return
+        same_day = [x for x in self.db.list_trades_by_date(sig_date) if x.get("pair") == pair]
+        already = len(same_day)
+        if already >= len(reentry_floats):
+            return  # 已用完
+
+        # 确保还在"挂单日"：挂单日 UTC = signal_date + 1
+        # sl_time 若无就用 now
+        now = (sl_time or datetime.now(UTC)).astimezone(UTC)
+        try:
+            sig_dt = datetime.fromisoformat(sig_date).replace(tzinfo=UTC)
+        except ValueError:
+            return
+        trade_day_start = sig_dt + timedelta(days=1)
+        trade_day_end = trade_day_start + timedelta(days=1)
+        if not (trade_day_start <= now < trade_day_end):
+            if self.logger:
+                self.logger.info(
+                    f"[reconcile] {pair} SL 但已跨挂单日（now={now} trade_day={trade_day_start.date()}）"
+                    f"，不重挂"
+                )
+            return
+
+        # 熔断/可交易检查
+        ok, why = self.account.can_trade(now)
+        if not ok:
+            if self.logger:
+                self.logger.info(f"[reconcile] {pair} SL 但账户不可交易({why})，不重挂")
+            return
+
+        # 拉今日 UTC 已发生的 1H K（挂单日 00:00 起）
+        try:
+            raw = self.okx.get_candles(pair, bar="1H", limit=24)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[reconcile] get_candles({pair}) 重挂前失败: {e}")
+            return
+        if not raw:
+            return
+
+        # OKX 返回按时间倒序（新→旧）。归一化后过滤到"挂单日 00:00 以后"的 K
+        from strategy.high_low import _normalize_candle  # 复用已有归一
+        normed = [_normalize_candle(c) for c in raw]
+        day_start_ms = int(trade_day_start.timestamp() * 1000)
+        today_bars = [c for c in normed if c["ts"] >= day_start_ms]
+        if not today_bars:
+            if self.logger:
+                self.logger.info(f"[reconcile] {pair} 今日无 K 线数据，不重挂")
+            return
+
+        direction = sl_trade.get("side")
+        attempt = already + 1
+        new_sig = self.strategy.compute_reentry_signal(
+            pair=pair, direction=direction, day_candles_so_far=today_bars,
+            attempt=attempt, signal_date=sig_date,
+        )
+        if not new_sig:
+            return
+
+        # 计算保证金（用当前 balance）
+        bal = self.account.get_balance()
+        margin, mode = self.account.compute_margin(bal)
+        lev = int(self.config["strategy"]["leverage"])
+
+        if self.logger:
+            self.logger.info(
+                f"[reentry] {pair} attempt={attempt} SL 后重挂 "
+                f"dir={direction} entry={new_sig['entry_price']} "
+                f"tp={new_sig['tp_price']} sl={new_sig['sl_price']} margin={margin:.2f}"
+            )
+
+        algo_id = self.order_manager.place_algo_orders(
+            new_sig, margin=margin, leverage=lev, attempt=attempt
+        )
+        if not algo_id and self.logger:
+            self.logger.error(f"[reentry] {pair} attempt={attempt} 挂单失败")
+
     def _cleanup_duplicate_pending(self, open_trades: list[dict]) -> None:
-        """扫每个策略 pair 的 pending algo：>1 张就撤到只剩 1 张。
-        保留优先级：
-          1. db 里 open trade 记录的 algoId
-          2. 否则 cTime 最早的那张（更可能是真的、后来的重复）
-        若 db 的 algoId 在 OKX 找不到，但同 pair 还有 pending → 改绑到保留下来那张。
+        """扫每个策略 pair 的 pending algo，撤"重复"的。
+        判定"重复"时兼容日内重挂：db 里每条 open trade 对应一张合法 pending。
+        - 每张 pending 若能在 db 里匹配到 open trade（by algoId）→ 合法保留
+        - 剩余"孤儿" pending：
+            * 若 db 有 open trade 且 algoId 找不到 → 改绑 db 到 cTime 最早的孤儿；其它孤儿撤
+            * 若 db 无 open trade 且孤儿只 1 张 → 不动（reconciler 会走对账路径）
+            * 其它 → 撤除
         """
         try:
             all_pending = self.okx.list_pending_algos(ordType="trigger")
@@ -214,62 +326,82 @@ class Reconciler:
             if inst in self.pairs:
                 pending_by_pair.setdefault(inst, []).append(o)
 
-        # 反查 db：pair → 该 pair 目前 open 且带 algoId 的 trade（应至多 1 条）
-        open_by_pair: dict[str, dict] = {}
+        # 反查 db：pair → 该 pair 目前 open 且带 algoId 的 trades（可能多条 —— 日内重挂）
+        open_algos_by_pair: dict[str, dict[str, dict]] = {}
         for t in open_trades:
             pair = t.get("pair")
-            if pair and t.get("okx_order_id"):
-                open_by_pair[pair] = t  # 若同 pair 多条 open trade，取最后一个即可
+            aid = t.get("okx_order_id")
+            if pair and aid:
+                open_algos_by_pair.setdefault(pair, {})[aid] = t
 
         for pair, orders in pending_by_pair.items():
-            if len(orders) <= 1:
-                # 顺便处理孤儿：db 记录的 algoId 不在 pending 里 → 可能已触发建仓（不管）
-                # 或已被撤（reconciler 走对账 exit 分支处理）。这里不额外操作。
-                continue
+            db_algo_map = open_algos_by_pair.get(pair, {})
+            db_algo_ids = set(db_algo_map.keys())
 
-            db_trade = open_by_pair.get(pair)
-            db_algo_id = db_trade.get("okx_order_id") if db_trade else None
+            # 分类：合法（在 db）/ 孤儿（不在 db）
+            legit = [o for o in orders if o.get("algoId") in db_algo_ids]
+            orphans = [o for o in orders if o.get("algoId") not in db_algo_ids]
 
-            # 选保留者
-            keep = None
-            if db_algo_id:
-                keep = next((o for o in orders if o.get("algoId") == db_algo_id), None)
-            if keep is None:
-                # db 里的 algoId 不在 OKX pending 里，或 db 根本没记录 → 保留 cTime 最早那张
+            if not orphans:
+                continue  # 全部合法（或没 pending）
+
+            # 有孤儿。分两种情况：
+            if db_algo_map and orphans:
+                # db 里有记录但对不上：改绑 db 里"algoId 不在 pending"的 trade 到 cTime 最早的孤儿
+                missing_db = [t for aid, t in db_algo_map.items()
+                              if aid not in {o.get("algoId") for o in legit}]
                 def _c(o: dict) -> int:
                     try:
                         return int(o.get("cTime") or 0)
                     except (TypeError, ValueError):
                         return 0
-                keep = min(orders, key=_c)
-                # 若 db 有 open trade 但 algoId 对不上，改绑到保留下来这张，
-                # 保证后续 orders-history 对账时 algoId 能匹配上
-                if db_trade and db_algo_id != keep.get("algoId"):
+                orphans_sorted = sorted(orphans, key=_c)
+                # 每个"缺失"的 db trade 消化一个孤儿
+                keep_orphans_ids: set[str] = set()
+                for db_t, orphan in zip(missing_db, orphans_sorted):
                     try:
-                        self.db.update_trade_algo_id(db_trade["id"], keep["algoId"])
+                        self.db.update_trade_algo_id(db_t["id"], orphan["algoId"])
+                        keep_orphans_ids.add(orphan["algoId"])
                         if self.logger:
                             self.logger.warning(
-                                f"[reconcile] cleanup {pair}: db trade#{db_trade['id']} "
-                                f"algoId {db_algo_id} → {keep['algoId']}（原 algoId 已不在 OKX pending）"
+                                f"[reconcile] cleanup {pair}: db trade#{db_t['id']} "
+                                f"algoId {db_t.get('okx_order_id')} → {orphan['algoId']}（原 algoId 已不在 OKX pending）"
                             )
                     except Exception as e:
                         if self.logger:
                             self.logger.error(f"[reconcile] cleanup update algoId failed: {e}")
-
-            # 撤其余
-            for o in orders:
-                aid = o.get("algoId")
-                if not aid or aid == keep.get("algoId"):
+                # 剩余孤儿撤
+                for o in orphans:
+                    if o.get("algoId") in keep_orphans_ids:
+                        continue
+                    self._cancel_pending(pair, o)
+            else:
+                # db 里啥都没：只 1 张孤儿 → 不动（可能是外部/历史遗留）；多张 → 保留最早、撤其余
+                if len(orphans) <= 1:
                     continue
-                if self.logger:
-                    self.logger.warning(
-                        f"[reconcile] cleanup {pair}: 发现重复 pending algo "
-                        f"algoId={aid} cTime={o.get('cTime')}，撤单（保留 {keep.get('algoId')}）"
-                    )
-                try:
-                    self.okx.cancel_algo_order(aid, pair)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(
-                            f"[reconcile] cleanup cancel {aid} failed: {e}"
-                        )
+                def _c(o: dict) -> int:
+                    try:
+                        return int(o.get("cTime") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                orphans_sorted = sorted(orphans, key=_c)
+                keep = orphans_sorted[0]
+                for o in orphans_sorted[1:]:
+                    if o.get("algoId") == keep.get("algoId"):
+                        continue
+                    self._cancel_pending(pair, o)
+
+    def _cancel_pending(self, pair: str, o: dict) -> None:
+        aid = o.get("algoId")
+        if not aid:
+            return
+        if self.logger:
+            self.logger.warning(
+                f"[reconcile] cleanup {pair}: 发现重复 pending algo "
+                f"algoId={aid} cTime={o.get('cTime')}，撤单"
+            )
+        try:
+            self.okx.cancel_algo_order(aid, pair)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[reconcile] cleanup cancel {aid} failed: {e}")

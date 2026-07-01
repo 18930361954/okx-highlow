@@ -192,7 +192,8 @@ def main():
     monitor = PositionMonitor(okx, db, account, config, logger=logger)
     monitor.start()
 
-    reconciler = Reconciler(okx, db, account, config, logger=logger)
+    reconciler = Reconciler(okx, db, account, config, logger=logger,
+                            strategy=strategy, order_manager=order_mgr)
 
     def _reconcile_tick():
         try:
