@@ -146,6 +146,18 @@ class HighLowStrategy:
         day_high = max(c["high"] for c in normed)
         day_low = min(c["low"] for c in normed)
 
+        # 行情过滤器：pair_overrides 可配 min_prev_amp / max_prev_amp
+        pv = self.pair_overrides.get(pair) or {}
+        min_amp = float(pv.get("min_prev_amp", 0.0))
+        max_amp = float(pv.get("max_prev_amp", 1.0))
+        if day_open > 0:
+            amp = (day_high - day_low) / day_open
+            if amp < min_amp or amp > max_amp:
+                if self.logger:
+                    self.logger.info(f"{pair}: amp={amp*100:.2f}% 越界 "
+                                      f"[{min_amp*100:g}%, {max_amp*100:g}%]，skip")
+                return None
+
         if day_close > day_open:
             direction = "long"
         elif day_close < day_open:

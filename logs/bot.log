@@ -74,3 +74,13 @@
 2026-07-01 14:24:42 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
 2026-07-01 14:24:42 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
 2026-07-01 14:24:42 [INFO] hl-bot: [shutdown] bye
+2026-07-01 15:35:07 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 15:35:07 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 15:35:07 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 15:35:07 [INFO] hl-bot: [catchup] ETH-USDT-SWAP 今日已处理（db 有记录），跳过
+2026-07-01 15:35:07 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP']
+2026-07-01 15:35:07 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 15:35:07 [WARNING] hl-bot: BTC-USDT-SWAP: no candles returned
+2026-07-01 15:35:07 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 15:35:07 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 15:35:07 [INFO] hl-bot: [shutdown] bye

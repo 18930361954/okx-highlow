@@ -48,7 +48,9 @@ def test_report_finds_yesterdays_signal_date(tmp_path, monkeypatch):
     assert "BTC-USDT-SWAP" in content
     assert "TP" in content
     assert "+100.00" in content
-    assert "当日交易: 1 笔" in content
+    # 新报告文案："当日成交 | 1 笔（盈 1 / 亏 0）"
+    assert "1 笔" in content
+    assert "当日回撤" in content or "当前回撤" in content  # 新增 DD 展示
 
 
 def test_report_empty_when_no_trades(tmp_path, monkeypatch):

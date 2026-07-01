@@ -194,7 +194,8 @@ def test_full_lifecycle_place_fill_settle_report(tmp_path, monkeypatch):
     assert "BTC-USDT-SWAP" in text
     assert "TP" in text
     assert "+100.00" in text
-    assert "当日交易: 1 笔（盈 1 / 亏 0）" in text
+    assert "1 笔" in text
+    assert "盈 1 / 亏 0" in text
 
 
 def test_three_consecutive_sl_triggers_cooldown_end_to_end(tmp_path):
