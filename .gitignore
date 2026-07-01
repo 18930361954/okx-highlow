@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 敏感：API key
+.env
+
+# 数据库（唯一按用户要求排除的运行时产物）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# IDE
+.idea/
+.vscode/
+
+# pytest 缓存 / 临时
+.pytest_cache/
+.pytest_tmp/
+
+# claude 本地会话产物
+.claude/

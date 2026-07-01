@@ -1,0 +1,17 @@
+2026-07-01 10:44:30 [INFO] hl-bot: OKX connected (env=demo)
+2026-07-01 10:44:30 [INFO] hl-bot: [init] balance bootstrapped from OKX: 58417.95 USDT
+2026-07-01 10:44:30 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 10:44:31 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 10:44:31 [INFO] hl-bot: [catchup] 补挂 pairs: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
+2026-07-01 10:44:31 [INFO] hl-bot: [scheduler] daily_signal_and_place fired
+2026-07-01 10:44:31 [INFO] hl-bot: [signal] day阴 open=59964.9 close=59147.0 high=60072.5 挂空 @ 60162.60875 (high×1.0015)
+2026-07-01 10:44:32 [INFO] hl-bot: [lev] BTC-USDT-SWAP = 100x (cross) ok
+2026-07-01 10:44:32 [INFO] hl-bot: [order] place algo BTC-USDT-SWAP dir=short entry=60162.60875 orderPx=60132.527446 tp=59440.657445 sl=60463.421794 margin=5841.80 lev=100 sz=971 mode=cross
+2026-07-01 10:44:32 [INFO] hl-bot: [order] BTC-USDT-SWAP algoId=3703452055286222848
+2026-07-01 10:44:33 [INFO] hl-bot: [signal] day阴 open=1590.15 close=1588.5 high=1601.77 挂空 @ 1604.172655 (high×1.0015)
+2026-07-01 10:44:33 [INFO] hl-bot: [lev] ETH-USDT-SWAP = 100x (cross) ok
+2026-07-01 10:44:33 [INFO] hl-bot: [order] place algo ETH-USDT-SWAP dir=short entry=1604.172655 orderPx=1603.370569 tp=1572.089202 sl=1620.214382 margin=5841.80 lev=100 sz=3641 mode=cross
+2026-07-01 10:44:34 [INFO] hl-bot: [order] ETH-USDT-SWAP algoId=3703452103503941632
+2026-07-01 10:44:34 [INFO] hl-bot: [ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号
+2026-07-01 11:14:21 [INFO] hl-bot: [shutdown] signal 2 received, stopping...
+2026-07-01 11:14:21 [INFO] hl-bot: [shutdown] bye

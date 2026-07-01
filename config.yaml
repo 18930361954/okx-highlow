@@ -1,0 +1,26 @@
+strategy:
+  pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
+  position_pct: 0.10
+  float_pct: 0.0015
+  tp_pct: 0.012
+  sl_pct: 0.005
+  pair_overrides:
+    BTC-USDT-SWAP: { sl_pct: 0.005, tp_pct: 0.012 }
+    ETH-USDT-SWAP: { sl_pct: 0.010, tp_pct: 0.020 }
+  leverage: 100
+  trend_filter: true
+  max_consecutive_losses: 3
+  cooldown_hours: 24
+  fixed_mode_threshold: 800000
+  fixed_mode_margin: 1000
+  signal_time_utc: "00:00"
+
+system:
+  log_level: INFO
+  log_keep_days: 30
+  db_path: data/trades.db
+  daily_report_time_utc: "23:55"
+
+account:
+  env: demo
+  td_mode: cross   # cross 全仓 / isolated 逐仓。建议 cross 避免 set_leverage 被旧 TP/SL 单卡住
