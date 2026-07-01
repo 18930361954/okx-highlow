@@ -6,14 +6,16 @@ strategy:
   sl_pct: 0.005
   pair_overrides:
     BTC-USDT-SWAP:
-      sl_pct: 0.005
+      position_pct: 0.20                # 单笔仓位 20%（激进：单笔亏损上限 20×100×0.7% = 14%）
+      sl_pct: 0.007
       tp_pct: 0.012
-      float_pct: 0.002                  # 首次浮动 0.2%（比默认 0.15% 稍宽以适配 BTC 波动）
-      reentry_floats: [0.002, 0.004]    # SL 后日内重挂：第1次0.2%、第2次0.4%（保守组合）
+      float_pct: 0.002                  # 首次浮动 0.2%
+      reentry_floats: [0.002, 0.004]    # SL 后日内重挂：第1次0.2%、第2次0.4%
     ETH-USDT-SWAP:
-      sl_pct: 0.010
+      position_pct: 0.15                # 单笔仓位 15%（激进：单笔亏损上限 15×100×0.7% = 10.5%）
+      sl_pct: 0.007
       tp_pct: 0.020
-      reentry_floats: [0.0015, 0.006]   # SL 后日内重挂：第1次0.15%、第2次0.6%（最优组合）
+      reentry_floats: [0.0015, 0.006]   # SL 后日内重挂：第1次0.15%、第2次0.6%
   leverage: 100
   trend_filter: true
   max_consecutive_losses: 3

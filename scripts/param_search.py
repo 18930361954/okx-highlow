@@ -1,18 +1,20 @@
-"""参数扫描：对指定 pair 扫 (fp1, fp2) 两维网格，180d 总盘 + 30d 滚动窗口指标。
-按综合评分排序输出 top-K。
+"""参数扫描：多维网格，找高复利参数组合。
+默认扫 position_pct × tp_pct × sl_pct，浮动值固定为当前 config 里的。
 
-  python scripts/param_search.py --pair ETH-USDT-SWAP --top 10
+  python scripts/param_search.py --pair ETH-USDT-SWAP --mode high-return --top 10
 
-评分：0.4*正收益窗口占比 + 0.3*中位窗口收益 + 0.2*180d 总收益 + 0.1*(-最差窗口)
-所有指标归一化到 [0,1]。仅供参考，不是绝对排序。
+约束：position_pct × leverage × sl_pct ≤ single-loss-max（默认 0.20，即单笔最大亏损 20% 余额）。
+评分模式：
+  - "high-return" (默认)：总收益 60% + 正收益率 25% + 中位 15%（不看尾部）
+  - "balanced"         ：总收益 30% + 正收益率 30% + 中位 25% + 尾部 15%
 """
 import argparse
 import statistics
 import sys
+from copy import deepcopy
 from itertools import product
 from pathlib import Path
 
-import pandas as pd
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,29 @@ def _rolling(df, pair, cfg, window, step, reentry):
     return results
 
 
+def _build_cfg(base_cfg: dict, pair: str,
+               position_pct: float, tp_pct: float, sl_pct: float,
+               leverage: int) -> dict:
+    """基于 base 复制并覆盖 pair 的关键参数。"""
+    cfg = deepcopy(base_cfg)
+    s = cfg["strategy"]
+    s["position_pct"] = position_pct
+    s["leverage"] = leverage
+    ov = s.setdefault("pair_overrides", {}).setdefault(pair, {})
+    ov["tp_pct"] = tp_pct
+    ov["sl_pct"] = sl_pct
+    # 顶层也覆盖一遍，兼容 backtest 里读取路径
+    s["tp_pct"] = tp_pct
+    s["sl_pct"] = sl_pct
+    return cfg
+
+
+def _floats_of(pair: str, cfg: dict) -> list[float] | None:
+    ov = (cfg["strategy"].get("pair_overrides") or {}).get(pair) or {}
+    seq = ov.get("reentry_floats") or []
+    return list(seq) if seq else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", default="ETH-USDT-SWAP")
@@ -44,10 +69,22 @@ def main():
     ap.add_argument("--window", type=int, default=30)
     ap.add_argument("--step", type=int, default=7)
     ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("--fp1", default="0.001,0.0015,0.002,0.0025,0.003",
-                    help="第1次浮动候选（逗号）")
-    ap.add_argument("--fp2", default="0.004,0.005,0.006,0.007,0.008",
-                    help="第2次浮动候选（逗号）")
+    ap.add_argument("--pos-pct", default="0.10,0.15,0.20,0.25",
+                    help="仓位比例候选（逗号）")
+    ap.add_argument("--tp-list", default=None,
+                    help="止盈候选（逗号）；默认 pair 自适应")
+    ap.add_argument("--sl-list", default=None,
+                    help="止损候选（逗号）；默认 pair 自适应")
+    ap.add_argument("--leverage", type=int, default=100)
+    ap.add_argument("--single-loss-max", type=float, default=0.20,
+                    help="单笔最大亏损占余额比例（约束：pos×lev×sl ≤ 此值）")
+    ap.add_argument("--mode", default="high-return",
+                    choices=["high-return", "balanced"],
+                    help="评分模式")
+    ap.add_argument("--fp1", type=float, default=None,
+                    help="首次浮动。默认读 pair 当前配置")
+    ap.add_argument("--fp2", type=float, default=None,
+                    help="重挂浮动。默认读 pair 当前配置")
     args = ap.parse_args()
 
     if args.csv:
@@ -60,36 +97,67 @@ def main():
         sys.exit(1)
 
     with open(ROOT / "config.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        base_cfg = yaml.safe_load(f)
 
-    fp1_grid = [float(x) for x in args.fp1.split(",")]
-    fp2_grid = [float(x) for x in args.fp2.split(",")]
-    combos = [(a, b) for a, b in product(fp1_grid, fp2_grid) if b > a]  # 第2次浮动应比第1次大
+    # pair-自适应默认 tp/sl 候选
+    if args.tp_list:
+        tp_grid = [float(x) for x in args.tp_list.split(",")]
+    else:
+        # ETH 更抗打（1H 波动大）→ tp 范围偏大
+        if "ETH" in args.pair:
+            tp_grid = [0.015, 0.020, 0.025, 0.030]
+        else:
+            tp_grid = [0.010, 0.012, 0.015, 0.020]
+    if args.sl_list:
+        sl_grid = [float(x) for x in args.sl_list.split(",")]
+    else:
+        if "ETH" in args.pair:
+            sl_grid = [0.007, 0.010, 0.012]
+        else:
+            sl_grid = [0.004, 0.005, 0.007]
 
-    print(f"[scan] {args.pair}  fp1={fp1_grid}  fp2={fp2_grid}  组合数={len(combos)}")
+    pos_grid = [float(x) for x in args.pos_pct.split(",")]
+
+    # 浮动值：默认走 config 里 pair 的重挂序列；若显式传 fp1/fp2 则用
+    default_reentry = _floats_of(args.pair, base_cfg)
+    if args.fp1 is not None and args.fp2 is not None:
+        reentry = [args.fp1, args.fp2]
+    elif default_reentry:
+        reentry = default_reentry
+    else:
+        # pair 未配重挂 → 用最小启动组
+        reentry = [0.0015, 0.006] if "ETH" in args.pair else [0.002, 0.004]
+
+    combos = list(product(pos_grid, tp_grid, sl_grid))
+    # 应用单笔亏损约束
+    kept = [(p, t, s) for p, t, s in combos
+             if p * args.leverage * s <= args.single_loss_max + 1e-9]
+    dropped = len(combos) - len(kept)
+
+    print(f"[scan] {args.pair} 组合={len(combos)}（保留 {len(kept)}，剔除 {dropped} 组超单笔亏损上限 {args.single_loss_max*100:g}%）")
+    print(f"[fixed] reentry_floats={reentry}  leverage={args.leverage}x")
+
     df = load_csv(csv_path)
 
     rows = []
-    for fp1, fp2 in combos:
-        total = simulate(df, args.pair, cfg, days=args.days,
-                          reentry_floats=[fp1, fp2])
-        wins = _rolling(df, args.pair, cfg, args.window, args.step,
-                         reentry=[fp1, fp2])
+    for pos, tp, sl in kept:
+        cfg = _build_cfg(base_cfg, args.pair, pos, tp, sl, args.leverage)
+        total = simulate(df, args.pair, cfg, days=args.days, reentry_floats=reentry)
+        wins = _rolling(df, args.pair, cfg, args.window, args.step, reentry=reentry)
         rets = [r["total_return_pct"] for r in wins]
         if not rets:
             continue
         pos_rate = sum(1 for x in rets if x > 0) / len(rets) * 100
-        median_ret = statistics.median(rets)
-        worst_ret = min(rets)
         rows.append({
-            "fp1": fp1, "fp2": fp2,
+            "pos": pos, "tp": tp, "sl": sl,
+            "single_loss": pos * args.leverage * sl,
             "total_ret": total["total_return_pct"],
             "total_win_rate": total["win_rate_pct"],
             "total_dd": total["max_dd_pct"],
             "total_pf": total["profit_factor"],
             "pos_rate": pos_rate,
-            "median_ret": median_ret,
-            "worst_ret": worst_ret,
+            "median_ret": statistics.median(rets),
+            "worst_ret": min(rets),
             "windows": len(wins),
         })
 
@@ -97,28 +165,37 @@ def main():
         print("[scan] no results")
         return
 
-    # 归一化后综合评分
     def _norm(vals):
         lo, hi = min(vals), max(vals)
         if hi == lo:
             return [0.5] * len(vals)
         return [(v - lo) / (hi - lo) for v in vals]
 
-    pos = _norm([r["pos_rate"] for r in rows])
-    med = _norm([r["median_ret"] for r in rows])
     tot = _norm([r["total_ret"] for r in rows])
-    wst = _norm([-r["worst_ret"] for r in rows])  # worst 越大（越负）分越低
-    for i, r in enumerate(rows):
-        r["score"] = 0.4 * pos[i] + 0.3 * med[i] + 0.2 * tot[i] + 0.1 * wst[i]
+    pos_n = _norm([r["pos_rate"] for r in rows])
+    med = _norm([r["median_ret"] for r in rows])
+    wst = _norm([-r["worst_ret"] for r in rows])
 
+    if args.mode == "high-return":
+        weights = (0.60, 0.25, 0.15, 0.00)  # tot, pos, med, wst
+        label = "评分：总收益 60% + 正收益率 25% + 中位 15%"
+    else:
+        weights = (0.30, 0.30, 0.25, 0.15)
+        label = "评分：总收益 30% + 正收益率 30% + 中位 25% + 尾部 15%"
+
+    for i, r in enumerate(rows):
+        r["score"] = (weights[0] * tot[i] + weights[1] * pos_n[i]
+                       + weights[2] * med[i] + weights[3] * wst[i])
     rows.sort(key=lambda x: x["score"], reverse=True)
 
-    print(f"\n=== Top {args.top} 组合（评分：正收益率 40% + 中位收益 30% + 总收益 20% + 尾部 10%）===")
-    print(f"{'fp1':>7} {'fp2':>7} {'score':>7} {'total%':>8} {'PF':>5} {'DD%':>7} "
-          f"{'win%':>6} {'pos%':>6} {'med%':>7} {'worst%':>8}")
+    print(f"\n=== Top {args.top} 组合（{label}）===")
+    print(f"{'pos%':>5} {'tp%':>5} {'sl%':>5} {'sl_bal%':>8} {'score':>6} "
+          f"{'total%':>9} {'PF':>5} {'DD%':>7} {'win%':>6} {'pos%':>6} "
+          f"{'med%':>7} {'worst%':>8}")
     for r in rows[:args.top]:
-        print(f"{r['fp1']*100:>6.2f}% {r['fp2']*100:>6.2f}% {r['score']:>7.3f} "
-              f"{r['total_ret']:>+8.2f} {r['total_pf']:>5.2f} {r['total_dd']:>7.2f} "
+        print(f"{r['pos']*100:>5.0f} {r['tp']*100:>5.2f} {r['sl']*100:>5.2f} "
+              f"{r['single_loss']*100:>7.1f}  {r['score']:>6.3f} "
+              f"{r['total_ret']:>+9.2f} {r['total_pf']:>5.2f} {r['total_dd']:>7.2f} "
               f"{r['total_win_rate']:>6.2f} {r['pos_rate']:>6.1f} "
               f"{r['median_ret']:>+7.2f} {r['worst_ret']:>+8.2f}")
 

@@ -285,9 +285,9 @@ class Reconciler:
         if not new_sig:
             return
 
-        # 计算保证金（用当前 balance）
+        # 计算保证金（用当前 balance，pair 级）
         bal = self.account.get_balance()
-        margin, mode = self.account.compute_margin(bal)
+        margin, mode = self.account.compute_margin(bal, pair=pair)
         lev = int(self.config["strategy"]["leverage"])
 
         if self.logger:

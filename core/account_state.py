@@ -24,7 +24,14 @@ class AccountState:
         self.cooldown_hours = int(s["cooldown_hours"])
         self.fixed_threshold = float(s["fixed_mode_threshold"])
         self.fixed_margin = float(s["fixed_mode_margin"])
+        self.pair_overrides = s.get("pair_overrides") or {}
         self.logger = logger
+
+    def _position_pct_for(self, pair: str | None) -> float:
+        if not pair:
+            return self.position_pct
+        ov = self.pair_overrides.get(pair) or {}
+        return float(ov.get("position_pct", self.position_pct))
 
     # ---------- raw helpers ----------
 
@@ -97,12 +104,13 @@ class AccountState:
             return False, f"balance={bal} not initialized or zero"
         return True, "ok"
 
-    def compute_margin(self, balance: float) -> tuple[float, str]:
+    def compute_margin(self, balance: float, pair: str | None = None) -> tuple[float, str]:
         if self.is_fixed_mode() or balance >= self.fixed_threshold:
             if not self.is_fixed_mode():
                 self.db.set_state(KEY_FIXED_LOCKED, "true")
             return self.fixed_margin, "FIXED"
-        return round(balance * self.position_pct, 6), "PCT"
+        pct = self._position_pct_for(pair)
+        return round(balance * pct, 6), "PCT"
 
     def on_trade_filled(
         self,

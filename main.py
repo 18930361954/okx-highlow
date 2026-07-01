@@ -41,7 +41,6 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
         return
 
     bal = account.get_balance()
-    margin, mode = account.compute_margin(bal)
     leverage = int(config["strategy"]["leverage"])
 
     for pair in config["strategy"]["pairs"]:
@@ -60,7 +59,9 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
             logger.info(f"{pair}: no signal (flat or insufficient data)")
             continue
 
-        logger.info(f"[signal] {signal['reason']}")
+        # pair 级仓位比例：不同 pair 可以有独立 position_pct
+        margin, mode = account.compute_margin(bal, pair=pair)
+        logger.info(f"[signal] {signal['reason']} margin={margin:.2f} ({mode})")
         algo_id = order_mgr.place_algo_orders(signal, margin=margin, leverage=leverage)
         if algo_id:
             logger.info(f"[order] {pair} algoId={algo_id}")

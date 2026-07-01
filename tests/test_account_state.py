@@ -44,6 +44,35 @@ def test_compute_margin_fixed_at_threshold(acc):
     assert margin == 1000
 
 
+def test_pair_level_position_pct(tmp_path):
+    """pair_overrides.position_pct 应覆盖默认；不传 pair 或 pair 无覆盖走默认。"""
+    cfg = {"strategy": {
+        "position_pct": 0.10,
+        "max_consecutive_losses": 3,
+        "cooldown_hours": 24,
+        "fixed_mode_threshold": 800_000,
+        "fixed_mode_margin": 1000,
+        "pair_overrides": {
+            "ETH-USDT-SWAP": {"position_pct": 0.15},
+        },
+    }}
+    db = DB(tmp_path / "t.db")
+    acc = AccountState(db, cfg)
+    acc.set_balance(100.0)
+
+    # 默认（无 pair）→ 10%
+    m, _ = acc.compute_margin(100.0)
+    assert m == pytest.approx(10.0)
+
+    # BTC 无覆盖 → 10%
+    m, _ = acc.compute_margin(100.0, pair="BTC-USDT-SWAP")
+    assert m == pytest.approx(10.0)
+
+    # ETH 覆盖到 15%
+    m, _ = acc.compute_margin(100.0, pair="ETH-USDT-SWAP")
+    assert m == pytest.approx(15.0)
+
+
 def test_fixed_mode_locks_permanently(acc):
     acc.compute_margin(900_000)  # 触发切档
     assert acc.is_fixed_mode()
