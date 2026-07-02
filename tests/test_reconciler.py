@@ -161,6 +161,34 @@ def test_uses_okx_pnl_when_provided(tmp_path):
     assert t["pnl"] == pytest.approx(97.35)  # 用 OKX 给的，不是估算的 100
 
 
+def test_exit_via_time_window_fallback_when_algo_id_differs(tmp_path):
+    """OKX TP/SL 触发的平仓订单有独立 algoId，跟主 algo 不匹配。
+    reconciler 必须用 pair+entry_time 时间窗口兜底匹配。"""
+    db, acc = _fresh(tmp_path)
+    tid = db.insert_trade(
+        signal_date="2026-06-30", pair="BTC-USDT-SWAP", side="short",
+        entry_price=60000.0, margin=100.0, mode="PCT",
+        okx_order_id="MAIN_ALGO",
+        entry_time="2026-07-01T14:00:00+00:00",
+    )
+    okx = FakeOKX({"BTC-USDT-SWAP": [
+        {"algoId": "MAIN_ALGO", "ordId": "O1",
+         "fillPx": "60000", "fillTime": "1782914400000",
+         "reduceOnly": "false"},
+        # 平仓：algoId 是独立的（模拟 OKX attach 触发生成的新 algoId）
+        {"algoId": "DIFF_ALGO_XYZ", "ordId": "O2",
+         "fillPx": "59400", "fillTime": "1782918000000",
+         "reduceOnly": "true", "category": "tp"},
+    ]})
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_price"] == pytest.approx(59400.0)
+    assert t["exit_reason"] == "TP"
+    assert t["pnl"] == pytest.approx(100.0)
+
+
 def test_trade_without_algo_id_is_skipped(tmp_path):
     db, acc = _fresh(tmp_path)
     db.insert_trade(signal_date="2026-06-30", pair="BTC-USDT-SWAP", side="long",

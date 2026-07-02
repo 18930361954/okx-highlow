@@ -91,9 +91,13 @@ class Reconciler:
         if not open_trades:
             return 0
 
-        # 按 pair 分组拉 orders-history，减少 API 调用（每 pair 一次）
+        # 按 pair 分组拉 orders-history。同时构建两份索引：
+        # 1) by_algo: 主 algo 直接下的入场订单（其 algoId == 主 algo 的 algoId）
+        # 2) by_pair: 该 pair 全部已成交订单（按 fillTime 升序），用于 TP/SL 平仓匹配
+        #    因为 OKX 的 TP/SL attach 触发后会生成独立的 algoId，跟主 algo 无关联字段。
         pairs = {t["pair"] for t in open_trades if t.get("pair")}
         orders_by_algo: dict[str, list[dict]] = {}
+        orders_by_pair: dict[str, list[dict]] = {}
         for pair in pairs:
             try:
                 rows = self.okx.list_order_history(instId=pair, state="filled", limit=100)
@@ -105,6 +109,16 @@ class Reconciler:
                 aid = o.get("algoId") or ""
                 if aid:
                     orders_by_algo.setdefault(aid, []).append(o)
+            # 按 fillTime 升序，方便按时间窗口匹配
+            def _ft(o: dict) -> int:
+                try:
+                    return int(o.get("fillTime") or o.get("uTime") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            orders_by_pair[pair] = sorted(rows, key=_ft)
+
+        # 已被匹配过的 order（避免同一平仓订单匹配到多个 open trade）
+        matched_ord_ids: set[str] = set()
 
         processed = 0
         for t in open_trades:
@@ -112,8 +126,41 @@ class Reconciler:
             if not algo_id:
                 # 挂单时未拿到 algoId → 没法关联；跳过。（下次挂单流程已加回查兜底）
                 continue
-            orders = orders_by_algo.get(algo_id, [])
+
+            # Step 1: 主 algoId 直接匹配（entry 单大部分能命中）
+            orders = list(orders_by_algo.get(algo_id, []))
             entry, exit_ = _classify_orders(orders)
+
+            # Step 2: TP/SL 触发的平仓单 algoId 是独立的 → 按 pair+时间窗口兜底
+            # 触发条件：db 已知 entry_time，且从 orders_by_algo 里没找到 reduceOnly=true 的平仓订单
+            if exit_ is None and t.get("entry_time"):
+                pair = t["pair"]
+                try:
+                    entry_dt = datetime.fromisoformat(t["entry_time"])
+                    entry_ms = int(entry_dt.timestamp() * 1000)
+                except (ValueError, TypeError):
+                    entry_ms = 0
+                # 找同 pair、fillTime > entry_time、reduceOnly=true、未被其它 trade 匹配的最早一条
+                for cand in orders_by_pair.get(pair, []):
+                    ord_id = cand.get("ordId") or cand.get("algoId") or ""
+                    if ord_id in matched_ord_ids:
+                        continue
+                    if str(cand.get("reduceOnly", "")).lower() != "true":
+                        continue
+                    try:
+                        ft = int(cand.get("fillTime") or cand.get("uTime") or 0)
+                    except (TypeError, ValueError):
+                        ft = 0
+                    if ft <= entry_ms:
+                        continue
+                    exit_ = cand
+                    matched_ord_ids.add(ord_id)
+                    if self.logger:
+                        self.logger.info(
+                            f"[reconcile] {pair} trade#{t['id']} 通过时间窗口匹配到平仓订单 "
+                            f"algoId={cand.get('algoId')} fillPx={cand.get('fillPx')}"
+                        )
+                    break
 
             entry_source = entry or exit_  # exit 存在但 entry 分类失败时兜底用 exit 时间
             if entry_source and not t.get("entry_time"):

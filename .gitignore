@@ -6,10 +6,13 @@ __pycache__/
 # 敏感：API key
 .env
 
-# 数据库（唯一按用户要求排除的运行时产物）
+# 数据库
 data/*.db
 data/*.db-shm
 data/*.db-wal
+
+# 日志（含 rotate 后的 bot.log.YYYY-MM-DD）
+logs/
 
 # IDE
 .idea/
