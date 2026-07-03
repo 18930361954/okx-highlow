@@ -6,21 +6,22 @@ strategy:
   sl_pct: 0.005
   pair_overrides:
     BTC-USDT-SWAP:
-      # 联合回测（含成本+行情过滤）180d 最优组合
-      position_pct: 0.05                # 单笔仓位 5%（保守：单笔亏损上限 5×100×0.4% = 2%）
-      tp_pct: 0.015                     # 止盈 1.5%
-      sl_pct: 0.004                     # 止损 0.4%（TP:SL = 3.75:1，高盈亏比抵消手续费）
+      # 2Y 联合回测寻优（145U起，全 maker 0.06%成本，均衡档 A：只优化 TP/SL）
+      # 2Y 收益 +51,969%，MDD 69.8%，145→75,505U
+      position_pct: 0.05                # 单笔仓位 5%
+      tp_pct: 0.010                     # 止盈 1.00%（BTC 胜率从 51.6% 抬到 61.6%）
+      sl_pct: 0.010                     # 止损 1.00%（R:R=1，容忍绝大部分假动作反噬）
       float_pct: 0.002                  # 首次浮动 0.2%
       reentry_floats: [0.002, 0.004]    # SL 后日内重挂
       min_prev_amp: 0.01                # 前日振幅 <1% 不入场（死水日）
-      max_prev_amp: 0.04                # 前日振幅 >4% 不入场（极端事件日）
+      max_prev_amp: 0.0475              # 前日振幅 >4.75% 不入场
     ETH-USDT-SWAP:
-      position_pct: 0.08                # 单笔仓位 8%（单笔亏损上限 8×100×0.7% = 5.6%）
-      tp_pct: 0.020                     # 止盈 2%
-      sl_pct: 0.007                     # 止损 0.7%（TP:SL = 2.86:1）
+      position_pct: 0.12                # 单笔仓位 12%
+      tp_pct: 0.014                     # 止盈 1.4%（ETH 胜率 52.2%，比 1.5% 更优）
+      sl_pct: 0.008                     # 止损 0.80%（放宽 SL 抗噪声）
       reentry_floats: [0.0015, 0.006]   # SL 后日内重挂
       min_prev_amp: 0.01
-      max_prev_amp: 0.04
+      max_prev_amp: 0.08                # 前日振幅 >8% 不入场（ETH 高波动 regime）
   leverage: 100
   trend_filter: true
   max_consecutive_losses: 3

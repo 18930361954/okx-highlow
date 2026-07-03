@@ -9,7 +9,8 @@ DEFAULT_CT_VAL = {
 
 # 触发价相对触发价的限价小步长（用于 trigger 后的限价委托价）。
 # 触发后立刻挂限价，价格放宽 SLIP_PCT 以提高成交概率（但仍是限价）。
-SLIP_PCT = 0.0005  # 0.05%
+# 0.01% = 保守偏移，绝大部分情况能作为 maker 挂单；极少数快速行情才会跨过成为 taker。
+SLIP_PCT = 0.0001  # 0.01%
 
 
 class OrderManager:
