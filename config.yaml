@@ -41,6 +41,8 @@ strategy:
   fixed_mode_threshold: 800000
   fixed_mode_margin: 1000
   signal_time_utc: "00:00"
+  # 多币下单之间的间隔（秒）。防 OKX algo 单并发限流导致 51149 下单超时。
+  place_gap_sec: 1.0
 
 system:
   log_level: INFO

@@ -42,6 +42,10 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
 
     bal = account.get_balance()
 
+    # 每单之间加 1s 间隔：OKX algo 单并发限流曾触发 51149 下单超时（多币同秒下单排队）
+    place_gap_sec = float(config["strategy"].get("place_gap_sec", 1.0))
+    placed_count = 0
+
     for pair in config["strategy"]["pairs"]:
         try:
             raw = okx.get_candles(pair, bar="1H", limit=24)
@@ -62,7 +66,12 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
         margin, mode = account.compute_margin(bal, pair=pair)
         leverage = account.leverage_for(pair)
         logger.info(f"[signal] {signal['reason']} margin={margin:.2f} ({mode}) lev={leverage}x")
+
+        if placed_count > 0 and place_gap_sec > 0:
+            time.sleep(place_gap_sec)
+
         algo_id = order_mgr.place_algo_orders(signal, margin=margin, leverage=leverage)
+        placed_count += 1
         if algo_id:
             logger.info(f"[order] {pair} algoId={algo_id}")
         else:

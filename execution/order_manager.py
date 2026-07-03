@@ -107,6 +107,7 @@ class OrderManager:
                 f"clOrdId={algo_cl_ord_id}"
             )
 
+        place_err: Exception | None = None
         try:
             resp = self.okx.place_algo_order(
                 instId=pair,
@@ -125,24 +126,31 @@ class OrderManager:
                 algoClOrdId=algo_cl_ord_id,
             )
         except Exception as e:
+            place_err = e
+            resp = None
             if self.logger:
                 self.logger.error(f"place_algo_order {pair} failed: {e}")
-            return None
 
         data = resp.get("data", []) if isinstance(resp, dict) else []
         algo_id = data[0].get("algoId") if data else None
 
-        # 边界：resp 结构不带 algoId（比如返回格式异常）。回查 pending 兜底，
-        # 有单就把 algoId 取回来，避免 db 缺记录导致下次 catchup 重复挂。
+        # 边界：resp 未含 algoId（返回格式异常 / 请求侧异常，比如 51149 下单超时）。
+        # 挂单请求带了 algoClOrdId 幂等键，OKX 侧只会建一次 —— 回查 pending
+        # 按 algoClOrdId 精确匹配，把 algoId 取回来，避免 db 缺记录导致下次 catchup 重复挂。
         if not algo_id:
             if self.logger:
-                self.logger.warning(
-                    f"[order] {pair} place resp 未含 algoId，回查 pending：resp={resp}"
-                )
+                if place_err:
+                    self.logger.warning(
+                        f"[order] {pair} 下单请求异常，按 clOrdId 回查 pending: clOrdId={algo_cl_ord_id}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"[order] {pair} place resp 未含 algoId，回查 pending：resp={resp}"
+                    )
             try:
                 for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
-                    algo_id = o.get("algoId") or algo_id
-                    if algo_id:
+                    if o.get("algoClOrdId") == algo_cl_ord_id:
+                        algo_id = o.get("algoId")
                         break
             except Exception as e:
                 if self.logger:

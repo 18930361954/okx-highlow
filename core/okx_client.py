@@ -61,6 +61,10 @@ class OKXClient:
             h["x-simulated-trading"] = "1"
         return h
 
+    # 可安全退避重试的 OKX 业务错误码：
+    #   51149 下单超时 —— OKX 内部处理超时，配合 algoClOrdId 幂等键可安全重下
+    _RETRYABLE_OKX_CODES = {"51149"}
+
     def _request(
         self,
         method: str,
@@ -91,9 +95,19 @@ class OKXClient:
                 )
                 data = resp.json()
                 if str(data.get("code", "")) != "0":
-                    msg = f"OKX error code={data.get('code')} msg={data.get('msg')} endpoint={endpoint}"
+                    code = str(data.get("code", ""))
+                    msg = f"OKX error code={code} msg={data.get('msg')} endpoint={endpoint}"
                     if self.logger:
                         self.logger.warning(msg)
+                    if code in self._RETRYABLE_OKX_CODES and attempt < max_retries - 1:
+                        last_err = OKXError(msg)
+                        wait = 2 ** attempt
+                        if self.logger:
+                            self.logger.warning(
+                                f"OKX retryable code={code} (attempt {attempt+1}); retry in {wait}s"
+                            )
+                        time.sleep(wait)
+                        continue
                     raise OKXError(msg)
                 return data
             except (requests.RequestException, ValueError) as e:
