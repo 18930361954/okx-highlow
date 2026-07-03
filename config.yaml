@@ -1,27 +1,39 @@
 strategy:
-  pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
+  pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
   position_pct: 0.10
   float_pct: 0.0015
   tp_pct: 0.012
   sl_pct: 0.005
   pair_overrides:
+    # 3 币安全档：BTC 4% / ETH 6% / SOL 15%（在强平安全约束下的最优）
+    # 2Y 回测 280U → 858,132U（+306,376%），MDD 51.6%，月化 +39.15%
+    # 强平门槛：三对全 SL 失效需≥5.21%，ETH 单独失效需≥12.04%
     BTC-USDT-SWAP:
-      # 2Y 联合回测寻优（145U起，全 maker 0.06%成本，均衡档 A：只优化 TP/SL）
-      # 2Y 收益 +51,969%，MDD 69.8%，145→75,505U
-      position_pct: 0.05                # 单笔仓位 5%
-      tp_pct: 0.010                     # 止盈 1.00%（BTC 胜率从 51.6% 抬到 61.6%）
-      sl_pct: 0.010                     # 止损 1.00%（R:R=1，容忍绝大部分假动作反噬）
+      position_pct: 0.04                # 单笔仓位 4%（降低 BTC 敞口）
+      leverage: 100
+      tp_pct: 0.010                     # 止盈 1.00%（BTC 胜率 61.6%）
+      sl_pct: 0.010                     # 止损 1.00%（R:R=1）
       float_pct: 0.002                  # 首次浮动 0.2%
       reentry_floats: [0.002, 0.004]    # SL 后日内重挂
-      min_prev_amp: 0.01                # 前日振幅 <1% 不入场（死水日）
+      min_prev_amp: 0.01
       max_prev_amp: 0.0475              # 前日振幅 >4.75% 不入场
     ETH-USDT-SWAP:
-      position_pct: 0.12                # 单笔仓位 12%
-      tp_pct: 0.014                     # 止盈 1.4%（ETH 胜率 52.2%，比 1.5% 更优）
-      sl_pct: 0.008                     # 止损 0.80%（放宽 SL 抗噪声）
+      position_pct: 0.06                # 单笔仓位 6%（降低 ETH 敞口以过安全线）
+      leverage: 100
+      tp_pct: 0.014                     # 止盈 1.4%（ETH 胜率 52.2%）
+      sl_pct: 0.008                     # 止损 0.80%
       reentry_floats: [0.0015, 0.006]   # SL 后日内重挂
       min_prev_amp: 0.01
-      max_prev_amp: 0.08                # 前日振幅 >8% 不入场（ETH 高波动 regime）
+      max_prev_amp: 0.08                # 前日振幅 >8% 不入场
+    SOL-USDT-SWAP:
+      position_pct: 0.15                # 单笔仓位 15%（SOL 胜率 78.4%，主发动机）
+      leverage: 50                      # SOL 50x（比 BTC/ETH 低半）
+      tp_pct: 0.010                     # 止盈 1.00%
+      sl_pct: 0.020                     # 止损 2.00%（高胜率补偿低 R:R=0.5）
+      float_pct: 0.002                  # 首次浮动 0.2%
+      reentry_floats: [0.002, 0.008]    # SL 后日内重挂
+      min_prev_amp: 0.015               # SOL 振幅 <1.5% 不入场
+      max_prev_amp: 0.12                # SOL 振幅 >12% 不入场（去掉极端事件日）
   leverage: 100
   trend_filter: true
   max_consecutive_losses: 3

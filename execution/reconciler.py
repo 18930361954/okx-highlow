@@ -73,6 +73,7 @@ class Reconciler:
         self.strategy = strategy         # 用于日内重挂计算入场价
         self.order_manager = order_manager  # 用于挂重挂单
         self.pairs: list[str] = list(config["strategy"]["pairs"])
+        # 全局默认杠杆（兼容旧代码）；实际用 account.leverage_for(pair) 拿 per-pair
         self.leverage = int(config["strategy"]["leverage"])
 
     def run_once(self) -> int:
@@ -212,7 +213,9 @@ class Reconciler:
                                 pct = (fill_px - entry_px) / entry_px
                             else:
                                 pct = (entry_px - fill_px) / entry_px
-                            pnl = margin * self.leverage * pct
+                            # per-pair leverage：SOL 50x、BTC/ETH 100x
+                            pair_lev = self.account.leverage_for(t.get("pair"))
+                            pnl = margin * pair_lev * pct
                         else:
                             pnl = 0.0
 
@@ -332,10 +335,10 @@ class Reconciler:
         if not new_sig:
             return
 
-        # 计算保证金（用当前 balance，pair 级）
+        # 计算保证金 + 杠杆（都是 pair 级：SOL 50x、BTC/ETH 100x）
         bal = self.account.get_balance()
         margin, mode = self.account.compute_margin(bal, pair=pair)
-        lev = int(self.config["strategy"]["leverage"])
+        lev = self.account.leverage_for(pair)
 
         if self.logger:
             self.logger.info(

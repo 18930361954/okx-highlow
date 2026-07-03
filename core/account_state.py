@@ -20,6 +20,7 @@ class AccountState:
         self.db = db
         s = config["strategy"]
         self.position_pct = float(s["position_pct"])
+        self.leverage = int(s.get("leverage", 100))  # 默认 100x，缺省时兼容旧配置
         self.max_losses = int(s["max_consecutive_losses"])
         self.cooldown_hours = int(s["cooldown_hours"])
         self.fixed_threshold = float(s["fixed_mode_threshold"])
@@ -32,6 +33,13 @@ class AccountState:
             return self.position_pct
         ov = self.pair_overrides.get(pair) or {}
         return float(ov.get("position_pct", self.position_pct))
+
+    def leverage_for(self, pair: str | None) -> int:
+        """获取 pair 级 leverage；缺省走全局。SOL 走 50x，BTC/ETH 走 100x。"""
+        if not pair:
+            return self.leverage
+        ov = self.pair_overrides.get(pair) or {}
+        return int(ov.get("leverage", self.leverage))
 
     # ---------- raw helpers ----------
 

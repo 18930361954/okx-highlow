@@ -41,7 +41,6 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
         return
 
     bal = account.get_balance()
-    leverage = int(config["strategy"]["leverage"])
 
     for pair in config["strategy"]["pairs"]:
         try:
@@ -59,9 +58,10 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
             logger.info(f"{pair}: no signal (flat or insufficient data)")
             continue
 
-        # pair 级仓位比例：不同 pair 可以有独立 position_pct
+        # pair 级仓位比例 + pair 级杠杆（SOL 50x、BTC/ETH 100x）
         margin, mode = account.compute_margin(bal, pair=pair)
-        logger.info(f"[signal] {signal['reason']} margin={margin:.2f} ({mode})")
+        leverage = account.leverage_for(pair)
+        logger.info(f"[signal] {signal['reason']} margin={margin:.2f} ({mode}) lev={leverage}x")
         algo_id = order_mgr.place_algo_orders(signal, margin=margin, leverage=leverage)
         if algo_id:
             logger.info(f"[order] {pair} algoId={algo_id}")
@@ -182,8 +182,9 @@ def main():
     init_balance_if_needed(okx, account, logger)
 
     # 预设杠杆（cross 全仓：set_leverage 一次设好 long+short）
-    lev = int(config["strategy"]["leverage"])
+    # per-pair leverage：SOL 走 50x，BTC/ETH 走 100x
     for pair in config["strategy"]["pairs"]:
+        lev = account.leverage_for(pair)
         try:
             okx.set_leverage(pair, lev, mgnMode=td_mode)
             logger.info(f"[lev] {pair} = {lev}x ({td_mode}) ok")

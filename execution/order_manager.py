@@ -5,6 +5,7 @@ from typing import Callable
 DEFAULT_CT_VAL = {
     "BTC-USDT-SWAP": 0.01,
     "ETH-USDT-SWAP": 0.1,
+    "SOL-USDT-SWAP": 1.0,
 }
 
 # 触发价相对触发价的限价小步长（用于 trigger 后的限价委托价）。
