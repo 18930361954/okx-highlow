@@ -49,7 +49,18 @@ class HighLowStrategy:
         self.pair_overrides = s.get("pair_overrides") or {}
         # 信号周期: 1D / 12H / 6H / 4H / 2H / 1H。scheduler 按此生成 cron。
         self.signal_bar = str(s.get("signal_bar", "1D"))
+        # 单笔张数封顶(与回测口径一致):BTC 1000, ETH/SOL 5000。
+        # pair_overrides.max_contracts 可覆盖。
+        self.max_contracts_map = s.get("max_contracts") or {}
         self.logger = logger
+
+    def max_contracts_for(self, pair: str) -> int | None:
+        """返回 pair 的单笔张数上限,None 表示无限。"""
+        ov = self.pair_overrides.get(pair) or {}
+        if "max_contracts" in ov:
+            return int(ov["max_contracts"])
+        v = self.max_contracts_map.get(pair)
+        return int(v) if v else None
 
     def _tp_sl_for(self, pair: str) -> tuple[float, float]:
         ov = self.pair_overrides.get(pair) or {}

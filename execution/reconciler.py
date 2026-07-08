@@ -435,8 +435,9 @@ class Reconciler:
                 f"tp={new_sig['tp_price']} sl={new_sig['sl_price']} margin={margin:.2f}"
             )
 
+        max_ct = getattr(self.strategy, "max_contracts_for", lambda p: None)(pair)
         algo_id = self.order_manager.place_algo_orders(
-            new_sig, margin=margin, leverage=lev, attempt=attempt
+            new_sig, margin=margin, leverage=lev, attempt=attempt, max_contracts=max_ct
         )
         if not algo_id and self.logger:
             self.logger.error(f"[reentry] {pair} attempt={attempt} 挂单失败")
@@ -527,7 +528,9 @@ class Reconciler:
                 f"margin={margin:.2f} ({mode}) lev={lev}x"
             )
 
-        algo_id = self.order_manager.place_algo_orders(signal, margin=margin, leverage=lev)
+        max_ct = getattr(self.strategy, "max_contracts_for", lambda p: None)(pair)
+        algo_id = self.order_manager.place_algo_orders(signal, margin=margin, leverage=lev,
+                                                       max_contracts=max_ct)
         if not algo_id and self.logger:
             self.logger.error(f"[catchup-exit] {pair} place_algo_orders 未拿到 algoId")
 

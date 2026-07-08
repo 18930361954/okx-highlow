@@ -131,12 +131,14 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
 
         margin, mode = rt.account.compute_margin(bal, pair=pair)
         leverage = rt.account.leverage_for(pair)
-        logger.info(f"[signal] {signal_dict['reason']} margin={margin:.2f} ({mode}) lev={leverage}x")
+        max_ct = rt.strategy.max_contracts_for(pair)
+        logger.info(f"[signal] {signal_dict['reason']} margin={margin:.2f} ({mode}) lev={leverage}x max_ct={max_ct}")
 
         if placed_count > 0 and place_gap_sec > 0:
             time.sleep(place_gap_sec)
 
-        algo_id = rt.order_manager.place_algo_orders(signal_dict, margin=margin, leverage=leverage)
+        algo_id = rt.order_manager.place_algo_orders(signal_dict, margin=margin, leverage=leverage,
+                                                     max_contracts=max_ct)
         placed_count += 1
         if algo_id:
             logger.info(f"[order] {pair} algoId={algo_id}")

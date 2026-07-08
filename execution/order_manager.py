@@ -45,17 +45,23 @@ class OrderManager:
     # ---------- helpers ----------
 
     def _calc_size(self, pair: str, margin_usdt: float, leverage: int,
-                   entry_price: float) -> str:
+                   entry_price: float, max_contracts: int | None = None) -> str:
         """
-        size 单位：张数（OKX SWAP）
+        size 单位:张数(OKX SWAP)
         notional = margin × leverage
         coin_qty = notional / entry_price
-        contracts = coin_qty / ct_val
+        contracts = coin_qty / ct_val,再按 max_contracts 截断
         """
         ct_val = self.ct_val.get(pair, 0.01)
         notional = margin_usdt * leverage
         coin_qty = notional / entry_price
         contracts = max(1, int(coin_qty / ct_val))
+        if max_contracts and contracts > max_contracts:
+            if self.logger:
+                self.logger.info(
+                    f"[order] {pair} 张数从 {contracts} 封顶到 {max_contracts}"
+                )
+            contracts = max_contracts
         return str(contracts)
 
     def _ensure_leverage(self, pair: str, leverage: int) -> None:
@@ -86,6 +92,7 @@ class OrderManager:
         leverage: int,
         td_mode: str | None = None,
         attempt: int = 1,
+        max_contracts: int | None = None,
     ) -> str | None:
         pair = signal["pair"]
         direction = signal["direction"]
@@ -99,7 +106,8 @@ class OrderManager:
         side = "buy" if direction == "long" else "sell"
         pos_side = "long" if direction == "long" else "short"
 
-        sz = self._calc_size(pair, margin, leverage, entry_price)
+        sz = self._calc_size(pair, margin, leverage, entry_price,
+                              max_contracts=max_contracts)
 
         # 触发后的限价价格：稍微放宽 SLIP_PCT 保证能成交，但仍是限价不是市价。
         if direction == "long":

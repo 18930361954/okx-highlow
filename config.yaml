@@ -16,6 +16,14 @@ strategy:
   # 多币下单之间的间隔(秒)。防 OKX algo 单并发限流导致 51149 下单超时。
   place_gap_sec: 1.0
 
+  # 单笔张数封顶(与回测口径一致)
+  # BTC 1000 张 × 0.01 = 10 BTC/笔;ETH 5000 张 × 0.1 = 500 ETH/笔;SOL 5000 张 × 1 = 5000 SOL/笔
+  # 每账户 pair_overrides 可加 max_contracts 单独覆盖
+  max_contracts:
+    BTC-USDT-SWAP: 1000
+    ETH-USDT-SWAP: 5000
+    SOL-USDT-SWAP: 5000
+
 system:
   log_level: INFO
   log_keep_days: 30

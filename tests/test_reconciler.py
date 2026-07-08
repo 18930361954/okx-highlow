@@ -313,11 +313,11 @@ class FakeOrderMgrReentry:
         self.calls: list[dict] = []
         self.next_algo_id = 9000
 
-    def place_algo_orders(self, signal, margin, leverage, attempt=1):
+    def place_algo_orders(self, signal, margin, leverage, attempt=1, **kwargs):
         aid = str(self.next_algo_id)
         self.next_algo_id += 1
         self.calls.append({"signal": signal, "margin": margin, "attempt": attempt,
-                            "algo_id": aid})
+                            "algo_id": aid, **kwargs})
         return aid
 
 
