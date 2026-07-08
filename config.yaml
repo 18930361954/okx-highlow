@@ -52,6 +52,7 @@ accounts:
   # ==================== 实盘账户 ====================
   # 「4H 三币组合」— 每天 6 次挂单
   - account_name: 实盘-主账户
+    enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
     api_key: 4a5db4d2-3b73-4a39-b824-5209fa76bfae
     secret_key: 456CC065FB5C3CF833E89AA18A668031
     passphrase: Zdx19971226@@
@@ -65,6 +66,7 @@ accounts:
 
   # 「6H 三币组合」— 每天 4 次挂单
   - account_name: 实盘-A1455923264
+    enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
     api_key: b373cac5-3f42-46a3-9741-6b26a440e781
     secret_key: 8879F75B9A45944DEFC7F442D2D256EA
     passphrase: Zdx19971226@@
@@ -78,6 +80,7 @@ accounts:
 
   # 「12H 三币组合」— 每天 2 次挂单
   - account_name: 实盘-bot14559
+    enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
     api_key: e27a1897-27ef-495a-81bc-0b014e02219a
     secret_key: 049CA31D8CE0B652676FFA9EA045C970
     passphrase: Zdx19971226@@
