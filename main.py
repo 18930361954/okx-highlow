@@ -259,11 +259,12 @@ def main():
             continue
         rt.logger.info(f"OKX connected (env={rt.cfg.env})")
         init_balance_if_needed(rt)
-        # 预设杠杆
+        # 预设杠杆(并登记到 order_manager 缓存,避免每次挂单重复 set)
         for pair in rt.cfg.pairs:
             lev = rt.account.leverage_for(pair)
             try:
                 rt.okx.set_leverage(pair, lev, mgnMode=rt.cfg.td_mode)
+                rt.order_manager.mark_leverage_confirmed(pair, lev)
                 rt.logger.info(f"[lev] {pair} = {lev}x ({rt.cfg.td_mode}) ok")
             except Exception as e:
                 rt.logger.warning(
@@ -275,10 +276,8 @@ def main():
         base_logger.error("所有账户 OKX 连接均失败,退出")
         sys.exit(2)
 
-    # 终端面板:多账户下只显示第一个账户(避免 rich Live 冲突)。
-    # 想看某个账户可以在 config 里把它放到 accounts 首位。
-    monitor = PositionMonitor(ok_runtimes[0].okx, db, ok_runtimes[0].account,
-                              ok_runtimes[0].cfg.to_legacy_config(), logger=base_logger)
+    # 终端面板:多账户版,显示所有账户余额、挂单、持仓、今日成交
+    monitor = PositionMonitor(runtimes=ok_runtimes, db=db, logger=base_logger)
     monitor.start()
 
     # 调度器

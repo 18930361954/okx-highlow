@@ -33,7 +33,14 @@ class OrderManager:
         self.ct_val = {**DEFAULT_CT_VAL, **(ct_val or {})}
         self.td_mode = td_mode
         self.account = account
+        # 缓存 pair → 已确认设置成功的 leverage,避免每次挂单都调 set_leverage。
+        # main.py 启动时会预设一次,同 leverage 时 place 就跳过 set。
+        self._lev_confirmed: dict[str, int] = {}
         self._fill_callback: Callable | None = None
+
+    def mark_leverage_confirmed(self, pair: str, leverage: int) -> None:
+        """外部(如 main.py boot)成功 set 过后调用此方法登记,让后续 place 跳过重复 set。"""
+        self._lev_confirmed[pair] = leverage
 
     # ---------- helpers ----------
 
@@ -53,11 +60,15 @@ class OrderManager:
 
     def _ensure_leverage(self, pair: str, leverage: int) -> None:
         """
-        cross 模式下 set_leverage 不需要 posSide（一次设好 long+short）。
-        失败仅警告：可能是因为该品种已有持仓/挂单，需用户手动到 OKX 调整。
+        缓存 pair 已确认的 leverage,同值时跳过 API 调用。
+        cross 模式下 set_leverage 不需要 posSide(一次设好 long+short)。
+        失败仅警告:可能是因为该品种已有持仓/挂单,需用户手动到 OKX 调整。
         """
+        if self._lev_confirmed.get(pair) == leverage:
+            return  # 已确认过,跳过
         try:
             self.okx.set_leverage(pair, leverage, mgnMode=self.td_mode)
+            self._lev_confirmed[pair] = leverage
             if self.logger:
                 self.logger.info(f"[lev] {pair} = {leverage}x ({self.td_mode}) ok")
         except Exception as e:
