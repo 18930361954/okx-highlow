@@ -62,6 +62,34 @@ def _infer_exit_reason(exit_order: dict) -> str:
     return "EXIT"
 
 
+def _infer_exit_reason_by_price(side: str, entry_price: float, exit_price: float,
+                                 tp_pct: float, sl_pct: float) -> str:
+    """字段兜底：按平仓价距 tp/sl 目标价的差距分类。
+    long: tp = entry*(1+tp_pct), sl = entry*(1-sl_pct)
+    short: tp = entry*(1-tp_pct), sl = entry*(1+sl_pct)
+    取离 exit_price 最近的那个当 reason。差距完全一致时按盈亏方向定。"""
+    if entry_price <= 0 or exit_price <= 0:
+        return "EXIT"
+    if side == "long":
+        tp_target = entry_price * (1 + tp_pct)
+        sl_target = entry_price * (1 - sl_pct)
+    elif side == "short":
+        tp_target = entry_price * (1 - tp_pct)
+        sl_target = entry_price * (1 + sl_pct)
+    else:
+        return "EXIT"
+    d_tp = abs(exit_price - tp_target)
+    d_sl = abs(exit_price - sl_target)
+    if d_tp < d_sl:
+        return "TP"
+    if d_sl < d_tp:
+        return "SL"
+    # 完全相等：按盈亏方向兜底
+    if side == "long":
+        return "TP" if exit_price >= entry_price else "SL"
+    return "TP" if exit_price <= entry_price else "SL"
+
+
 class Reconciler:
     def __init__(self, okx_client, db, account_state, config: dict, logger=None,
                  strategy=None, order_manager=None):
@@ -197,6 +225,21 @@ class Reconciler:
                     if fill_px <= 0:
                         continue
                     reason = _infer_exit_reason(exit_)
+                    # 字段兜底失败落到 "EXIT" 时：按 pair 级 tp/sl_pct + 平仓价距离分类。
+                    # 关键：SL 分类正确才能触发 _try_reentry。
+                    if reason == "EXIT" and self.strategy is not None:
+                        entry_px = float(t.get("entry_price") or 0)
+                        try:
+                            tp_pct, sl_pct = self.strategy.tp_sl_for(t.get("pair", ""))
+                            reason = _infer_exit_reason_by_price(
+                                side=t.get("side", ""),
+                                entry_price=entry_px,
+                                exit_price=fill_px,
+                                tp_pct=tp_pct,
+                                sl_pct=sl_pct,
+                            )
+                        except Exception:
+                            pass
 
                     # pnl 优先取 OKX 提供的实际 pnl（含手续费/资金费口径），
                     # 拿不到就按 margin*lev*pct 估算（与回测一致）。
@@ -250,6 +293,17 @@ class Reconciler:
                                 self.logger.error(
                                     f"[reconcile] reentry after trade#{t.get('id')} failed: {e}"
                                 )
+
+                    # 平仓后补挂：daily_signal_and_place 因"当时有持仓"跳过挂单时，
+                    # 平仓（无论 TP/SL/EXIT）后应尝试跑一次今日 signal 首挂 attempt=1。
+                    # 判定：今日 signal_date 下该 pair 在 db 里无任何记录 → 说明确实被跳过了。
+                    try:
+                        self._catchup_after_exit(t.get("pair"), exit_dt)
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(
+                                f"[reconcile] catchup after trade#{t.get('id')} failed: {e}"
+                            )
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"[reconcile] settle trade#{t.get('id')} failed: {e}")
@@ -264,14 +318,18 @@ class Reconciler:
         - 当前 UTC 与该 signal_date 对应的"挂单日"是同一天（signal_date + 1）
         - 账户未熔断
         """
+        pair = sl_trade.get("pair") or "?"
         if not self.strategy or not self.order_manager:
+            if self.logger:
+                self.logger.info(f"[reentry] {pair} 跳过：strategy/order_manager 未注入")
             return
-        pair = sl_trade.get("pair")
-        if not pair:
+        if not sl_trade.get("pair"):
             return
         reentry_floats = self.strategy.reentry_floats_for(pair)
         if len(reentry_floats) < 2:
-            return  # 未启用重挂
+            if self.logger:
+                self.logger.info(f"[reentry] {pair} 跳过：未配置 reentry_floats")
+            return
 
         # 判定当日已入场几次（用 signal_date 分组）
         sig_date = sl_trade.get("signal_date")
@@ -280,7 +338,11 @@ class Reconciler:
         same_day = [x for x in self.db.list_trades_by_date(sig_date) if x.get("pair") == pair]
         already = len(same_day)
         if already >= len(reentry_floats):
-            return  # 已用完
+            if self.logger:
+                self.logger.info(
+                    f"[reentry] {pair} 跳过：当日已入场 {already} 次，达到 reentry_floats 上限"
+                )
+            return
 
         # 确保还在"挂单日"：挂单日 UTC = signal_date + 1
         # sl_time 若无就用 now
@@ -352,6 +414,88 @@ class Reconciler:
         )
         if not algo_id and self.logger:
             self.logger.error(f"[reentry] {pair} attempt={attempt} 挂单失败")
+
+    def _catchup_after_exit(self, pair: str | None, exit_dt: datetime | None) -> None:
+        """平仓后日内补挂 attempt=1（对应「有持仓所以 daily_signal 被跳过」的场景）。
+        判定：
+        - strategy/order_manager 已注入
+        - 当前 UTC 仍在挂单日区间内（signal_date + 1 天）
+        - db 里今日 signal_date 该 pair 无任何 trade（若已有记录说明当日已挂过单）
+        - OKX 无 pending / 无持仓 该 pair
+        - 账户未熔断
+        用今日「昨日」24 根 1H K 走 compute_signal（跟 daily_signal_and_place 完全一致）。
+        """
+        if not pair or not self.strategy or not self.order_manager:
+            return
+        now = (exit_dt or datetime.now(UTC)).astimezone(UTC)
+        # 挂单日 UTC = 今天；signal_date = 昨天
+        today = now.date()
+        sig_date = (today - timedelta(days=1)).isoformat()
+
+        # 已有当日记录 → 不补
+        same_day = [x for x in self.db.list_trades_by_date(sig_date) if x.get("pair") == pair]
+        if same_day:
+            return
+
+        # 账户/熔断
+        ok, why = self.account.can_trade(now)
+        if not ok:
+            if self.logger:
+                self.logger.info(f"[catchup-exit] {pair} 账户不可交易({why})，不补挂")
+            return
+
+        # OKX 侧再确认无 pending / 无持仓（可能有其它 pair 的挂单，只看该 pair）
+        try:
+            for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
+                if o.get("instId") == pair:
+                    if self.logger:
+                        self.logger.info(f"[catchup-exit] {pair} 已有 pending，跳过")
+                    return
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[catchup-exit] {pair} list_pending 失败: {e}")
+            return
+        try:
+            for p in self.okx.get_positions(instId=pair):
+                if float(p.get("pos", 0) or 0) != 0:
+                    if self.logger:
+                        self.logger.info(f"[catchup-exit] {pair} 仍有持仓，跳过")
+                    return
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[catchup-exit] {pair} get_positions 失败: {e}")
+            return
+
+        # 拉昨日 24 根 1H → compute_signal
+        try:
+            raw = self.okx.get_candles(pair, bar="1H", limit=24)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[catchup-exit] {pair} get_candles 失败: {e}")
+            return
+        if not raw:
+            return
+
+        signal = self.strategy.compute_signal(pair, raw, signal_date=sig_date)
+        if not signal:
+            if self.logger:
+                self.logger.info(f"[catchup-exit] {pair} compute_signal 无结果，不补挂")
+            return
+
+        bal = self.account.get_balance()
+        margin, mode = self.account.compute_margin(bal, pair=pair)
+        lev = self.account.leverage_for(pair)
+
+        if self.logger:
+            self.logger.info(
+                f"[catchup-exit] {pair} 平仓后补挂 attempt=1 "
+                f"entry={signal['entry_price']} tp={signal['tp_price']} sl={signal['sl_price']} "
+                f"margin={margin:.2f} ({mode}) lev={lev}x"
+            )
+
+        algo_id = self.order_manager.place_algo_orders(signal, margin=margin, leverage=lev)
+        if not algo_id and self.logger:
+            self.logger.error(f"[catchup-exit] {pair} place_algo_orders 未拿到 algoId")
 
     def _cleanup_duplicate_pending(self, open_trades: list[dict]) -> None:
         """扫每个策略 pair 的 pending algo，撤"重复"的。

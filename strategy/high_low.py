@@ -56,6 +56,10 @@ class HighLowStrategy:
             float(ov.get("sl_pct", self.sl_pct)),
         )
 
+    def tp_sl_for(self, pair: str) -> tuple[float, float]:
+        """公开版：外部（如 reconciler 兜底分类 TP/SL）需要拿 pair 级 tp/sl 百分比。"""
+        return self._tp_sl_for(pair)
+
     def _float_for(self, pair: str) -> float:
         ov = self.pair_overrides.get(pair) or {}
         return float(ov.get("float_pct", self.float_pct))

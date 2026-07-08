@@ -29,8 +29,27 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def _pairs_with_open_position(okx, logger) -> set[str]:
+    """查询 OKX 上当前有真实持仓的 pair 集合（pos != 0）。任何异常返回空 set，
+    调用方按"未查到"处理，避免误跳过挂单。"""
+    have: set[str] = set()
+    try:
+        for p in okx.get_positions():
+            if float(p.get("pos", 0) or 0) != 0:
+                inst = p.get("instId")
+                if inst:
+                    have.add(inst)
+    except Exception as e:
+        if logger:
+            logger.warning(f"[skip-check] get_positions 失败，本轮不按持仓跳过: {e}")
+    return have
+
+
 def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger):
-    """每日 00:00 UTC：拉前一日 24 根 1H → 生成信号 → 下单"""
+    """每日 00:00 UTC：拉前一日 24 根 1H → 生成信号 → 下单。
+    挂单前对每 pair 检查 OKX 当前持仓：有持仓则暂不挂单，等 Reconciler 结算 exit
+    时自动 catch-up 补挂（详见 execution/reconciler.py 的 _catchup_after_exit）。
+    """
     logger.info("[scheduler] daily_signal_and_place fired")
     now = utc_now()
     sig_date = yesterday_utc_date(now)  # 前一日的数据 → 今日挂单
@@ -45,8 +64,14 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
     # 每单之间加 1s 间隔：OKX algo 单并发限流曾触发 51149 下单超时（多币同秒下单排队）
     place_gap_sec = float(config["strategy"].get("place_gap_sec", 1.0))
     placed_count = 0
+    held_pairs = _pairs_with_open_position(okx, logger)
 
     for pair in config["strategy"]["pairs"]:
+        # 持仓保护：有持仓时暂不挂单。平仓后由 Reconciler 触发日内补挂。
+        if pair in held_pairs:
+            logger.info(f"[skip] {pair}：当前有持仓，暂不挂单（平仓后由对账器补挂）")
+            continue
+
         try:
             raw = okx.get_candles(pair, bar="1H", limit=24)
         except Exception as e:
@@ -176,7 +201,11 @@ def main():
         sys.exit(1)
 
     db = DB(PROJECT_ROOT / config["system"]["db_path"])
-    okx = OKXClient(api_key, secret, passphrase, env=config["account"]["env"], logger=logger)
+
+    net_cfg = config.get("network") or {}
+    proxy_url = str(net_cfg.get("proxy_url") or "") if net_cfg.get("proxy_enabled") else None
+    okx = OKXClient(api_key, secret, passphrase, env=config["account"]["env"],
+                    logger=logger, proxy_url=proxy_url)
 
     if not okx.test_connection():
         logger.error("OKX connection failed — exiting")

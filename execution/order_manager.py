@@ -128,8 +128,10 @@ class OrderManager:
         except Exception as e:
             place_err = e
             resp = None
+            # 51149 首次超时后重试可能回 code=1 msg=""（OKX 侧幂等键已建单，只是响应异常）。
+            # 这类先降级为 WARNING，走下面的 clOrdId 回查兜底；回查失败再抬回 ERROR
             if self.logger:
-                self.logger.error(f"place_algo_order {pair} failed: {e}")
+                self.logger.warning(f"place_algo_order {pair} raised: {e}（走 clOrdId 兜底）")
 
         data = resp.get("data", []) if isinstance(resp, dict) else []
         algo_id = data[0].get("algoId") if data else None
@@ -155,6 +157,12 @@ class OrderManager:
             except Exception as e:
                 if self.logger:
                     self.logger.error(f"[order] 回查 pending 失败: {e}")
+
+            if not algo_id and place_err and self.logger:
+                # 回查也没找到 → 真的失败了，抬回 ERROR
+                self.logger.error(
+                    f"place_algo_order {pair} failed 且 clOrdId={algo_cl_ord_id} 回查未命中: {place_err}"
+                )
 
         self.db.insert_trade(
             signal_date=signal.get("signal_date", ""),

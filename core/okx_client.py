@@ -25,6 +25,7 @@ class OKXClient:
         env: str = "demo",
         logger=None,
         timeout: int = 15,
+        proxy_url: str | None = None,
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -33,6 +34,10 @@ class OKXClient:
         self.logger = logger
         self.timeout = timeout
         self._session = requests.Session()
+        if proxy_url:
+            self._session.proxies = {"http": proxy_url, "https": proxy_url}
+            if logger:
+                logger.info(f"[net] OKX REST via proxy {proxy_url}")
 
     # ---------------- signing & request ----------------
 
@@ -63,7 +68,9 @@ class OKXClient:
 
     # 可安全退避重试的 OKX 业务错误码：
     #   51149 下单超时 —— OKX 内部处理超时，配合 algoClOrdId 幂等键可安全重下
-    _RETRYABLE_OKX_CODES = {"51149"}
+    #   51290 Trading bot engine currently upgrading —— OKX 明确要求重试，纯读端接口重试无副作用；
+    #         下单端配合 algoClOrdId 幂等键也安全
+    _RETRYABLE_OKX_CODES = {"51149", "51290"}
 
     def _request(
         self,

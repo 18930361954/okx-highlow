@@ -71,12 +71,19 @@ def _sparkline(vals: list[float]) -> str:
 def generate_report(db, account, config, target_date: str | None = None) -> Path:
     today = target_date or datetime.now(UTC).date().isoformat()
     sig_date = (datetime.fromisoformat(today).date() - timedelta(days=1)).isoformat()
-    trades = db.list_trades_by_date(sig_date)
+    # 未触发挂单仍按 signal_date=昨日看
+    trades_today_signal = db.list_trades_by_date(sig_date)
+
+    # 「当日成交」按 exit_time 落在 today 聚合：一笔前几天挂的单可能今天才平仓，
+    # 之前按 signal_date 分组会漏掉这类跨日成交（例如 07-05 signal 的 SOL 07-07 才平仓）。
+    all_trades = db.list_trades(limit=10000)
+    filled = [t for t in all_trades
+              if t.get("exit_price") is not None
+              and (t.get("exit_time") or "")[:10] == today]
 
     start_balance_str = db.get_state(f"balance_start_{today}")
     end_balance = account.get_balance()
 
-    filled = [t for t in trades if t.get("exit_price") is not None]
     wins = sum(1 for t in filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in filled if (t.get("pnl") or 0) < 0)
     total_pnl = sum((t.get("pnl") or 0) for t in filled)
@@ -192,7 +199,7 @@ def generate_report(db, account, config, target_date: str | None = None) -> Path
     lines.append("")
 
     # === 未触发挂单 ===
-    pending = [t for t in trades if t.get("exit_price") is None]
+    pending = [t for t in trades_today_signal if t.get("exit_price") is None]
     if pending:
         lines.append("## 未触发挂单")
         lines.append("| 品种 | 方向 | 触发价 | 保证金 | mode |")

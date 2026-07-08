@@ -53,3 +53,7 @@ system:
 account:
   env: demo
   td_mode: cross   # cross 全仓 / isolated 逐仓。建议 cross 避免 set_leverage 被旧 TP/SL 单卡住
+
+network:
+  proxy_enabled: false             # 打开时 OKX REST 全部走 proxy_url
+  proxy_url: "http://127.0.0.1:18081"

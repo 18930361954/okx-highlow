@@ -104,10 +104,12 @@ class PositionMonitor:
         trade_tbl = Table(title="今日已成交", show_header=True, header_style="green", expand=True)
         for c in ("时间", "品种", "方向", "出场", "原因", "PnL"):
             trade_tbl.add_column(c)
-        # 今日执行的交易在 db 里 signal_date=昨日（昨日 K → 今日单）
-        sig_date = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
-        rows = self.db.list_trades_by_date(sig_date)
-        filled = [r for r in rows if r.get("exit_price") is not None]
+        # 「今日已成交」按 exit_time 落在今天 UTC 聚合；signal_date 可能是前几日。
+        today_iso = datetime.now(UTC).date().isoformat()
+        all_rows = self.db.list_trades(limit=500)
+        filled = [r for r in all_rows
+                  if r.get("exit_price") is not None
+                  and (r.get("exit_time") or "")[:10] == today_iso]
         for r in filled:
             trade_tbl.add_row(
                 (r.get("exit_time") or "")[:19],
