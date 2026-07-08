@@ -61,7 +61,7 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020 }
         ETH-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.006, sl_pct: 0.020 }
-        SOL-USDT-SWAP: { float_pct: 0.0025, tp_pct: 0.006, sl_pct: 0.020 }
+        SOL-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020 }
 
   # 「6H 三币组合」— 每天 4 次挂单
   - account_name: 实盘-A1455923264
@@ -100,7 +100,7 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020 }
         ETH-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.006, sl_pct: 0.020 }
-        SOL-USDT-SWAP: { float_pct: 0.0025, tp_pct: 0.006, sl_pct: 0.020 }
+        SOL-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020 }
 
   - account_name: 模拟盘-A1455923264
     api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
