@@ -88,7 +88,8 @@ def main() -> None:
     ap.add_argument("--balance", type=float, default=300.0)
     ap.add_argument("--days", type=int, default=730)
     ap.add_argument("--position-pct", type=float, default=0.10)
-    ap.add_argument("--leverage", type=int, default=100)
+    ap.add_argument("--leverage", type=int, default=100,
+                    help="SOL 实盘上限 50x,回测时对 SOL 记得传 --leverage 50")
     ap.add_argument("--out", default=str(ROOT / "reports" / "grid_results.csv"))
     args = ap.parse_args()
 
