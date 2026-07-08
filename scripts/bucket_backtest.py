@@ -59,6 +59,7 @@ class BacktestResult:
     profit_factor: float
     monthly_pct: float
     n_signals: int  # 生成过多少个信号桶
+    yearly: dict | None = None   # {'2024': {'pnl': ..., 'end_balance': ...}, ...}
 
     def as_row(self) -> dict:
         d = self.__dict__.copy()
@@ -69,6 +70,11 @@ class BacktestResult:
             v = d[k]
             if isinstance(v, float):
                 d[k] = round(v, 3)
+        # yearly 平铺成列 y2024_end / y2024_pnl 等
+        y = d.pop("yearly", None) or {}
+        for yr, v in y.items():
+            d[f"y{yr}_end"] = round(v.get("end_balance", 0), 2)
+            d[f"y{yr}_pnl_pct"] = round(v.get("pnl_pct", 0), 2)
         return d
 
 
@@ -104,14 +110,16 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
              position_pct: float = 0.10,
              leverage: int = 100,
              fixed_margin: bool = True,
-             taker_fee: float = 0.0005) -> BacktestResult:
+             taker_fee: float = 0.0005,
+             slippage_bps: float = 0.0,
+             funding_bps_per_8h: float = 0.0) -> BacktestResult:
     """
-    fixed_margin=True(默认): 每笔 margin = initial * position_pct(不复利)。
-      好处:MDD 有真实意义,收益率线性可比,爆仓门槛真实。
-    fixed_margin=False: 每笔 margin = balance * position_pct(全额复利)。
-      问题:小周期高频交易下复利指数放大,MDD 99% + 收益百万倍并存,不真实。
-    taker_fee: 每笔进出场共扣两次 fee (= 2 * taker_fee * notional * pct 近似)。
-      OKX SWAP taker 5bp,进出场 → 每笔总费 ≈ 10bp of notional。
+    fixed_margin=True: 每笔 margin = initial * position_pct(不复利)。MDD 有真实意义。
+    fixed_margin=False: 每笔 margin = balance * position_pct(全额复利)。收益指数放大。
+    taker_fee: 5bp × 2/笔 = 10bp of notional。
+    slippage_bps: 每笔额外扣多少 bp 滑点 (悲观口径,应用于 pnl 之前的 pct)。
+    funding_bps_per_8h: 单币每 8h 一次的 funding 费率(应用于持仓时长比例的 notional)。
+      持仓超过 8h 会被扣一次;超过 16h 两次...
     """
     """按信号桶逐个跑。信号桶用 df_sig(聚合),入场后在 df_base 里逐根 K 判 TP/SL。
     向量化版:所有信号桶入场/退出用 numpy 一次算完。"""
@@ -132,16 +140,16 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
     sig_c = df_sig["close"].to_numpy()
     sig_h = df_sig["high"].to_numpy()
     sig_l = df_sig["low"].to_numpy()
-    # 用 int64 ns 表达时间;避开 tz-aware datetime object 与 timedelta64 相加的错
-    sig_ts_ns = df_sig.index.view("int64")
-
-    base_ts_ns = df_base.index.view("int64")
+    # 注意:pandas datetime64 index 的 unit 取决于源数据 (通常是 ms),不是 ns。
+    # 先 tz_convert 到 UTC 去 tz(否则 tz-aware 不能 astype),再统一到 ms int64。
+    sig_ts_ms = df_sig.index.tz_convert("UTC").tz_localize(None).astype("datetime64[ms]").view("int64")
+    base_ts_ms = df_base.index.tz_convert("UTC").tz_localize(None).astype("datetime64[ms]").view("int64")
     base_h = df_base["high"].to_numpy()
     base_l = df_base["low"].to_numpy()
     base_c = df_base["close"].to_numpy()
 
     bucket_secs = BASE_BAR_SECS[signal_bar]
-    bucket_ns = bucket_secs * 1_000_000_000
+    bucket_ms = bucket_secs * 1000
 
     # 每个信号桶(除最后一个):方向 / 入场价 / tp / sl
     dir_arr = np.zeros(n_buckets - 1, dtype=np.int8)  # 1 long, -1 short, 0 skip
@@ -151,20 +159,26 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
     entry_long = sig_l[:-1] * (1 - float_pct)
     entry_short = sig_h[:-1] * (1 + float_pct)
 
-    # 下一桶时间范围 [start_ns[i], end_ns[i])
-    start_ns = sig_ts_ns[1:]
-    end_ns = start_ns + bucket_ns
+    # 下一桶时间范围 [start_ms[i], end_ms[i])
+    start_ms = sig_ts_ms[1:]
+    end_ms = start_ms + bucket_ms
 
     # 每桶在 base 里的 [lo, hi)
-    lo_arr = np.searchsorted(base_ts_ns, start_ns, side="left")
-    hi_arr = np.searchsorted(base_ts_ns, end_ns, side="left")
+    lo_arr = np.searchsorted(base_ts_ms, start_ms, side="left")
+    hi_arr = np.searchsorted(base_ts_ms, end_ms, side="left")
 
     balance = initial_balance
     peak = balance
     max_dd_pct = 0.0
     pnls: list[float] = []
+    exit_years: list[int] = []
+    yearly_end: dict[int, float] = {}
 
-    # 因 balance 依赖上一笔,需要按顺序 —— 但每笔内部完全用 numpy 切片判断
+    slippage = slippage_bps * 1e-4  # bp → 小数
+    funding = funding_bps_per_8h * 1e-4  # 每 8h 一次的费率
+
+    base_ts_secs = base_ts_ms // 1000  # int64,便于算持仓时长
+
     for i in range(n_buckets - 1):
         d = dir_arr[i]
         if d == 0:
@@ -178,14 +192,12 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
             entry = entry_long[i]
             tp = entry * (1 + tp_pct)
             sl = entry * (1 - sl_pct)
-            # 触发入场:第一根 low <= entry
             hit_entry = base_l[lo:hi] <= entry
             if not hit_entry.any():
                 continue
-            entry_off = int(hit_entry.argmax())  # 第一个 True
+            entry_off = int(hit_entry.argmax())
             ek = lo + entry_off
 
-            # entry 起判 TP/SL
             sub_h = base_h[ek:hi]
             sub_l = base_l[ek:hi]
             sl_mask = sub_l <= sl
@@ -194,15 +206,19 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
             tp_first = int(tp_mask.argmax()) if tp_mask.any() else -1
 
             if sl_first == -1 and tp_first == -1:
+                exit_off = (hi - ek) - 1
                 exit_price = float(base_c[hi - 1])
             elif sl_first == -1:
+                exit_off = tp_first
                 exit_price = tp
             elif tp_first == -1:
+                exit_off = sl_first
                 exit_price = sl
             elif sl_first <= tp_first:
-                # 同根双穿 → SL 优先
+                exit_off = sl_first
                 exit_price = sl
             else:
+                exit_off = tp_first
                 exit_price = tp
             pct = (exit_price - entry) / entry
         else:
@@ -223,33 +239,66 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
             tp_first = int(tp_mask.argmax()) if tp_mask.any() else -1
 
             if sl_first == -1 and tp_first == -1:
+                exit_off = (hi - ek) - 1
                 exit_price = float(base_c[hi - 1])
             elif sl_first == -1:
+                exit_off = tp_first
                 exit_price = tp
             elif tp_first == -1:
+                exit_off = sl_first
                 exit_price = sl
             elif sl_first <= tp_first:
+                exit_off = sl_first
                 exit_price = sl
             else:
+                exit_off = tp_first
                 exit_price = tp
             pct = (entry - exit_price) / entry
 
+        # 滑点:每笔 pct 直接减 slippage
+        pct -= slippage
+
         margin = (initial_balance if fixed_margin else balance) * position_pct
-        # 手续费:开+平各扣一次 taker_fee(相对 notional)
         notional = margin * leverage
+
+        # 持仓时长秒 → funding 次数 (向上取整,持仓 > 0s 就算)
+        exit_k = ek + exit_off
+        hold_secs = max(0, int(base_ts_secs[exit_k] - base_ts_secs[ek]))
+        funding_periods = hold_secs // (8 * 3600) + (1 if hold_secs % (8 * 3600) > 0 and hold_secs > 0 else 0)
+        funding_cost = funding_periods * funding * notional
+
+        # 手续费:开+平各扣一次 taker_fee
         fee = 2 * taker_fee * notional
-        pnl = notional * pct - fee
+        pnl = notional * pct - fee - funding_cost
         balance += pnl
         peak = max(peak, balance)
         if peak > 0:
             dd = (peak - balance) / peak * 100
             max_dd_pct = max(max_dd_pct, dd)
         pnls.append(pnl)
+
+        # 年度记录:按 exit K 的年份 (base_ts_ms 是毫秒)
+        exit_year = int(pd.Timestamp(base_ts_ms[exit_k], unit="ms", tz="UTC").year)
+        exit_years.append(exit_year)
+        yearly_end[exit_year] = balance
+
         if balance <= 0:
             balance = 0
             break
 
     trades = [{"pnl": p} for p in pnls]
+
+    # 年度汇总
+    yearly: dict[str, dict] = {}
+    prev_end = initial_balance
+    for yr in sorted(yearly_end.keys()):
+        end_bal = yearly_end[yr]
+        pnl_pct = (end_bal - prev_end) / prev_end * 100 if prev_end > 0 else 0
+        yearly[str(yr)] = {
+            "end_balance": end_bal,
+            "pnl_pct": pnl_pct,
+        }
+        prev_end = end_bal
 
     wins = sum(1 for t in trades if t["pnl"] > 0)
     losses = sum(1 for t in trades if t["pnl"] < 0)
@@ -270,7 +319,7 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
         trades=total, wins=wins, losses=losses,
         win_rate_pct=win_rate, max_dd_pct=max_dd_pct,
         profit_factor=pf, monthly_pct=monthly,
-        n_signals=n_buckets,
+        n_signals=n_buckets, yearly=yearly,
     )
 
 
@@ -299,10 +348,16 @@ def main() -> None:
     ap.add_argument("--float", dest="float_pct", type=float, default=0.002)
     ap.add_argument("--tp", dest="tp_pct", type=float, default=0.012)
     ap.add_argument("--sl", dest="sl_pct", type=float, default=0.008)
-    ap.add_argument("--balance", type=float, default=300.0)
+    ap.add_argument("--balance", type=float, default=140.0)
     ap.add_argument("--position-pct", type=float, default=0.10)
     ap.add_argument("--leverage", type=int, default=100)
     ap.add_argument("--days", type=int, default=730)
+    ap.add_argument("--compound", action="store_true",
+                    help="复利模式:margin = 当前余额 × position_pct(默认固定 initial × pct)")
+    ap.add_argument("--slippage-bps", type=float, default=0.0,
+                    help="每笔额外滑点 bp,10 = 0.1 pct")
+    ap.add_argument("--funding-bps", type=float, default=0.0,
+                    help="每 8h funding 费率 bp,3 = 0.03 pct")
     args = ap.parse_args()
 
     base_bar = args.base or _pick_base_bar(args.signal)
@@ -314,13 +369,23 @@ def main() -> None:
         args.float_pct, args.tp_pct, args.sl_pct,
         initial_balance=args.balance,
         position_pct=args.position_pct, leverage=args.leverage,
+        fixed_margin=not args.compound,
+        slippage_bps=args.slippage_bps,
+        funding_bps_per_8h=args.funding_bps,
     )
 
-    print(f"=== {res.pair} base={res.base_bar} signal={res.signal_bar} ===")
-    print(f"  float={res.float_pct} tp={res.tp_pct} sl={res.sl_pct}")
-    print(f"  return={res.total_return_pct:+.2f}% monthly={res.monthly_pct:+.2f}%")
+    print(f"=== {res.pair} base={res.base_bar} signal={res.signal_bar} "
+          f"({'复利' if args.compound else '固定'}) ===")
+    print(f"  float={res.float_pct} tp={res.tp_pct} sl={res.sl_pct} "
+          f"initial={res.initial} slippage={args.slippage_bps}bp funding={args.funding_bps}bp/8h")
+    print(f"  final={res.final:.2f} return={res.total_return_pct:+.2f}% "
+          f"monthly={res.monthly_pct:+.2f}%")
     print(f"  trades={res.trades} win={res.win_rate_pct:.1f}% mdd={res.max_dd_pct:.2f}%")
     print(f"  pf={res.profit_factor if res.profit_factor != float('inf') else 'inf'}")
+    if res.yearly:
+        print("  年度余额曲线:")
+        for yr, y in res.yearly.items():
+            print(f"    {yr}: {y['pnl_pct']:+7.2f}% → {y['end_balance']:.2f}")
 
 
 if __name__ == "__main__":

@@ -39,7 +39,8 @@ SL_GRID = [0.005, 0.008, 0.010, 0.015]
 def run_grid(pairs: list[str], signal_bars: list[str],
              floats: list[float], tps: list[float], sls: list[float],
              balance: float, days: int, position_pct: float,
-             leverage: int) -> list[dict]:
+             leverage: int, compound: bool = False,
+             slippage_bps: float = 0.0, funding_bps: float = 0.0) -> list[dict]:
     results: list[dict] = []
     total_cases = len(pairs) * len(signal_bars) * len(floats) * len(tps) * len(sls)
     print(f"[grid] total cases: {total_cases}")
@@ -63,7 +64,10 @@ def run_grid(pairs: list[str], signal_bars: list[str],
                 try:
                     r = simulate(df_base, df_sig, pair, base_bar, signal_bar,
                                  fp, tp, sl, initial_balance=balance,
-                                 position_pct=position_pct, leverage=leverage)
+                                 position_pct=position_pct, leverage=leverage,
+                                 fixed_margin=not compound,
+                                 slippage_bps=slippage_bps,
+                                 funding_bps_per_8h=funding_bps)
                 except Exception as e:
                     print(f"[fail] {pair} {signal_bar} f={fp} tp={tp} sl={sl}: {e}")
                     done += 1
@@ -91,6 +95,9 @@ def main() -> None:
     ap.add_argument("--leverage", type=int, default=100,
                     help="SOL 实盘上限 50x,回测时对 SOL 记得传 --leverage 50")
     ap.add_argument("--out", default=str(ROOT / "reports" / "grid_results.csv"))
+    ap.add_argument("--compound", action="store_true", help="复利模式")
+    ap.add_argument("--slippage-bps", type=float, default=0.0)
+    ap.add_argument("--funding-bps", type=float, default=0.0)
     args = ap.parse_args()
 
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
@@ -100,7 +107,10 @@ def main() -> None:
     sls = [float(x) for x in args.sls.split(",") if x.strip()]
 
     results = run_grid(pairs, signals, floats, tps, sls,
-                       args.balance, args.days, args.position_pct, args.leverage)
+                       args.balance, args.days, args.position_pct, args.leverage,
+                       compound=args.compound,
+                       slippage_bps=args.slippage_bps,
+                       funding_bps=args.funding_bps)
 
     if results:
         out = Path(args.out)
