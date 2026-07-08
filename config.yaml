@@ -60,35 +60,51 @@ network:
 
 # ---------------- 多账户 (multi-account) ----------------
 # 用于「一进程内并行跑多个策略/API key」的实盘部署。
-#   - main.py 走上面的 legacy 单账户模式（不受这段影响）
-#   - main_multi.py 读 accounts 段,每个账户独立 OKXClient + DB + AccountState + Reconciler
 # 每账户可选字段:
-#   name         必填,ID(用于 db 文件名 + 日志前缀)。建议 kebab-case
-#   enabled      默认 true;false 时跳过
-#   env          demo / live
-#   api_key/secret_key/passphrase  该账户的 OKX API 三件套
-#   pairs        该账户跑哪些 pair;缺省沿用 strategy.pairs
-#   strategy     可选,覆盖顶层 strategy 的任意字段(浅覆盖,pair_overrides 深合并)
-#   td_mode      cross / isolated;缺省沿用 account.td_mode
-#   db_path      SQLite 路径;缺省 data/trades_<name>.db
-accounts: []
-# 示例(私仓可直接填 key,公开仓请改用 ${ENV_VAR} 占位后由 main_multi 展开):
-# accounts:
-#   - name: btc-only
-#     enabled: true
-#     env: demo
-#     api_key: "xxx"
-#     secret_key: "yyy"
-#     passphrase: "zzz"
-#     pairs: [BTC-USDT-SWAP]
-#     td_mode: cross
-#     strategy:
-#       pair_overrides:
-#         BTC-USDT-SWAP: { sl_pct: 0.008, tp_pct: 0.012 }
-#   - name: sol-hunter
-#     enabled: true
-#     env: live
-#     api_key: "aaa"
-#     secret_key: "bbb"
-#     passphrase: "ccc"
-#     pairs: [SOL-USDT-SWAP]
+#   account_name / name          必填,标识 (用于 db account 列 + 日志前缀)
+#   enabled                       默认 true;false 时跳过
+#   env_adapt / env               real|live / demo
+#   api_key / secret_key / passphrase   该账户的 OKX API 三件套
+#   pairs                         该账户跑哪些 pair;缺省沿用 strategy.pairs
+#   strategy                      可选,覆盖顶层 strategy 的任意字段(浅覆盖,pair_overrides 深合并)
+#   td_mode                       cross / isolated;缺省沿用 account.td_mode
+#
+# 无 accounts 段 → 自动从 .env 合成一个名为 default 的账户(行为等价旧 main.py)
+accounts:
+  # 实盘账户
+  - account_name: 实盘-主账户
+    api_key: 4a5db4d2-3b73-4a39-b824-5209fa76bfae
+    secret_key: 456CC065FB5C3CF833E89AA18A668031
+    passphrase: Zdx19971226@@
+    env_adapt: real
+
+  - account_name: 实盘-A1455923264
+    api_key: b373cac5-3f42-46a3-9741-6b26a440e781
+    secret_key: 8879F75B9A45944DEFC7F442D2D256EA
+    passphrase: Zdx19971226@@
+    env_adapt: real
+
+  - account_name: 实盘-bot14559
+    api_key: e27a1897-27ef-495a-81bc-0b014e02219a
+    secret_key: 049CA31D8CE0B652676FFA9EA045C970
+    passphrase: Zdx19971226@@
+    env_adapt: real
+
+  # 模拟盘账户
+  - account_name: 模拟盘-主账户
+    api_key: e5b77589-31a3-456b-8900-834de01fef45
+    secret_key: 10930BAADD1DFB4C324A9066A2BC4CC1
+    passphrase: Zdx19971226@@
+    env_adapt: demo
+
+  - account_name: 模拟盘-A1455923264
+    api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
+    secret_key: 92BBD3C260D31827F0AA39BA0ABFFD56
+    passphrase: Zdx19971226@@
+    env_adapt: demo
+
+  - account_name: 模拟盘-bot14559
+    api_key: fbdcc756-3241-4560-9540-6476c96f2548
+    secret_key: F92BE16A31E148D3D52FC9E6832A7489
+    passphrase: Zdx19971226@@
+    env_adapt: demo

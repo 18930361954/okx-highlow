@@ -103,9 +103,22 @@ def _resolve_proxy_url(top_cfg: dict) -> str | None:
     return url or None
 
 
+def _normalize_env(v: str) -> str:
+    """把 real/live/prod 归一到 'live';demo/sim/simulate 归一到 'demo'。
+    OKXClient 里 env != 'demo' 就走 live(不加模拟盘头)。"""
+    v = (v or "").strip().lower()
+    if v in ("live", "real", "prod", "production"):
+        return "live"
+    if v in ("demo", "sim", "simulate", "simulation"):
+        return "demo"
+    return v or "demo"
+
+
 def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
     enabled = bool(raw.get("enabled", True))
-    env = str(raw.get("env") or top_cfg.get("account", {}).get("env") or "demo")
+    # 兼容字段名:env / env_adapt;取值 real/live/demo 都归一
+    env_raw = raw.get("env") or raw.get("env_adapt") or top_cfg.get("account", {}).get("env") or "demo"
+    env = _normalize_env(str(env_raw))
 
     api_key = str(_expand_env(raw.get("api_key", "")) or "")
     secret_key = str(_expand_env(raw.get("secret_key", "")) or "")
@@ -212,7 +225,8 @@ def load_accounts(top_cfg: dict, db: DB, base_logger) -> list[AccountRuntime]:
     runtimes: list[AccountRuntime] = []
     seen: set[str] = set()
     for i, raw in enumerate(accounts_raw):
-        name = str(raw.get("name") or f"acc{i}")
+        # 兼容 name / account_name 两种键名
+        name = str(raw.get("name") or raw.get("account_name") or f"acc{i}")
         if name in seen:
             raise ValueError(f"duplicate account name: {name}")
         seen.add(name)
