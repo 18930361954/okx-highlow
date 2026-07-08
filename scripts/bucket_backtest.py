@@ -40,6 +40,14 @@ RESAMPLE_RULE = {
 }
 
 
+# OKX SWAP 合约面值(与 execution/order_manager.py DEFAULT_CT_VAL 保持一致)
+CT_VAL = {
+    "BTC-USDT-SWAP": 0.01,
+    "ETH-USDT-SWAP": 0.1,
+    "SOL-USDT-SWAP": 1.0,
+}
+
+
 @dataclass
 class BacktestResult:
     pair: str
@@ -113,17 +121,16 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
              taker_fee: float = 0.0005,
              slippage_bps: float = 0.0,
              funding_bps_per_8h: float = 0.0,
-             max_margin: float | None = None) -> BacktestResult:
+             max_margin: float | None = None,
+             max_contracts: int | None = None,
+             ct_val: float | None = None) -> BacktestResult:
     """
     fixed_margin=True: 每笔 margin = initial * position_pct(不复利)。MDD 有真实意义。
     fixed_margin=False: 每笔 margin = balance * position_pct(复利)。
-      建议同时设 max_margin 上限,避免复利数学放大到 OKX 流动性无法承接的规模。
-    max_margin: 单笔 margin 硬顶。默认 None(无限)。设 1500 → notional 上限 = 1500 × lev
-      (BTC/ETH 100x → 15 万 USDT/笔;SOL 50x → 7.5 万 USDT/笔),约占 OKX 单品种日交易量 万分之一,
-      滑点保持可控。
-    taker_fee: 5bp × 2/笔 = 10bp of notional。
-    slippage_bps: 每笔额外扣多少 bp 滑点。
-    funding_bps_per_8h: 每 8h funding 费率。
+    max_margin: 单笔 margin USDT 硬顶(旧口径,与 max_contracts 二选一)。
+    max_contracts: 单笔张数硬顶(新口径,推荐)。BTC 1000 张、ETH/SOL 5000 张。
+      张数换算 margin:notional = 张数 × 合约面值 × 入场价 → margin = notional / lev。
+    ct_val: 合约面值。若 None 则按 pair 自动查 CT_VAL 表。
     """
     """按信号桶逐个跑。信号桶用 df_sig(聚合),入场后在 df_base 里逐根 K 判 TP/SL。
     向量化版:所有信号桶入场/退出用 numpy 一次算完。"""
@@ -266,6 +273,14 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
         if max_margin is not None and margin > max_margin:
             margin = max_margin
         notional = margin * leverage
+
+        # 张数封顶:notional 按张数硬上限重算
+        if max_contracts is not None:
+            cv = ct_val if ct_val is not None else CT_VAL.get(pair, 0.01)
+            contracts_wanted = notional / (cv * entry) if (cv * entry) > 0 else 0
+            if contracts_wanted > max_contracts:
+                notional = max_contracts * cv * entry
+                margin = notional / leverage
 
         # 持仓时长秒 → funding 次数 (向上取整,持仓 > 0s 就算)
         exit_k = ek + exit_off

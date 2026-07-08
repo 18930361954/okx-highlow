@@ -38,24 +38,26 @@ def _slice(df, start, end):
 
 def _run_one(df_base, df_sig, pair, base_bar, signal_bar,
              fp, tp, sl, balance, position_pct, leverage,
-             compound, slippage_bps, funding_bps, max_margin):
+             compound, slippage_bps, funding_bps, max_contracts):
     return simulate(
         df_base, df_sig, pair, base_bar, signal_bar, fp, tp, sl,
         initial_balance=balance, position_pct=position_pct,
         leverage=leverage, fixed_margin=not compound,
         slippage_bps=slippage_bps, funding_bps_per_8h=funding_bps,
-        max_margin=max_margin,
+        max_contracts=max_contracts,
     )
 
 
 def walk_forward(pairs, signal_bars, balance, position_pct, days,
-                 train_end_iso, slippage_bps, funding_bps, max_margin,
+                 train_end_iso, slippage_bps, funding_bps,
+                 max_contracts_map: dict[str, int],
                  leverage_map: dict[str, int]) -> list[dict]:
     train_end = pd.Timestamp(train_end_iso, tz="UTC")
     results: list[dict] = []
 
     for pair in pairs:
         lev = leverage_map.get(pair, 100)
+        max_ct = max_contracts_map.get(pair)
         for sb in signal_bars:
             base_bar = _pick_base_bar(sb)
             try:
@@ -90,7 +92,7 @@ def walk_forward(pairs, signal_bars, balance, position_pct, days,
                              fp, tp, sl, balance, position_pct, lev,
                              compound=False,  # walk-forward 用固定 margin,MDD 才有意义
                              slippage_bps=slippage_bps,
-                             funding_bps=funding_bps, max_margin=max_margin)
+                             funding_bps=funding_bps, max_contracts=max_ct)
                 if r.max_dd_pct > 50 or r.trades < 30:
                     continue
                 if r.total_return_pct <= 0:
@@ -113,7 +115,7 @@ def walk_forward(pairs, signal_bars, balance, position_pct, days,
                               best["fp"], best["tp"], best["sl"],
                               balance, position_pct, lev,
                               compound=False, slippage_bps=slippage_bps,
-                              funding_bps=funding_bps, max_margin=max_margin)
+                              funding_bps=funding_bps, max_contracts=max_ct)
 
             # 通过判定
             passed = (
@@ -157,12 +159,18 @@ def main() -> None:
                     help="train/test 分界日;默认 2026-01-06 (18 个月 train + 6 个月 test)")
     ap.add_argument("--slippage-bps", type=float, default=10.0)
     ap.add_argument("--funding-bps", type=float, default=3.0)
-    ap.add_argument("--max-margin", type=float, default=1500.0)
+    ap.add_argument("--btc-max-contracts", type=int, default=1000)
+    ap.add_argument("--other-max-contracts", type=int, default=5000)
     ap.add_argument("--out", default=str(ROOT / "reports" / "walk_forward.csv"))
     args = ap.parse_args()
 
     leverage_map = {
-        "BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100, "SOL-USDT-SWAP": 50,
+        "BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100, "SOL-USDT-SWAP": 100,
+    }
+    max_contracts_map = {
+        "BTC-USDT-SWAP": args.btc_max_contracts,
+        "ETH-USDT-SWAP": args.other_max_contracts,
+        "SOL-USDT-SWAP": args.other_max_contracts,
     }
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
     sbs = [s.strip() for s in args.signals.split(",") if s.strip()]
@@ -170,7 +178,7 @@ def main() -> None:
     results = walk_forward(
         pairs, sbs, args.balance, args.position_pct, args.days,
         args.train_end, args.slippage_bps, args.funding_bps,
-        args.max_margin, leverage_map,
+        max_contracts_map, leverage_map,
     )
 
     print("\n" + "=" * 78)

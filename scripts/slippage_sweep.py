@@ -17,7 +17,8 @@ from scripts.bucket_backtest import _load_csv, _resample, _pick_base_bar, simula
 
 
 def sweep(rows: list[dict], balance: float, position_pct: float, days: int,
-          leverage_map: dict[str, int], funding_bps: float, max_margin: float,
+          leverage_map: dict[str, int], funding_bps: float,
+          max_contracts_map: dict[str, int],
           slippage_grid: list[float]) -> list[dict]:
     """rows 里每条含 pair/signal_bar/float_pct/tp_pct/sl_pct,对每个滑点跑一次。"""
     out: list[dict] = []
@@ -26,6 +27,7 @@ def sweep(rows: list[dict], balance: float, position_pct: float, days: int,
         sb = src["signal_bar"]
         fp, tp, sl = float(src["float_pct"]), float(src["tp_pct"]), float(src["sl_pct"])
         lev = leverage_map.get(pair, 100)
+        max_ct = max_contracts_map.get(pair)
         base_bar = _pick_base_bar(sb)
         try:
             df_base = _load_csv(pair, base_bar, days)
@@ -44,7 +46,7 @@ def sweep(rows: list[dict], balance: float, position_pct: float, days: int,
                          initial_balance=balance, position_pct=position_pct,
                          leverage=lev, fixed_margin=True,
                          slippage_bps=slip, funding_bps_per_8h=funding_bps,
-                         max_margin=max_margin)
+                         max_contracts=max_ct)
             row_data[f"slip{int(slip)}_return"] = round(r.total_return_pct, 2)
             row_data[f"slip{int(slip)}_mdd"] = round(r.max_dd_pct, 2)
             row_data[f"slip{int(slip)}_win"] = round(r.win_rate_pct, 2)
@@ -67,7 +69,8 @@ def main() -> None:
     ap.add_argument("--position-pct", type=float, default=0.10)
     ap.add_argument("--days", type=int, default=730)
     ap.add_argument("--funding-bps", type=float, default=3.0)
-    ap.add_argument("--max-margin", type=float, default=1500.0)
+    ap.add_argument("--btc-max-contracts", type=int, default=1000)
+    ap.add_argument("--other-max-contracts", type=int, default=5000)
     ap.add_argument("--slippages", default="0,10,30,50,100")
     ap.add_argument("--only-passed", action="store_true",
                     help="只对 walk_forward 里 passed=YES 的做敏感性")
@@ -82,12 +85,17 @@ def main() -> None:
         sys.exit(1)
 
     leverage_map = {
-        "BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100, "SOL-USDT-SWAP": 50,
+        "BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100, "SOL-USDT-SWAP": 100,
+    }
+    max_contracts_map = {
+        "BTC-USDT-SWAP": args.btc_max_contracts,
+        "ETH-USDT-SWAP": args.other_max_contracts,
+        "SOL-USDT-SWAP": args.other_max_contracts,
     }
     slippage_grid = [float(x) for x in args.slippages.split(",")]
 
     results = sweep(rows, args.balance, args.position_pct, args.days,
-                    leverage_map, args.funding_bps, args.max_margin, slippage_grid)
+                    leverage_map, args.funding_bps, max_contracts_map, slippage_grid)
 
     if results:
         out = Path(args.out)
