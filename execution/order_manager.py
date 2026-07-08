@@ -1,5 +1,7 @@
 from typing import Callable
 
+from data.db import DEFAULT_ACCOUNT
+
 
 # 各品种合约面值。OKX SWAP 张数与标的数量换算用。
 DEFAULT_CT_VAL = {
@@ -24,12 +26,13 @@ class OrderManager:
     """
 
     def __init__(self, okx_client, db, logger=None, ct_val: dict | None = None,
-                 td_mode: str = "cross"):
+                 td_mode: str = "cross", account: str = DEFAULT_ACCOUNT):
         self.okx = okx_client
         self.db = db
         self.logger = logger
         self.ct_val = {**DEFAULT_CT_VAL, **(ct_val or {})}
         self.td_mode = td_mode
+        self.account = account
         self._fill_callback: Callable | None = None
 
     # ---------- helpers ----------
@@ -174,6 +177,7 @@ class OrderManager:
             okx_order_id=algo_id,
             entry_time=None,
             attempt=attempt,
+            account=self.account,
         )
         return algo_id
 

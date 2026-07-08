@@ -1,3 +1,8 @@
+"""HighLow Bot 多账户入口。
+
+- 单账户历史配置(无 accounts 段) → 自动合成一个 'default' 账户,行为等价旧 main.py
+- 多账户配置 → 一个进程内并行跑 N 个账户,共享 data/trades.db,共享 scheduler
+"""
 import os
 import signal
 import sys
@@ -8,14 +13,11 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from core.account_state import AccountState
-from core.okx_client import OKXClient
-from core.scheduler import build_scheduler
+from core.multi_account import AccountRuntime, load_accounts
+from core.scheduler import add_account_jobs
+from apscheduler.schedulers.background import BackgroundScheduler
 from data.db import DB
-from execution.order_manager import OrderManager
 from execution.position_monitor import PositionMonitor
-from execution.reconciler import Reconciler
-from strategy.high_low import HighLowStrategy
 from utils.logger import get_logger
 from utils.time_helper import utc_now, yesterday_utc_date
 
@@ -30,8 +32,7 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def _pairs_with_open_position(okx, logger) -> set[str]:
-    """查询 OKX 上当前有真实持仓的 pair 集合（pos != 0）。任何异常返回空 set，
-    调用方按"未查到"处理，避免误跳过挂单。"""
+    """查该账户 OKX 当前有真实持仓的 pair 集合(pos != 0)。异常返回空 set。"""
     have: set[str] = set()
     try:
         for p in okx.get_positions():
@@ -41,39 +42,35 @@ def _pairs_with_open_position(okx, logger) -> set[str]:
                     have.add(inst)
     except Exception as e:
         if logger:
-            logger.warning(f"[skip-check] get_positions 失败，本轮不按持仓跳过: {e}")
+            logger.warning(f"[skip-check] get_positions 失败,本轮不按持仓跳过: {e}")
     return have
 
 
-def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger):
-    """每日 00:00 UTC：拉前一日 24 根 1H → 生成信号 → 下单。
-    挂单前对每 pair 检查 OKX 当前持仓：有持仓则暂不挂单，等 Reconciler 结算 exit
-    时自动 catch-up 补挂（详见 execution/reconciler.py 的 _catchup_after_exit）。
-    """
+def daily_signal_and_place(rt: AccountRuntime) -> None:
+    """每日 00:00 UTC (per-account):拉前一日 24 根 1H → 生成信号 → 下单。
+    挂单前查 OKX 持仓,有持仓则跳过;平仓后由 Reconciler._catchup_after_exit 补挂。"""
+    logger = rt.logger
     logger.info("[scheduler] daily_signal_and_place fired")
     now = utc_now()
-    sig_date = yesterday_utc_date(now)  # 前一日的数据 → 今日挂单
+    sig_date = yesterday_utc_date(now)
 
-    ok, reason = account.can_trade(now)
+    ok, reason = rt.account.can_trade(now)
     if not ok:
         logger.warning(f"[skip] cannot trade: {reason}")
         return
 
-    bal = account.get_balance()
-
-    # 每单之间加 1s 间隔：OKX algo 单并发限流曾触发 51149 下单超时（多币同秒下单排队）
-    place_gap_sec = float(config["strategy"].get("place_gap_sec", 1.0))
+    bal = rt.account.get_balance()
+    place_gap_sec = float(rt.cfg.strategy_config.get("place_gap_sec", 1.0))
     placed_count = 0
-    held_pairs = _pairs_with_open_position(okx, logger)
+    held_pairs = _pairs_with_open_position(rt.okx, logger)
 
-    for pair in config["strategy"]["pairs"]:
-        # 持仓保护：有持仓时暂不挂单。平仓后由 Reconciler 触发日内补挂。
+    for pair in rt.cfg.pairs:
         if pair in held_pairs:
-            logger.info(f"[skip] {pair}：当前有持仓，暂不挂单（平仓后由对账器补挂）")
+            logger.info(f"[skip] {pair}:当前有持仓,暂不挂单(平仓后由对账器补挂)")
             continue
 
         try:
-            raw = okx.get_candles(pair, bar="1H", limit=24)
+            raw = rt.okx.get_candles(pair, bar="1H", limit=24)
         except Exception as e:
             logger.error(f"get_candles({pair}) failed: {e}")
             continue
@@ -82,20 +79,19 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
             logger.warning(f"{pair}: no candles returned")
             continue
 
-        signal = strategy.compute_signal(pair, raw, signal_date=sig_date)
-        if not signal:
+        signal_dict = rt.strategy.compute_signal(pair, raw, signal_date=sig_date)
+        if not signal_dict:
             logger.info(f"{pair}: no signal (flat or insufficient data)")
             continue
 
-        # pair 级仓位比例 + pair 级杠杆（SOL 50x、BTC/ETH 100x）
-        margin, mode = account.compute_margin(bal, pair=pair)
-        leverage = account.leverage_for(pair)
-        logger.info(f"[signal] {signal['reason']} margin={margin:.2f} ({mode}) lev={leverage}x")
+        margin, mode = rt.account.compute_margin(bal, pair=pair)
+        leverage = rt.account.leverage_for(pair)
+        logger.info(f"[signal] {signal_dict['reason']} margin={margin:.2f} ({mode}) lev={leverage}x")
 
         if placed_count > 0 and place_gap_sec > 0:
             time.sleep(place_gap_sec)
 
-        algo_id = order_mgr.place_algo_orders(signal, margin=margin, leverage=leverage)
+        algo_id = rt.order_manager.place_algo_orders(signal_dict, margin=margin, leverage=leverage)
         placed_count += 1
         if algo_id:
             logger.info(f"[order] {pair} algoId={algo_id}")
@@ -103,167 +99,184 @@ def daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger
             logger.error(f"[order] {pair} place_algo_orders returned no id")
 
 
-def daily_report(db, account, config, logger):
-    """每日 23:55 UTC：生成 Markdown 报告"""
-    logger.info("[scheduler] daily_report fired")
+def daily_report_all(runtimes: list[AccountRuntime], config: dict, base_logger) -> None:
+    """每日 23:55 UTC (全局共 1 次): 生成一份主报告 = 总览 + 各账户拆分表。"""
+    base_logger.info("[scheduler] daily_report fired (all accounts)")
     try:
-        from scripts.daily_report import generate_report
-        generate_report(db, account, config)
+        from scripts.daily_report import generate_multi_account_report
+        out = generate_multi_account_report(runtimes, config)
+        base_logger.info(f"[report] saved → {out}")
     except Exception as e:
-        logger.error(f"daily_report failed: {e}")
+        base_logger.error(f"daily_report failed: {e}")
 
 
-def daily_cancel(order_mgr, logger):
-    """每日 23:59 UTC：撤所有未触发挂单"""
-    logger.info("[scheduler] daily_cancel fired")
-    order_mgr.cancel_all_pending()
+def daily_cancel(rt: AccountRuntime) -> None:
+    rt.logger.info("[scheduler] daily_cancel fired")
+    rt.order_manager.cancel_all_pending()
 
 
-def startup_catchup_if_needed(okx, db, strategy, account, order_mgr, config, logger):
-    """启动时若已过今日 signal_time_utc 且今日该 pair 尚未挂过单，补跑一次 daily_signal_and_place。
-    判定：db.trades 里 signal_date=昨日 且 pair=该 pair 的记录不存在 → 视为漏挂。
-    补挂时会临时把 config.strategy.pairs 收窄成"待补 pair 列表"，避免对已挂 pair 重复下单。
-    """
+def startup_catchup_if_needed(rt: AccountRuntime) -> None:
+    """启动时若已过 signal_time_utc 且今日该 pair 尚未挂过单,补跑一次 daily_signal_and_place。"""
+    logger = rt.logger
+    config_strat = rt.cfg.strategy_config
     now = utc_now()
-    sig_h, sig_m = map(int, str(config["strategy"]["signal_time_utc"]).split(":"))
+    sig_h, sig_m = map(int, str(config_strat.get("signal_time_utc", "00:00")).split(":"))
     today_signal_ts = now.replace(hour=sig_h, minute=sig_m, second=0, microsecond=0)
     if now < today_signal_ts:
         logger.info(f"[catchup] now {now.strftime('%H:%M')} < signal_time "
-                    f"{sig_h:02d}:{sig_m:02d}, 无需补挂")
+                    f"{sig_h:02d}:{sig_m:02d},无需补挂")
         return
 
-    sig_date = yesterday_utc_date(now)  # 今日挂的单 db 里 signal_date=昨日
-    existing_db = {r["pair"] for r in db.list_trades_by_date(sig_date.isoformat())}
+    sig_date = yesterday_utc_date(now)
+    existing_db = {
+        r["pair"] for r in rt.db.list_trades_by_date(sig_date.isoformat(), account=rt.name)
+    }
 
-    # 交叉验证 OKX 实际状态：pending algo 单 + 已有持仓都算"今日已处理"，
-    # 防止 db 因下单成功但客户端漏写等边界情况导致重复挂单。
     existing_okx: set[str] = set()
     try:
-        for o in okx.list_pending_algos(ordType="trigger"):
+        for o in rt.okx.list_pending_algos(ordType="trigger"):
             inst = o.get("instId")
             if inst:
                 existing_okx.add(inst)
     except Exception as e:
-        logger.warning(f"[catchup] list_pending_algos 失败，仅按 db 判定: {e}")
+        logger.warning(f"[catchup] list_pending_algos 失败,仅按 db 判定: {e}")
     try:
-        for p in okx.get_positions():
+        for p in rt.okx.get_positions():
             if float(p.get("pos", 0) or 0) != 0:
                 inst = p.get("instId")
                 if inst:
                     existing_okx.add(inst)
     except Exception as e:
-        logger.warning(f"[catchup] get_positions 失败，仅按 db 判定: {e}")
+        logger.warning(f"[catchup] get_positions 失败,仅按 db 判定: {e}")
 
     pending: list[str] = []
-    for pair in config["strategy"]["pairs"]:
+    for pair in rt.cfg.pairs:
         if pair in existing_db:
-            logger.info(f"[catchup] {pair} 今日已处理（db 有记录），跳过")
+            logger.info(f"[catchup] {pair} 今日已处理(db 有记录),跳过")
         elif pair in existing_okx:
-            logger.info(f"[catchup] {pair} OKX 已有 pending/持仓（db 缺记录），跳过")
+            logger.info(f"[catchup] {pair} OKX 已有 pending/持仓(db 缺记录),跳过")
         else:
             pending.append(pair)
 
     if not pending:
-        logger.info("[catchup] 所有 pair 今日均已处理，跳过补挂")
+        logger.info("[catchup] 所有 pair 今日均已处理,跳过补挂")
         return
 
     logger.info(f"[catchup] 补挂 pairs: {pending}")
-    original_pairs = config["strategy"]["pairs"]
+    original = list(rt.cfg.pairs)
     try:
-        config["strategy"]["pairs"] = pending
-        daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger)
+        rt.cfg.pairs = pending
+        daily_signal_and_place(rt)
     finally:
-        config["strategy"]["pairs"] = original_pairs
+        rt.cfg.pairs = original
 
 
-def init_balance_if_needed(okx, account, logger):
-    """首次启动：余额 == 0 时从 OKX 拉一次实际余额"""
-    if account.get_balance() <= 0:
+def init_balance_if_needed(rt: AccountRuntime) -> None:
+    if rt.account.get_balance() <= 0:
         try:
-            bal = okx.get_balance("USDT")
-            account.set_balance(bal)
-            logger.info(f"[init] balance bootstrapped from OKX: {bal:.2f} USDT")
+            bal = rt.okx.get_balance("USDT")
+            rt.account.set_balance(bal)
+            rt.logger.info(f"[init] balance bootstrapped from OKX: {bal:.2f} USDT")
         except Exception as e:
-            logger.error(f"[init] cannot fetch balance: {e}")
+            rt.logger.error(f"[init] cannot fetch balance: {e}")
 
 
 def main():
     load_dotenv(PROJECT_ROOT / ".env")
     config = load_config()
-    logger = get_logger("hl-bot", level=config["system"]["log_level"],
-                        keep_days=int(config["system"]["log_keep_days"]))
+    base_logger = get_logger(
+        "hl-bot", level=config["system"]["log_level"],
+        keep_days=int(config["system"]["log_keep_days"]),
+    )
 
-    api_key = os.getenv("OKX_API_KEY", "")
-    secret = os.getenv("OKX_SECRET_KEY", "")
-    passphrase = os.getenv("OKX_PASSPHRASE", "")
-    if not api_key:
-        logger.error("OKX_API_KEY not set in .env — exiting")
+    db_path = PROJECT_ROOT / config["system"]["db_path"]
+    db = DB(db_path)
+
+    # 加载账户 (无 accounts 段 → 自动合成 default,行为等价旧 main.py)
+    try:
+        runtimes = load_accounts(config, db, base_logger)
+    except Exception as e:
+        base_logger.error(f"load_accounts failed: {e}")
         sys.exit(1)
 
-    db = DB(PROJECT_ROOT / config["system"]["db_path"])
+    if not runtimes:
+        base_logger.error("没有可运行的账户,退出")
+        sys.exit(1)
 
-    net_cfg = config.get("network") or {}
-    proxy_url = str(net_cfg.get("proxy_url") or "") if net_cfg.get("proxy_enabled") else None
-    okx = OKXClient(api_key, secret, passphrase, env=config["account"]["env"],
-                    logger=logger, proxy_url=proxy_url)
+    base_logger.info(f"[boot] 启用 {len(runtimes)} 个账户: {[rt.name for rt in runtimes]}")
 
-    if not okx.test_connection():
-        logger.error("OKX connection failed — exiting")
+    # 逐账户连通性检查 + 初始化
+    ok_runtimes: list[AccountRuntime] = []
+    for rt in runtimes:
+        if not rt.okx.test_connection():
+            rt.logger.error("OKX 连接失败,该账户跳过启动")
+            continue
+        rt.logger.info(f"OKX connected (env={rt.cfg.env})")
+        init_balance_if_needed(rt)
+        # 预设杠杆
+        for pair in rt.cfg.pairs:
+            lev = rt.account.leverage_for(pair)
+            try:
+                rt.okx.set_leverage(pair, lev, mgnMode=rt.cfg.td_mode)
+                rt.logger.info(f"[lev] {pair} = {lev}x ({rt.cfg.td_mode}) ok")
+            except Exception as e:
+                rt.logger.warning(
+                    f"set_leverage {pair} {lev}x {rt.cfg.td_mode} failed (可到 OKX 手动设): {e}"
+                )
+        ok_runtimes.append(rt)
+
+    if not ok_runtimes:
+        base_logger.error("所有账户 OKX 连接均失败,退出")
         sys.exit(2)
-    logger.info(f"OKX connected (env={config['account']['env']})")
 
-    strategy = HighLowStrategy(config, logger=logger)
-    account = AccountState(db, config, logger=logger)
-    td_mode = str(config["account"].get("td_mode", "cross"))
-    order_mgr = OrderManager(okx, db, logger=logger, td_mode=td_mode)
-
-    init_balance_if_needed(okx, account, logger)
-
-    # 预设杠杆（cross 全仓：set_leverage 一次设好 long+short）
-    # per-pair leverage：SOL 走 50x，BTC/ETH 走 100x
-    for pair in config["strategy"]["pairs"]:
-        lev = account.leverage_for(pair)
-        try:
-            okx.set_leverage(pair, lev, mgnMode=td_mode)
-            logger.info(f"[lev] {pair} = {lev}x ({td_mode}) ok")
-        except Exception as e:
-            logger.warning(f"set_leverage {pair} {lev}x {td_mode} failed (可到 OKX 手动设): {e}")
-
-    monitor = PositionMonitor(okx, db, account, config, logger=logger)
+    # 终端面板:多账户下只显示第一个账户(避免 rich Live 冲突)。
+    # 想看某个账户可以在 config 里把它放到 accounts 首位。
+    monitor = PositionMonitor(ok_runtimes[0].okx, db, ok_runtimes[0].account,
+                              ok_runtimes[0].cfg.to_legacy_config(), logger=base_logger)
     monitor.start()
 
-    reconciler = Reconciler(okx, db, account, config, logger=logger,
-                            strategy=strategy, order_manager=order_mgr)
-
-    def _reconcile_tick():
-        try:
-            n = reconciler.run_once()
-            if n:
-                logger.info(f"[reconcile] settled {n} trade update(s)")
-        except Exception as e:
-            logger.error(f"[reconcile] tick failed: {e}")
-
-    # 解析 signal/report/cancel 时间
-    sig_h, sig_m = map(int, str(config["strategy"]["signal_time_utc"]).split(":"))
+    # 调度器
+    sched = BackgroundScheduler(timezone=UTC)
     rep_h, rep_m = map(int, str(config["system"]["daily_report_time_utc"]).split(":"))
 
-    sched = build_scheduler(
-        daily_signal_fn=lambda: daily_signal_and_place(okx, db, strategy, account, order_mgr, config, logger),
-        daily_report_fn=lambda: daily_report(db, account, config, logger),
-        daily_cancel_fn=lambda: daily_cancel(order_mgr, logger),
-        reconcile_fn=_reconcile_tick,
-        reconcile_interval_seconds=20,
-        signal_hour=sig_h, signal_minute=sig_m,
-        report_hour=rep_h, report_minute=rep_m,
+    for rt in ok_runtimes:
+        sig_h, sig_m = map(int, str(rt.cfg.strategy_config.get("signal_time_utc", "00:00")).split(":"))
+        add_account_jobs(
+            sched,
+            account_name=rt.name,
+            daily_signal_fn=lambda rt=rt: daily_signal_and_place(rt),
+            # 各账户不再各自出报告,统一由 all_report_job 出总报告
+            daily_report_fn=lambda: None,
+            daily_cancel_fn=lambda rt=rt: daily_cancel(rt),
+            reconcile_fn=rt.reconcile_tick,
+            reconcile_interval_seconds=20,
+            signal_hour=sig_h, signal_minute=sig_m,
+            report_hour=rep_h, report_minute=rep_m,
+        )
+
+    # 全局 1 次总报告
+    from apscheduler.triggers.cron import CronTrigger
+    sched.add_job(
+        lambda: daily_report_all(ok_runtimes, config, base_logger),
+        trigger=CronTrigger(hour=rep_h, minute=rep_m, timezone=UTC),
+        id="daily_report_all",
+        misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
     )
+
     sched.start()
 
-    # 启动立刻对账一次：如果重启前有未闭合 trade，尽快回填
-    _reconcile_tick()
+    # 启动立刻各账户跑一次 reconcile + catchup
+    for rt in ok_runtimes:
+        try:
+            rt.reconcile_tick()
+        except Exception as e:
+            rt.logger.error(f"启动 reconcile 失败: {e}")
+        try:
+            startup_catchup_if_needed(rt)
+        except Exception as e:
+            rt.logger.error(f"startup catchup 失败: {e}")
 
-    startup_catchup_if_needed(okx, db, strategy, account, order_mgr, config, logger)
-
-    logger.info("[ready] HighLow Bot 系统就绪，等待 00:00 UTC 触发首次信号")
+    base_logger.info("[ready] HighLow Bot 系统就绪,等待 00:00 UTC 触发首次信号")
 
     stop_evt = {"stop": False}
 
@@ -271,7 +284,7 @@ def main():
         if stop_evt["stop"]:
             return
         stop_evt["stop"] = True
-        logger.info(f"[shutdown] signal {signum} received, stopping...")
+        base_logger.info(f"[shutdown] signal {signum} received, stopping...")
         try:
             sched.shutdown(wait=False)
         except Exception:
@@ -288,7 +301,7 @@ def main():
     except KeyboardInterrupt:
         _shutdown(signal.SIGINT, None)
 
-    logger.info("[shutdown] bye")
+    base_logger.info("[shutdown] bye")
 
 
 if __name__ == "__main__":

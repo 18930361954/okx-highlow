@@ -23,23 +23,21 @@ def _dd_flag(dd_pct: float) -> str:
     return "✅ 良好"
 
 
-def _build_balance_series(db, up_to_today: str) -> list[tuple[str, float]]:
+def _build_balance_series(db, up_to_today: str,
+                           account: str = "default") -> list[tuple[str, float]]:
     """从全部 trade 记录重建"每日结束时 balance"序列。
-    只用 exit_time 有值的（已结算）trade。
+    只用 exit_time 有值的（已结算）trade。多账户下按账户过滤。
     """
-    all_trades = db.list_trades(limit=10000)
+    all_trades = db.list_trades(limit=10000, account=account)
     filled = [t for t in all_trades if t.get("pnl") is not None]
     filled.sort(key=lambda t: (t.get("exit_time") or "", t.get("id", 0)))
 
-    # 假设起始 balance = 当前 balance - sum(所有 pnl)
     cur = 0.0
     for t in filled:
         cur += t.get("pnl") or 0
-    # 但这只给了"当前减去所有 pnl"，需要真实起点。用 state 里的 current_balance 反推
-    real_current = float(db.get_state("current_balance") or "0")
+    real_current = float(db.get_state("current_balance", account=account) or "0")
     start = real_current - cur
 
-    # 按 exit 日聚合
     by_day: dict[str, float] = {}
     running = start
     for t in filled:
@@ -68,20 +66,21 @@ def _sparkline(vals: list[float]) -> str:
     return "".join(out)
 
 
-def generate_report(db, account, config, target_date: str | None = None) -> Path:
+def generate_report(db, account, config, target_date: str | None = None,
+                     account_name: str = "default") -> Path:
     today = target_date or datetime.now(UTC).date().isoformat()
     sig_date = (datetime.fromisoformat(today).date() - timedelta(days=1)).isoformat()
     # 未触发挂单仍按 signal_date=昨日看
-    trades_today_signal = db.list_trades_by_date(sig_date)
+    trades_today_signal = db.list_trades_by_date(sig_date, account=account_name)
 
     # 「当日成交」按 exit_time 落在 today 聚合：一笔前几天挂的单可能今天才平仓，
     # 之前按 signal_date 分组会漏掉这类跨日成交（例如 07-05 signal 的 SOL 07-07 才平仓）。
-    all_trades = db.list_trades(limit=10000)
+    all_trades = db.list_trades(limit=10000, account=account_name)
     filled = [t for t in all_trades
               if t.get("exit_price") is not None
               and (t.get("exit_time") or "")[:10] == today]
 
-    start_balance_str = db.get_state(f"balance_start_{today}")
+    start_balance_str = db.get_state(f"balance_start_{today}", account=account_name)
     end_balance = account.get_balance()
 
     wins = sum(1 for t in filled if (t.get("pnl") or 0) > 0)
@@ -101,11 +100,13 @@ def generate_report(db, account, config, target_date: str | None = None) -> Path
     max_losses = account.max_losses
 
     # === balance 曲线 + DD ===
-    series = _build_balance_series(db, today)
+    series = _build_balance_series(db, today, account=account_name)
     if series:
         vals = [v for _, v in series]
-        peak = max(vals)
-        cur_dd = ((peak - end_balance) / peak * 100) if peak > 0 else 0
+        # 峰值同时纳入「当日结束余额」，防止 series 尾端还没落库、end_balance 已超过 series
+        # 时算出负回撤（历史 bug：07-06 报告显示 -9.4%）
+        peak = max(max(vals), end_balance)
+        cur_dd = max(0.0, ((peak - end_balance) / peak * 100)) if peak > 0 else 0.0
         # 计算历史最大 DD
         max_dd = 0.0
         running_peak = vals[0]
@@ -113,6 +114,10 @@ def generate_report(db, account, config, target_date: str | None = None) -> Path
             running_peak = max(running_peak, v)
             dd = (running_peak - v) / running_peak * 100 if running_peak > 0 else 0
             max_dd = max(max_dd, dd)
+        # end_balance 也参与 running_peak/dd,处理 series 只有 1 点导致 max_dd 恒 0 的情况
+        running_peak = max(running_peak, end_balance)
+        dd = (running_peak - end_balance) / running_peak * 100 if running_peak > 0 else 0
+        max_dd = max(max_dd, dd)
         # 最近 30 天
         recent = series[-30:] if len(series) > 30 else series
         recent_vals = [v for _, v in recent]
@@ -227,6 +232,149 @@ def generate_report(db, account, config, target_date: str | None = None) -> Path
         for w in warnings:
             lines.append(f"- {w}")
         lines.append("")
+
+    out_dir = ROOT / "docs" / "daily_reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"report_{today}.md" if account_name == "default" else f"report_{today}_{account_name}.md"
+    out_path = out_dir / fname
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+# ---------------- 多账户主报告 ----------------
+
+def _summarize_account(db, rt_like, today: str) -> dict:
+    """rt_like 需暴露 .name / .account (AccountState) / .cfg (提供 pairs 等)。
+    这里不 import AccountRuntime 以避免循环依赖。"""
+    name = rt_like.name
+    account_state = rt_like.account
+    sig_date = (datetime.fromisoformat(today).date() - timedelta(days=1)).isoformat()
+
+    all_trades = db.list_trades(limit=10000, account=name)
+    today_filled = [t for t in all_trades
+                    if t.get("exit_price") is not None
+                    and (t.get("exit_time") or "")[:10] == today]
+    total_pnl = sum((t.get("pnl") or 0) for t in today_filled)
+    wins = sum(1 for t in today_filled if (t.get("pnl") or 0) > 0)
+    losses = sum(1 for t in today_filled if (t.get("pnl") or 0) < 0)
+
+    end_bal = account_state.get_balance()
+    start_bal = end_bal - total_pnl
+
+    # 回撤(带 end_bal 兜底防负)
+    series = _build_balance_series(db, today, account=name)
+    if series:
+        vals = [v for _, v in series]
+        peak = max(max(vals), end_bal)
+        cur_dd = max(0.0, ((peak - end_bal) / peak * 100)) if peak > 0 else 0.0
+    else:
+        peak = end_bal
+        cur_dd = 0.0
+
+    pending = [t for t in db.list_trades_by_date(sig_date, account=name)
+               if t.get("exit_price") is None]
+
+    return {
+        "name": name,
+        "pairs": list(rt_like.cfg.pairs),
+        "start_balance": start_bal,
+        "end_balance": end_bal,
+        "peak": peak,
+        "pnl": total_pnl,
+        "n_filled": len(today_filled),
+        "wins": wins,
+        "losses": losses,
+        "cur_dd": cur_dd,
+        "in_cooldown": account_state.is_in_cooldown(),
+        "consec_losses": account_state.get_consecutive_losses(),
+        "max_losses": account_state.max_losses,
+        "mode": "FIXED" if account_state.is_fixed_mode() else "PCT",
+        "filled": today_filled,
+        "pending": pending,
+    }
+
+
+def generate_multi_account_report(runtimes, config, target_date: str | None = None) -> Path:
+    """一份主报告 = 顶部总览 + 每账户拆分表。
+    runtimes: list[AccountRuntime]。使用 rt.name / rt.account / rt.cfg / rt.db。
+    """
+    today = target_date or datetime.now(UTC).date().isoformat()
+
+    if not runtimes:
+        raise ValueError("runtimes 为空")
+
+    db = runtimes[0].db  # 共享 db
+    per_acc = [_summarize_account(db, rt, today) for rt in runtimes]
+
+    total_end = sum(a["end_balance"] for a in per_acc)
+    total_start = sum(a["start_balance"] for a in per_acc)
+    total_pnl = sum(a["pnl"] for a in per_acc)
+    total_filled = sum(a["n_filled"] for a in per_acc)
+    total_wins = sum(a["wins"] for a in per_acc)
+    total_losses = sum(a["losses"] for a in per_acc)
+    pnl_pct = (total_pnl / total_start * 100) if total_start > 0 else 0.0
+
+    lines: list[str] = []
+    lines.append(f"# 每日盈亏报告 {today}（多账户汇总）")
+    lines.append("")
+    lines.append("## 总览（全账户）")
+    lines.append("| 指标 | 值 |")
+    lines.append("|---|---|")
+    lines.append(f"| 账户数 | {len(per_acc)} |")
+    lines.append(f"| 起始总余额 | {total_start:.2f} USDT |")
+    lines.append(f"| 结束总余额 | {total_end:.2f} USDT |")
+    lines.append(f"| 当日总盈亏 | {total_pnl:+.2f} USDT ({pnl_pct:+.2f}%) |")
+    lines.append(f"| 当日成交 | {total_filled} 笔（盈 {total_wins} / 亏 {total_losses}）|")
+    lines.append("")
+
+    # 按账户一览表
+    lines.append("## 账户一览")
+    lines.append("| 账户 | 品种 | 起始 | 结束 | 盈亏 | 成交 | 回撤 | 熔断 | 模式 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for a in per_acc:
+        pairs_str = ",".join(a["pairs"]) or "-"
+        cd = "🔴" if a["in_cooldown"] else "✅"
+        lines.append(
+            f"| {a['name']} | {pairs_str} | {a['start_balance']:.2f} | {a['end_balance']:.2f} | "
+            f"{a['pnl']:+.2f} | {a['n_filled']}(盈{a['wins']}/亏{a['losses']}) | "
+            f"{a['cur_dd']:.2f}% {_dd_flag(a['cur_dd'])} | {cd} | {a['mode']} |"
+        )
+    lines.append("")
+
+    # 各账户拆分
+    for a in per_acc:
+        lines.append(f"## 账户 [{a['name']}]")
+        lines.append(f"- 品种: {', '.join(a['pairs']) or '-'}")
+        lines.append(f"- 余额: {a['start_balance']:.2f} → {a['end_balance']:.2f} "
+                     f"({a['pnl']:+.2f} USDT)")
+        lines.append(f"- 连亏计数: {a['consec_losses']}/{a['max_losses']} · "
+                     f"熔断: {'是' if a['in_cooldown'] else '否'} · 模式: {a['mode']}")
+        lines.append(f"- 历史峰值: {a['peak']:.2f} · 当前回撤: {a['cur_dd']:.2f}% {_dd_flag(a['cur_dd'])}")
+        lines.append("")
+
+        if a["filled"]:
+            lines.append("### 成交明细")
+            lines.append("| 时间 | 品种 | 方向 | 入场 | 出场 | 原因 | PnL |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for t in a["filled"]:
+                ts = (t.get("exit_time") or "")[:19]
+                lines.append(
+                    f"| {ts} | {t.get('pair', '')} | {t.get('side', '')} | "
+                    f"{t.get('entry_price', '')} | {t.get('exit_price', '')} | "
+                    f"{t.get('exit_reason', '')} | {(t.get('pnl') or 0):+.2f} |"
+                )
+            lines.append("")
+
+        if a["pending"]:
+            lines.append("### 未触发挂单")
+            lines.append("| 品种 | 方向 | 触发价 | 保证金 |")
+            lines.append("|---|---|---|---|")
+            for t in a["pending"]:
+                lines.append(
+                    f"| {t.get('pair', '')} | {t.get('side', '')} | "
+                    f"{t.get('entry_price', '')} | {(t.get('margin') or 0):.2f} |"
+                )
+            lines.append("")
 
     out_dir = ROOT / "docs" / "daily_reports"
     out_dir.mkdir(parents=True, exist_ok=True)

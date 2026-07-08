@@ -57,3 +57,38 @@ account:
 network:
   proxy_enabled: false             # 打开时 OKX REST 全部走 proxy_url
   proxy_url: "http://127.0.0.1:18081"
+
+# ---------------- 多账户 (multi-account) ----------------
+# 用于「一进程内并行跑多个策略/API key」的实盘部署。
+#   - main.py 走上面的 legacy 单账户模式（不受这段影响）
+#   - main_multi.py 读 accounts 段,每个账户独立 OKXClient + DB + AccountState + Reconciler
+# 每账户可选字段:
+#   name         必填,ID(用于 db 文件名 + 日志前缀)。建议 kebab-case
+#   enabled      默认 true;false 时跳过
+#   env          demo / live
+#   api_key/secret_key/passphrase  该账户的 OKX API 三件套
+#   pairs        该账户跑哪些 pair;缺省沿用 strategy.pairs
+#   strategy     可选,覆盖顶层 strategy 的任意字段(浅覆盖,pair_overrides 深合并)
+#   td_mode      cross / isolated;缺省沿用 account.td_mode
+#   db_path      SQLite 路径;缺省 data/trades_<name>.db
+accounts: []
+# 示例(私仓可直接填 key,公开仓请改用 ${ENV_VAR} 占位后由 main_multi 展开):
+# accounts:
+#   - name: btc-only
+#     enabled: true
+#     env: demo
+#     api_key: "xxx"
+#     secret_key: "yyy"
+#     passphrase: "zzz"
+#     pairs: [BTC-USDT-SWAP]
+#     td_mode: cross
+#     strategy:
+#       pair_overrides:
+#         BTC-USDT-SWAP: { sl_pct: 0.008, tp_pct: 0.012 }
+#   - name: sol-hunter
+#     enabled: true
+#     env: live
+#     api_key: "aaa"
+#     secret_key: "bbb"
+#     passphrase: "ccc"
+#     pairs: [SOL-USDT-SWAP]

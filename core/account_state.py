@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from data.db import DEFAULT_ACCOUNT
+
 
 UTC = timezone.utc
 
@@ -13,11 +15,12 @@ KEY_FIXED_LOCKED = "fixed_mode_locked"
 class AccountState:
     """
     余额、连亏、熔断、切档状态的持久层。
-    全部从 SQLite `state` 表读写。
+    全部从 SQLite `state` 表读写。所有读写都带 account 维度 → 多账户共享同一份 db。
     """
 
-    def __init__(self, db, config: dict, logger=None):
+    def __init__(self, db, config: dict, logger=None, account: str = DEFAULT_ACCOUNT):
         self.db = db
+        self.account = account
         s = config["strategy"]
         self.position_pct = float(s["position_pct"])
         self.leverage = int(s.get("leverage", 100))  # 默认 100x，缺省时兼容旧配置
@@ -44,15 +47,15 @@ class AccountState:
     # ---------- raw helpers ----------
 
     def _get_float(self, key: str, default: float = 0.0) -> float:
-        v = self.db.get_state(key)
+        v = self.db.get_state(key, account=self.account)
         return float(v) if v is not None else default
 
     def _get_int(self, key: str, default: int = 0) -> int:
-        v = self.db.get_state(key)
+        v = self.db.get_state(key, account=self.account)
         return int(v) if v is not None else default
 
     def _get_bool(self, key: str, default: bool = False) -> bool:
-        v = self.db.get_state(key)
+        v = self.db.get_state(key, account=self.account)
         if v is None:
             return default
         return str(v).lower() in ("1", "true", "yes")
@@ -63,9 +66,9 @@ class AccountState:
         return self._get_float(KEY_BALANCE, 0.0)
 
     def set_balance(self, balance: float) -> None:
-        self.db.set_state(KEY_BALANCE, f"{balance:.6f}")
+        self.db.set_state(KEY_BALANCE, f"{balance:.6f}", account=self.account)
         if balance >= self.fixed_threshold and not self.is_fixed_mode():
-            self.db.set_state(KEY_FIXED_LOCKED, "true")
+            self.db.set_state(KEY_FIXED_LOCKED, "true", account=self.account)
             if self.logger:
                 self.logger.info(
                     f"[切档] balance={balance:.2f} >= {self.fixed_threshold} → FIXED 永久锁定"
@@ -79,7 +82,7 @@ class AccountState:
 
     def is_in_cooldown(self, now: datetime | None = None) -> bool:
         now = (now or datetime.now(UTC)).astimezone(UTC)
-        until = self.db.get_state(KEY_COOLDOWN_UNTIL)
+        until = self.db.get_state(KEY_COOLDOWN_UNTIL, account=self.account)
         if not until:
             return False
         try:
@@ -91,7 +94,7 @@ class AccountState:
             return False
 
     def cooldown_until(self) -> datetime | None:
-        v = self.db.get_state(KEY_COOLDOWN_UNTIL)
+        v = self.db.get_state(KEY_COOLDOWN_UNTIL, account=self.account)
         if not v:
             return None
         try:
@@ -115,7 +118,7 @@ class AccountState:
     def compute_margin(self, balance: float, pair: str | None = None) -> tuple[float, str]:
         if self.is_fixed_mode() or balance >= self.fixed_threshold:
             if not self.is_fixed_mode():
-                self.db.set_state(KEY_FIXED_LOCKED, "true")
+                self.db.set_state(KEY_FIXED_LOCKED, "true", account=self.account)
             return self.fixed_margin, "FIXED"
         pct = self._position_pct_for(pair)
         return round(balance * pct, 6), "PCT"
@@ -139,19 +142,19 @@ class AccountState:
             losses += 1
         else:
             losses = 0
-        self.db.set_state(KEY_LOSSES, str(losses))
+        self.db.set_state(KEY_LOSSES, str(losses), account=self.account)
 
         if losses >= self.max_losses:
             until = now + timedelta(hours=self.cooldown_hours)
-            self.db.set_state(KEY_COOLDOWN_UNTIL, until.isoformat())
-            self.db.set_state(KEY_LOSSES, "0")
+            self.db.set_state(KEY_COOLDOWN_UNTIL, until.isoformat(), account=self.account)
+            self.db.set_state(KEY_LOSSES, "0", account=self.account)
             if self.logger:
                 self.logger.warning(
                     f"[熔断] 连亏 {losses} 次，暂停至 {until.isoformat()}"
                 )
 
     def reset_cooldown(self) -> None:
-        self.db.set_state(KEY_COOLDOWN_UNTIL, "")
-        self.db.set_state(KEY_LOSSES, "0")
+        self.db.set_state(KEY_COOLDOWN_UNTIL, "", account=self.account)
+        self.db.set_state(KEY_LOSSES, "0", account=self.account)
         if self.logger:
             self.logger.info("[manual] cooldown reset")

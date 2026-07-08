@@ -4,9 +4,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+DEFAULT_ACCOUNT = "default"
+
+
 _SCHEMA_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL DEFAULT 'default',
     signal_date TEXT NOT NULL,
     pair TEXT NOT NULL,
     side TEXT NOT NULL,
@@ -26,14 +30,17 @@ CREATE TABLE IF NOT EXISTS trades (
 
 _SCHEMA_STATE = """
 CREATE TABLE IF NOT EXISTS state (
-    key TEXT PRIMARY KEY,
+    account TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
     value TEXT NOT NULL,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account, key)
 );
 """
 
 _INDEX_TRADES_DATE = "CREATE INDEX IF NOT EXISTS idx_trades_signal_date ON trades(signal_date);"
 _INDEX_TRADES_PAIR = "CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair);"
+_INDEX_TRADES_ACC = "CREATE INDEX IF NOT EXISTS idx_trades_account ON trades(account);"
 
 
 class DB:
@@ -55,13 +62,30 @@ class DB:
     def _init_schema(self) -> None:
         with self._conn() as c:
             c.execute(_SCHEMA_TRADES)
-            c.execute(_SCHEMA_STATE)
-            c.execute(_INDEX_TRADES_DATE)
-            c.execute(_INDEX_TRADES_PAIR)
-            # 迁移：既有库补 attempt 列
+            # trades 迁移：既有库补 attempt / account 列
             cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
             if "attempt" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN attempt INTEGER DEFAULT 1")
+            if "account" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN account TEXT NOT NULL DEFAULT 'default'")
+
+            # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
+            # 检测老 schema 直接改建新表迁数据。
+            state_cols = {r[1] for r in c.execute("PRAGMA table_info(state)").fetchall()}
+            if state_cols and "account" not in state_cols:
+                c.execute("ALTER TABLE state RENAME TO state_old")
+                c.execute(_SCHEMA_STATE)
+                c.execute(
+                    "INSERT INTO state(account, key, value, updated_at) "
+                    "SELECT 'default', key, value, updated_at FROM state_old"
+                )
+                c.execute("DROP TABLE state_old")
+            else:
+                c.execute(_SCHEMA_STATE)
+
+            c.execute(_INDEX_TRADES_DATE)
+            c.execute(_INDEX_TRADES_PAIR)
+            c.execute(_INDEX_TRADES_ACC)
 
     def insert_trade(
         self,
@@ -78,14 +102,15 @@ class DB:
         exit_time: str | None = None,
         okx_order_id: str | None = None,
         attempt: int = 1,
+        account: str = DEFAULT_ACCOUNT,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO trades
-                (signal_date, pair, side, entry_price, exit_price, exit_reason,
+                (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
                  margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (signal_date, pair, side, entry_price, exit_price, exit_reason,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
                  margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
             )
             return int(cur.lastrowid)
@@ -120,12 +145,19 @@ class DB:
                     (entry_time, trade_id),
                 )
 
-    def list_open_trades(self) -> list[dict]:
-        """尚未结算的 trades：exit_price 为空即为未闭合。reconciler 用。"""
+    def list_open_trades(self, account: str | None = None) -> list[dict]:
+        """尚未结算的 trades：exit_price 为空即为未闭合。reconciler 用。
+        account=None 时返回全部账户;传具体 account 时只返回该账户的。"""
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT * FROM trades WHERE exit_price IS NULL ORDER BY id"
-            ).fetchall()
+            if account is None:
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE exit_price IS NULL ORDER BY id"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE exit_price IS NULL AND account=? ORDER BY id",
+                    (account,),
+                ).fetchall()
             return [dict(r) for r in rows]
 
     def update_trade_algo_id(self, trade_id: int, new_algo_id: str) -> None:
@@ -136,32 +168,58 @@ class DB:
                 (new_algo_id, trade_id),
             )
 
-    def get_state(self, key: str, default: str | None = None) -> str | None:
+    def get_state(self, key: str, default: str | None = None,
+                  account: str = DEFAULT_ACCOUNT) -> str | None:
         with self._conn() as c:
-            row = c.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+            row = c.execute(
+                "SELECT value FROM state WHERE account=? AND key=?", (account, key),
+            ).fetchone()
             return row["value"] if row else default
 
-    def set_state(self, key: str, value: Any) -> None:
+    def set_state(self, key: str, value: Any, account: str = DEFAULT_ACCOUNT) -> None:
         with self._conn() as c:
             c.execute(
-                """INSERT INTO state(key, value, updated_at)
-                   VALUES (?, ?, CURRENT_TIMESTAMP)
-                   ON CONFLICT(key) DO UPDATE SET
+                """INSERT INTO state(account, key, value, updated_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(account, key) DO UPDATE SET
                      value=excluded.value, updated_at=CURRENT_TIMESTAMP""",
-                (key, str(value)),
+                (account, key, str(value)),
             )
 
-    def list_trades_by_date(self, signal_date: str) -> list[dict]:
+    def list_trades_by_date(self, signal_date: str,
+                             account: str | None = None) -> list[dict]:
+        """account=None 时全账户;否则按账户过滤。"""
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT * FROM trades WHERE signal_date=? ORDER BY id",
-                (signal_date,),
-            ).fetchall()
+            if account is None:
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE signal_date=? ORDER BY id",
+                    (signal_date,),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE signal_date=? AND account=? ORDER BY id",
+                    (signal_date, account),
+                ).fetchall()
             return [dict(r) for r in rows]
 
-    def list_trades(self, limit: int = 100) -> list[dict]:
+    def list_trades(self, limit: int = 100,
+                    account: str | None = None) -> list[dict]:
+        with self._conn() as c:
+            if account is None:
+                rows = c.execute(
+                    "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE account=? ORDER BY id DESC LIMIT ?",
+                    (account, limit),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_accounts(self) -> list[str]:
+        """已在 db 里出现过的 account 名字集合(union of trades + state)。日报汇总用。"""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT account FROM trades UNION SELECT account FROM state"
             ).fetchall()
-            return [dict(r) for r in rows]
+        return sorted({r["account"] for r in rows})

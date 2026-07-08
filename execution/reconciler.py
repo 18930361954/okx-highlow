@@ -8,6 +8,8 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from data.db import DEFAULT_ACCOUNT
+
 UTC = timezone.utc
 
 
@@ -92,7 +94,8 @@ def _infer_exit_reason_by_price(side: str, entry_price: float, exit_price: float
 
 class Reconciler:
     def __init__(self, okx_client, db, account_state, config: dict, logger=None,
-                 strategy=None, order_manager=None):
+                 strategy=None, order_manager=None,
+                 account_name: str = DEFAULT_ACCOUNT):
         self.okx = okx_client
         self.db = db
         self.account = account_state
@@ -100,6 +103,7 @@ class Reconciler:
         self.logger = logger
         self.strategy = strategy         # 用于日内重挂计算入场价
         self.order_manager = order_manager  # 用于挂重挂单
+        self.account_name = account_name    # 多账户下限定 db 查询范围
         self.pairs: list[str] = list(config["strategy"]["pairs"])
         # 全局默认杠杆（兼容旧代码）；实际用 account.leverage_for(pair) 拿 per-pair
         self.leverage = int(config["strategy"]["leverage"])
@@ -107,7 +111,7 @@ class Reconciler:
     def run_once(self) -> int:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
         try:
-            open_trades = self.db.list_open_trades()
+            open_trades = self.db.list_open_trades(account=self.account_name)
         except Exception as e:
             if self.logger:
                 self.logger.error(f"[reconcile] list_open_trades failed: {e}")
@@ -335,7 +339,7 @@ class Reconciler:
         sig_date = sl_trade.get("signal_date")
         if not sig_date:
             return
-        same_day = [x for x in self.db.list_trades_by_date(sig_date) if x.get("pair") == pair]
+        same_day = [x for x in self.db.list_trades_by_date(sig_date, account=self.account_name) if x.get("pair") == pair]
         already = len(same_day)
         if already >= len(reentry_floats):
             if self.logger:
@@ -433,7 +437,7 @@ class Reconciler:
         sig_date = (today - timedelta(days=1)).isoformat()
 
         # 已有当日记录 → 不补
-        same_day = [x for x in self.db.list_trades_by_date(sig_date) if x.get("pair") == pair]
+        same_day = [x for x in self.db.list_trades_by_date(sig_date, account=self.account_name) if x.get("pair") == pair]
         if same_day:
             return
 
