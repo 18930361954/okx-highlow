@@ -40,7 +40,10 @@ def run_grid(pairs: list[str], signal_bars: list[str],
              floats: list[float], tps: list[float], sls: list[float],
              balance: float, days: int, position_pct: float,
              leverage: int, compound: bool = False,
-             slippage_bps: float = 0.0, funding_bps: float = 0.0) -> list[dict]:
+             slippage_bps: float = 0.0, funding_bps: float = 0.0,
+             max_margin: float | None = None,
+             date_from: str | None = None,
+             date_to: str | None = None) -> list[dict]:
     results: list[dict] = []
     total_cases = len(pairs) * len(signal_bars) * len(floats) * len(tps) * len(sls)
     print(f"[grid] total cases: {total_cases}")
@@ -60,14 +63,29 @@ def run_grid(pairs: list[str], signal_bars: list[str],
                 continue
             df_sig = _resample(df_base, signal_bar)
 
+            # 日期切片:walk-forward 用。tz-aware 需要转换。
+            import pandas as pd
+            if date_from:
+                mask = df_base.index >= pd.Timestamp(date_from, tz="UTC")
+                df_base_slice = df_base[mask]
+                df_sig_slice = df_sig[df_sig.index >= pd.Timestamp(date_from, tz="UTC")]
+            else:
+                df_base_slice = df_base
+                df_sig_slice = df_sig
+            if date_to:
+                mask = df_base_slice.index < pd.Timestamp(date_to, tz="UTC")
+                df_base_slice = df_base_slice[mask]
+                df_sig_slice = df_sig_slice[df_sig_slice.index < pd.Timestamp(date_to, tz="UTC")]
+
             for fp, tp, sl in itertools.product(floats, tps, sls):
                 try:
-                    r = simulate(df_base, df_sig, pair, base_bar, signal_bar,
+                    r = simulate(df_base_slice, df_sig_slice, pair, base_bar, signal_bar,
                                  fp, tp, sl, initial_balance=balance,
                                  position_pct=position_pct, leverage=leverage,
                                  fixed_margin=not compound,
                                  slippage_bps=slippage_bps,
-                                 funding_bps_per_8h=funding_bps)
+                                 funding_bps_per_8h=funding_bps,
+                                 max_margin=max_margin)
                 except Exception as e:
                     print(f"[fail] {pair} {signal_bar} f={fp} tp={tp} sl={sl}: {e}")
                     done += 1
@@ -98,6 +116,10 @@ def main() -> None:
     ap.add_argument("--compound", action="store_true", help="复利模式")
     ap.add_argument("--slippage-bps", type=float, default=0.0)
     ap.add_argument("--funding-bps", type=float, default=0.0)
+    ap.add_argument("--max-margin", type=float, default=None,
+                    help="单笔 margin 硬顶 USDT")
+    ap.add_argument("--date-from", default=None, help="ISO 起始时间 YYYY-MM-DD")
+    ap.add_argument("--date-to", default=None, help="ISO 结束时间 YYYY-MM-DD (不含)")
     args = ap.parse_args()
 
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
@@ -110,7 +132,10 @@ def main() -> None:
                        args.balance, args.days, args.position_pct, args.leverage,
                        compound=args.compound,
                        slippage_bps=args.slippage_bps,
-                       funding_bps=args.funding_bps)
+                       funding_bps=args.funding_bps,
+                       max_margin=args.max_margin,
+                       date_from=args.date_from,
+                       date_to=args.date_to)
 
     if results:
         out = Path(args.out)

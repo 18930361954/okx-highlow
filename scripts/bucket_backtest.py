@@ -112,14 +112,18 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
              fixed_margin: bool = True,
              taker_fee: float = 0.0005,
              slippage_bps: float = 0.0,
-             funding_bps_per_8h: float = 0.0) -> BacktestResult:
+             funding_bps_per_8h: float = 0.0,
+             max_margin: float | None = None) -> BacktestResult:
     """
     fixed_margin=True: 每笔 margin = initial * position_pct(不复利)。MDD 有真实意义。
-    fixed_margin=False: 每笔 margin = balance * position_pct(全额复利)。收益指数放大。
+    fixed_margin=False: 每笔 margin = balance * position_pct(复利)。
+      建议同时设 max_margin 上限,避免复利数学放大到 OKX 流动性无法承接的规模。
+    max_margin: 单笔 margin 硬顶。默认 None(无限)。设 1500 → notional 上限 = 1500 × lev
+      (BTC/ETH 100x → 15 万 USDT/笔;SOL 50x → 7.5 万 USDT/笔),约占 OKX 单品种日交易量 万分之一,
+      滑点保持可控。
     taker_fee: 5bp × 2/笔 = 10bp of notional。
-    slippage_bps: 每笔额外扣多少 bp 滑点 (悲观口径,应用于 pnl 之前的 pct)。
-    funding_bps_per_8h: 单币每 8h 一次的 funding 费率(应用于持仓时长比例的 notional)。
-      持仓超过 8h 会被扣一次;超过 16h 两次...
+    slippage_bps: 每笔额外扣多少 bp 滑点。
+    funding_bps_per_8h: 每 8h funding 费率。
     """
     """按信号桶逐个跑。信号桶用 df_sig(聚合),入场后在 df_base 里逐根 K 判 TP/SL。
     向量化版:所有信号桶入场/退出用 numpy 一次算完。"""
@@ -259,6 +263,8 @@ def simulate(df_base: pd.DataFrame, df_sig: pd.DataFrame,
         pct -= slippage
 
         margin = (initial_balance if fixed_margin else balance) * position_pct
+        if max_margin is not None and margin > max_margin:
+            margin = max_margin
         notional = margin * leverage
 
         # 持仓时长秒 → funding 次数 (向上取整,持仓 > 0s 就算)
@@ -358,6 +364,8 @@ def main() -> None:
                     help="每笔额外滑点 bp,10 = 0.1 pct")
     ap.add_argument("--funding-bps", type=float, default=0.0,
                     help="每 8h funding 费率 bp,3 = 0.03 pct")
+    ap.add_argument("--max-margin", type=float, default=None,
+                    help="单笔 margin 硬顶 (USDT),默认无限")
     args = ap.parse_args()
 
     base_bar = args.base or _pick_base_bar(args.signal)
@@ -372,6 +380,7 @@ def main() -> None:
         fixed_margin=not args.compound,
         slippage_bps=args.slippage_bps,
         funding_bps_per_8h=args.funding_bps,
+        max_margin=args.max_margin,
     )
 
     print(f"=== {res.pair} base={res.base_bar} signal={res.signal_bar} "
