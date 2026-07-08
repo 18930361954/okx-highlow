@@ -206,6 +206,10 @@ def combined_simulate(
             # 熔断中不开
             if ts < cooldown_until_ts:
                 continue
+            # 持仓保护(与实盘 main.daily_signal_and_place 里的 held_pairs 逻辑对齐):
+            # 同 pair 若还有 open position,跳过新单
+            if any(p.pair == ev.pair for (p, _, _) in open_positions.values()):
+                continue
             # 计算 margin
             margin = balance * position_pct
             notional = margin * ev.leverage

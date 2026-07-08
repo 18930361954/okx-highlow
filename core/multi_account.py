@@ -55,12 +55,43 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-class _PrefixLogger:
-    """给同一个底层 logger 加 [account] 前缀,避免为每个账户 File-rotate 一份日志。"""
+import logging as _logging
 
-    def __init__(self, base_logger, prefix: str):
+
+class _AccountFilter(_logging.Filter):
+    """只放行消息里包含 [account_name] 前缀的日志。"""
+    def __init__(self, prefix: str):
+        super().__init__()
+        self._marker = f"[{prefix}]"
+
+    def filter(self, record: _logging.LogRecord) -> bool:
+        try:
+            return self._marker in record.getMessage()
+        except Exception:
+            return False
+
+
+class _PrefixLogger:
+    """给同一个底层 logger 加 [account] 前缀。
+    每账户额外注册一个 FileHandler(带 filter)写到 logs/bot_<name>.log,
+    主 bot.log 仍收全部日志。
+    """
+
+    def __init__(self, base_logger, prefix: str, keep_days: int = 30):
         self._base = base_logger
         self._prefix = prefix
+        try:
+            from utils.logger import get_account_file_handler
+            # 避免同账户重复注册
+            _cache: set[str] = getattr(base_logger, "_acc_files", set())
+            if prefix not in _cache:
+                handler = get_account_file_handler(prefix, keep_days=keep_days)
+                handler.addFilter(_AccountFilter(prefix))
+                base_logger.addHandler(handler)
+                _cache.add(prefix)
+                base_logger._acc_files = _cache
+        except Exception:
+            pass
 
     def _fmt(self, msg: str) -> str:
         return f"[{self._prefix}] {msg}"

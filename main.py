@@ -169,12 +169,28 @@ def daily_cancel(rt: AccountRuntime) -> None:
 def startup_catchup_if_needed(rt: AccountRuntime) -> None:
     """启动时判断当前信号桶该 pair 是否已挂单,未挂则补跑。
     多信号周期下无"是否已过 00:00"的固定判断,直接按当前桶来。
+
+    保护:若当前桶已过半(> 50% 时间),跳过本桶补挂 —— 现价可能已远离信号触发价,
+    挂着大概率不成交。等下桶自然 cron。
     """
     logger = rt.logger
     now = utc_now()
     signal_bar = rt.strategy.signal_bar
     cur_bkt = current_bucket_start(now, signal_bar)
     sig_id = bucket_id(previous_bucket_start(now, signal_bar))
+
+    # 判断当前桶经过时长
+    from core.scheduler import SIGNAL_BAR_HOURS
+    hours = SIGNAL_BAR_HOURS.get(signal_bar, [0])
+    bucket_hours = 24 // len(hours) if len(hours) >= 1 else 24
+    bucket_secs = bucket_hours * 3600
+    elapsed = (now - cur_bkt).total_seconds()
+    if elapsed > bucket_secs * 0.5:
+        logger.info(
+            f"[catchup] 当前桶 {cur_bkt.strftime('%H:%M')} 已过 "
+            f"{elapsed/60:.0f}/{bucket_secs/60:.0f} 分钟(>50%),跳过补挂,等下桶"
+        )
+        return
 
     existing_db = {
         r["pair"] for r in rt.db.list_trades_by_date(sig_id, account=rt.name)

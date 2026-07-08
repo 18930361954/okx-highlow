@@ -1,5 +1,5 @@
 import logging
-import os
+import re
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -50,3 +50,18 @@ def get_logger(
 
     _configured[name] = logger
     return logger
+
+
+def get_account_file_handler(account_name: str, keep_days: int = 30) -> logging.Handler:
+    """给每账户返回一个独立的按天 rotate 的 FileHandler。
+    logs/bot_<safe_name>.log,主日志 bot.log 仍会收所有日志。
+    """
+    safe = re.sub(r"[^\w\-.]", "_", account_name)
+    log_file = _LOG_DIR / f"bot_{safe}.log"
+    h = TimedRotatingFileHandler(
+        log_file, when="midnight", interval=1,
+        backupCount=keep_days, encoding="utf-8", utc=True,
+    )
+    h.suffix = "%Y-%m-%d"
+    h.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
+    return h
