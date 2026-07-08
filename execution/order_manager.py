@@ -96,11 +96,14 @@ class OrderManager:
         else:
             order_px = round(entry_price * (1 - SLIP_PCT), 6)
 
-        # 幂等键：pair+signal_date+direction+attempt 唯一。OKX 保证同 clOrdId 不重复建单。
-        # 只允许字母数字/-/_/.，最长 32 字符。BTC-USDT-SWAP → BTC；ETH-USDT-SWAP → ETH。
-        coin = pair.split("-")[0]  # 如 BTC / ETH
-        sd = signal.get("signal_date", "").replace("-", "")  # 20260630
-        algo_cl_ord_id = f"hl{coin}{sd}{direction[0]}{attempt}"[:32]  # 如 hlBTC20260630s1
+        # 幂等键: pair + signal_id + direction + attempt 唯一。
+        # OKX 限制 [A-Za-z0-9_-.]{1,32}。sig_id 可能是 '2026-07-08' 或 '2026-07-08T04:00Z'
+        # (bucket id),清理特殊字符 + 截断到 32。
+        coin = pair.split("-")[0]  # BTC / ETH / SOL
+        sd_raw = str(signal.get("signal_date", ""))
+        # 只留数字字母,把日期时间戳压成 YYYYMMDDHH 之类
+        sd = "".join(ch for ch in sd_raw if ch.isalnum())[:12]  # 20260708T04 → 20260708T04
+        algo_cl_ord_id = f"hl{coin}{sd}{direction[0]}{attempt}"[:32]
 
         if self.logger:
             self.logger.info(

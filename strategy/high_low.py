@@ -47,6 +47,8 @@ class HighLowStrategy:
         self.sl_pct = float(s["sl_pct"])
         self.trend_filter = bool(s.get("trend_filter", True))
         self.pair_overrides = s.get("pair_overrides") or {}
+        # 信号周期: 1D / 12H / 6H / 4H / 2H / 1H。scheduler 按此生成 cron。
+        self.signal_bar = str(s.get("signal_bar", "1D"))
         self.logger = logger
 
     def _tp_sl_for(self, pair: str) -> tuple[float, float]:
@@ -59,6 +61,14 @@ class HighLowStrategy:
     def tp_sl_for(self, pair: str) -> tuple[float, float]:
         """公开版：外部（如 reconciler 兜底分类 TP/SL）需要拿 pair 级 tp/sl 百分比。"""
         return self._tp_sl_for(pair)
+
+    def signal_bar_for(self, pair: str | None = None) -> str:
+        """信号周期。目前一个账户共用一个 signal_bar,per-pair 覆盖预留但不启用。"""
+        if pair:
+            ov = self.pair_overrides.get(pair) or {}
+            if "signal_bar" in ov:
+                return str(ov["signal_bar"])
+        return self.signal_bar
 
     def _float_for(self, pair: str) -> float:
         ov = self.pair_overrides.get(pair) or {}
@@ -137,9 +147,18 @@ class HighLowStrategy:
         candles_1h: list,
         signal_date: date | str | None = None,
     ) -> dict | None:
-        if not candles_1h or len(candles_1h) < 2:
+        """
+        candles_1h 是上一个「信号桶」内的原始 K 列表(用于聚合 OHLC)。
+        - 1D 信号 → 上一日 24 根 1H K
+        - 4H 信号 → 上一 4H 段内 K,可以直接是「1 根 4H K」或「4 根 1H K」
+        signal_date 是桶标识(字符串或 date),用作 db.signal_date 存储;
+        对 1D 桶 = '2026-07-08';对 4H 桶 = '2026-07-08T04:00Z' 之类。
+
+        candles_1h 只有 1 根时,该根本身就是聚合结果(直接当 day_o/h/l/c)。
+        """
+        if not candles_1h:
             if self.logger:
-                self.logger.warning(f"{pair}: not enough candles ({len(candles_1h) if candles_1h else 0})")
+                self.logger.warning(f"{pair}: no candles")
             return None
 
         normed = [_normalize_candle(c) for c in candles_1h]

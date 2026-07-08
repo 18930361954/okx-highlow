@@ -13,6 +13,27 @@ from data.db import DEFAULT_ACCOUNT
 UTC = timezone.utc
 
 
+# 秒数,与 core.scheduler.SIGNAL_BAR_HOURS 保持一致
+_BUCKET_SECS = {
+    "1D": 86400, "12H": 43200, "6H": 21600, "4H": 14400,
+    "2H": 7200, "1H": 3600,
+}
+
+
+def _parse_sig_id(sig_id: str) -> datetime | None:
+    """把 db.signal_date(可能是 '2026-07-08' 或 '2026-07-08T04:00Z')解析成桶起始 UTC。"""
+    if not sig_id:
+        return None
+    try:
+        s = sig_id.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except ValueError:
+        return None
+
+
 def _ms_to_iso(ms: Any) -> str:
     try:
         ts = int(ms)
@@ -348,20 +369,19 @@ class Reconciler:
                 )
             return
 
-        # 确保还在"挂单日"：挂单日 UTC = signal_date + 1
-        # sl_time 若无就用 now
+        # 确保还在"挂单桶"内。挂单桶 = signal 桶后一桶。
         now = (sl_time or datetime.now(UTC)).astimezone(UTC)
-        try:
-            sig_dt = datetime.fromisoformat(sig_date).replace(tzinfo=UTC)
-        except ValueError:
+        signal_bar = getattr(self.strategy, "signal_bar", "1D")
+        bucket_secs = _BUCKET_SECS.get(signal_bar, 86400)
+        sig_dt = _parse_sig_id(sig_date)
+        if sig_dt is None:
             return
-        trade_day_start = sig_dt + timedelta(days=1)
-        trade_day_end = trade_day_start + timedelta(days=1)
-        if not (trade_day_start <= now < trade_day_end):
+        trade_bkt_start = sig_dt + timedelta(seconds=bucket_secs)
+        trade_bkt_end = trade_bkt_start + timedelta(seconds=bucket_secs)
+        if not (trade_bkt_start <= now < trade_bkt_end):
             if self.logger:
                 self.logger.info(
-                    f"[reconcile] {pair} SL 但已跨挂单日（now={now} trade_day={trade_day_start.date()}）"
-                    f"，不重挂"
+                    f"[reconcile] {pair} SL 但已跨挂单桶(now={now} trade_bkt={trade_bkt_start})不重挂"
                 )
             return
 
@@ -369,12 +389,15 @@ class Reconciler:
         ok, why = self.account.can_trade(now)
         if not ok:
             if self.logger:
-                self.logger.info(f"[reconcile] {pair} SL 但账户不可交易({why})，不重挂")
+                self.logger.info(f"[reconcile] {pair} SL 但账户不可交易({why}),不重挂")
             return
 
-        # 拉今日 UTC 已发生的 1H K（挂单日 00:00 起）
+        # 拉当前挂单桶开始至今的细粒度 K,重算入场价
         try:
-            raw = self.okx.get_candles(pair, bar="1H", limit=24)
+            # 1D 保持旧行为(1H K);其它周期直接用 signal_bar K
+            k_bar = "1H" if signal_bar == "1D" else signal_bar
+            k_limit = 24 if signal_bar == "1D" else max(2, int(bucket_secs / 3600))
+            raw = self.okx.get_candles(pair, bar=k_bar, limit=k_limit)
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"[reconcile] get_candles({pair}) 重挂前失败: {e}")
@@ -382,14 +405,13 @@ class Reconciler:
         if not raw:
             return
 
-        # OKX 返回按时间倒序（新→旧）。归一化后过滤到"挂单日 00:00 以后"的 K
-        from strategy.high_low import _normalize_candle  # 复用已有归一
+        from strategy.high_low import _normalize_candle
         normed = [_normalize_candle(c) for c in raw]
-        day_start_ms = int(trade_day_start.timestamp() * 1000)
-        today_bars = [c for c in normed if c["ts"] >= day_start_ms]
+        bkt_start_ms = int(trade_bkt_start.timestamp() * 1000)
+        today_bars = [c for c in normed if c["ts"] >= bkt_start_ms]
         if not today_bars:
             if self.logger:
-                self.logger.info(f"[reconcile] {pair} 今日无 K 线数据，不重挂")
+                self.logger.info(f"[reconcile] {pair} 当前桶无 K 线,不重挂")
             return
 
         direction = sl_trade.get("side")
@@ -420,40 +442,43 @@ class Reconciler:
             self.logger.error(f"[reentry] {pair} attempt={attempt} 挂单失败")
 
     def _catchup_after_exit(self, pair: str | None, exit_dt: datetime | None) -> None:
-        """平仓后日内补挂 attempt=1（对应「有持仓所以 daily_signal 被跳过」的场景）。
-        判定：
+        """平仓后当前信号桶内补挂 attempt=1(对应「有持仓所以 signal 被跳过」的场景)。
+        判定:
         - strategy/order_manager 已注入
-        - 当前 UTC 仍在挂单日区间内（signal_date + 1 天）
-        - db 里今日 signal_date 该 pair 无任何 trade（若已有记录说明当日已挂过单）
+        - db 里当前信号桶 sig_id 该 pair 无任何 trade
         - OKX 无 pending / 无持仓 该 pair
         - 账户未熔断
-        用今日「昨日」24 根 1H K 走 compute_signal（跟 daily_signal_and_place 完全一致）。
         """
         if not pair or not self.strategy or not self.order_manager:
             return
         now = (exit_dt or datetime.now(UTC)).astimezone(UTC)
-        # 挂单日 UTC = 今天；signal_date = 昨天
-        today = now.date()
-        sig_date = (today - timedelta(days=1)).isoformat()
+        signal_bar = getattr(self.strategy, "signal_bar", "1D")
+        # 上一桶 (即 signal 依据的那一桶) 起始时间 → 用它作 sig_id
+        try:
+            from main import previous_bucket_start, bucket_id
+            prev = previous_bucket_start(now, signal_bar)
+            sig_id = bucket_id(prev)
+        except Exception:
+            # main 未加载时兜底回退到 1D 语义
+            sig_id = (now.date() - timedelta(days=1)).isoformat()
 
-        # 已有当日记录 → 不补
-        same_day = [x for x in self.db.list_trades_by_date(sig_date, account=self.account_name) if x.get("pair") == pair]
-        if same_day:
+        # 已有当前桶记录 → 不补
+        same_bkt = [x for x in self.db.list_trades_by_date(sig_id, account=self.account_name) if x.get("pair") == pair]
+        if same_bkt:
             return
 
         # 账户/熔断
         ok, why = self.account.can_trade(now)
         if not ok:
             if self.logger:
-                self.logger.info(f"[catchup-exit] {pair} 账户不可交易({why})，不补挂")
+                self.logger.info(f"[catchup-exit] {pair} 账户不可交易({why}),不补挂")
             return
 
-        # OKX 侧再确认无 pending / 无持仓（可能有其它 pair 的挂单，只看该 pair）
         try:
             for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
                 if o.get("instId") == pair:
                     if self.logger:
-                        self.logger.info(f"[catchup-exit] {pair} 已有 pending，跳过")
+                        self.logger.info(f"[catchup-exit] {pair} 已有 pending,跳过")
                     return
         except Exception as e:
             if self.logger:
@@ -463,16 +488,21 @@ class Reconciler:
             for p in self.okx.get_positions(instId=pair):
                 if float(p.get("pos", 0) or 0) != 0:
                     if self.logger:
-                        self.logger.info(f"[catchup-exit] {pair} 仍有持仓，跳过")
+                        self.logger.info(f"[catchup-exit] {pair} 仍有持仓,跳过")
                     return
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"[catchup-exit] {pair} get_positions 失败: {e}")
             return
 
-        # 拉昨日 24 根 1H → compute_signal
+        # 拉上一桶 K → compute_signal
         try:
-            raw = self.okx.get_candles(pair, bar="1H", limit=24)
+            if signal_bar == "1D":
+                raw = self.okx.get_candles(pair, bar="1H", limit=24)
+            else:
+                raw = self.okx.get_candles(pair, bar=signal_bar, limit=2)
+                if raw and len(raw) >= 2:
+                    raw = [raw[1]]
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"[catchup-exit] {pair} get_candles 失败: {e}")
@@ -480,7 +510,7 @@ class Reconciler:
         if not raw:
             return
 
-        signal = self.strategy.compute_signal(pair, raw, signal_date=sig_date)
+        signal = self.strategy.compute_signal(pair, raw, signal_date=sig_id)
         if not signal:
             if self.logger:
                 self.logger.info(f"[catchup-exit] {pair} compute_signal 无结果，不补挂")
