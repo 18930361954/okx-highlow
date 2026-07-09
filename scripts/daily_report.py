@@ -3,6 +3,7 @@
 输出到 docs/daily_reports/report_YYYY-MM-DD.md
 """
 import argparse
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,21 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 UTC = timezone.utc
+
+
+def _trunc2(x: float) -> float:
+    """向零截断到 2 位小数, 与 OKX 界面显示口径一致。"""
+    if x >= 0:
+        return math.floor(x * 100) / 100
+    return -math.floor(-x * 100) / 100
+
+
+def _fmt2s(x: float) -> str:
+    return f"{_trunc2(x):+.2f}"
+
+
+def _fmt2u(x: float) -> str:
+    return f"{_trunc2(x):.2f}"
 
 
 def _dd_flag(dd_pct: float) -> str:
@@ -85,9 +101,11 @@ def generate_report(db, account, config, target_date: str | None = None,
 
     wins = sum(1 for t in filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in filled if (t.get("pnl") or 0) < 0)
-    total_pnl = sum((t.get("pnl") or 0) for t in filled)
+    # db.pnl 已是净口径(reconciler 从 OKX positions-history.realizedPnl 写入);
+    # 名义 = 净 + 手续费(反推展示,便于对账)
+    total_net = sum((t.get("pnl") or 0) for t in filled)
     total_fee = sum((t.get("fee") or 0) for t in filled)
-    total_net = total_pnl - total_fee
+    total_pnl = total_net + total_fee
 
     if start_balance_str is None:
         start_balance = end_balance - total_net
@@ -157,9 +175,9 @@ def generate_report(db, account, config, target_date: str | None = None,
     lines.append(f"|---|---|---|")
     lines.append(f"| 起始余额 | {start_balance:.2f} USDT | — |")
     lines.append(f"| 结束余额 | {end_balance:.2f} USDT | — |")
-    lines.append(f"| 当日名义盈亏 | {total_pnl:+.2f} USDT | — |")
+    lines.append(f"| 当日名义盈亏 | {_fmt2s(total_pnl)} USDT | — |")
     lines.append(f"| 当日手续费 | {total_fee:.4f} USDT | — |")
-    lines.append(f"| 当日净盈亏 | {total_net:+.2f} USDT ({pnl_pct:+.2f}%) | — |")
+    lines.append(f"| 当日净盈亏 | {_fmt2s(total_net)} USDT ({pnl_pct:+.2f}%) | — |")
     lines.append(f"| 当日成交 | {len(filled)} 笔（盈 {wins} / 亏 {losses}）| — |")
     lines.append(f"| 历史峰值 | {peak:.2f} USDT | — |")
     lines.append(f"| **当前回撤** | **{cur_dd:.2f}%** | **{_dd_flag(cur_dd)}** |")
@@ -198,13 +216,13 @@ def generate_report(db, account, config, target_date: str | None = None,
         lines.append("|---|---|---|---|---|---|---|---|---|")
         for t in filled:
             ts = (t.get("exit_time") or "")[:19]
-            pnl = t.get("pnl") or 0
+            net = t.get("pnl") or 0
             fee = t.get("fee") or 0
-            net = pnl - fee
+            pnl = net + fee  # 名义 = 净 + 手续费(反推展示)
             lines.append(
                 f"| {ts} | {t.get('pair', '')} | {t.get('side', '')} | "
                 f"{t.get('entry_price', '')} | {t.get('exit_price', '')} | "
-                f"{t.get('exit_reason', '')} | {pnl:+.2f} | {fee:.4f} | {net:+.2f} |"
+                f"{t.get('exit_reason', '')} | {_fmt2s(pnl)} | {fee:.4f} | {_fmt2s(net)} |"
             )
     else:
         lines.append("（无成交）")
@@ -261,9 +279,10 @@ def _summarize_account(db, rt_like, today: str) -> dict:
     today_filled = [t for t in all_trades
                     if t.get("exit_price") is not None
                     and (t.get("exit_time") or "")[:10] == today]
-    total_pnl = sum((t.get("pnl") or 0) for t in today_filled)
+    # db.pnl 已是净口径; 名义 = 净 + 手续费
+    total_net = sum((t.get("pnl") or 0) for t in today_filled)
     total_fee = sum((t.get("fee") or 0) for t in today_filled)
-    total_net = total_pnl - total_fee
+    total_pnl = total_net + total_fee
     wins = sum(1 for t in today_filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in today_filled if (t.get("pnl") or 0) < 0)
 
@@ -336,9 +355,9 @@ def generate_multi_account_report(runtimes, config, target_date: str | None = No
     lines.append(f"| 账户数 | {len(per_acc)} |")
     lines.append(f"| 起始总余额 | {total_start:.2f} USDT |")
     lines.append(f"| 结束总余额 | {total_end:.2f} USDT |")
-    lines.append(f"| 当日名义盈亏 | {total_pnl:+.2f} USDT |")
+    lines.append(f"| 当日名义盈亏 | {_fmt2s(total_pnl)} USDT |")
     lines.append(f"| 当日手续费 | {total_fee:.4f} USDT |")
-    lines.append(f"| 当日净盈亏 | {total_net:+.2f} USDT ({pnl_pct:+.2f}%) |")
+    lines.append(f"| 当日净盈亏 | {_fmt2s(total_net)} USDT ({pnl_pct:+.2f}%) |")
     lines.append(f"| 当日成交 | {total_filled} 笔（盈 {total_wins} / 亏 {total_losses}）|")
     lines.append("")
 
@@ -351,7 +370,7 @@ def generate_multi_account_report(runtimes, config, target_date: str | None = No
         cd = "🔴" if a["in_cooldown"] else "✅"
         lines.append(
             f"| {a['name']} | {pairs_str} | {a['start_balance']:.2f} | {a['end_balance']:.2f} | "
-            f"{a['pnl']:+.2f} | {a['fee']:.4f} | {a['net']:+.2f} | "
+            f"{_fmt2s(a['pnl'])} | {a['fee']:.4f} | {_fmt2s(a['net'])} | "
             f"{a['n_filled']}(盈{a['wins']}/亏{a['losses']}) | "
             f"{a['cur_dd']:.2f}% {_dd_flag(a['cur_dd'])} | {cd} | {a['mode']} |"
         )
@@ -362,7 +381,8 @@ def generate_multi_account_report(runtimes, config, target_date: str | None = No
         lines.append(f"## 账户 [{a['name']}]")
         lines.append(f"- 品种: {', '.join(a['pairs']) or '-'}")
         lines.append(f"- 余额: {a['start_balance']:.2f} → {a['end_balance']:.2f} "
-                     f"(名义 {a['pnl']:+.2f} · 费 {a['fee']:.4f} · 净 {a['net']:+.2f} USDT)")
+                     f"(名义 {_fmt2s(a['pnl'])} · 费 {a['fee']:.4f} · "
+                     f"净 {_fmt2s(a['net'])} USDT)")
         lines.append(f"- 连亏计数: {a['consec_losses']}/{a['max_losses']} · "
                      f"熔断: {'是' if a['in_cooldown'] else '否'} · 模式: {a['mode']}")
         lines.append(f"- 历史峰值: {a['peak']:.2f} · 当前回撤: {a['cur_dd']:.2f}% {_dd_flag(a['cur_dd'])}")
@@ -374,13 +394,13 @@ def generate_multi_account_report(runtimes, config, target_date: str | None = No
             lines.append("|---|---|---|---|---|---|---|---|---|")
             for t in a["filled"]:
                 ts = (t.get("exit_time") or "")[:19]
-                pnl = t.get("pnl") or 0
+                net = t.get("pnl") or 0
                 fee = t.get("fee") or 0
-                net = pnl - fee
+                pnl = net + fee  # 名义 = 净 + 手续费(反推展示)
                 lines.append(
                     f"| {ts} | {t.get('pair', '')} | {t.get('side', '')} | "
                     f"{t.get('entry_price', '')} | {t.get('exit_price', '')} | "
-                    f"{t.get('exit_reason', '')} | {pnl:+.2f} | {fee:.4f} | {net:+.2f} |"
+                    f"{t.get('exit_reason', '')} | {_fmt2s(pnl)} | {fee:.4f} | {_fmt2s(net)} |"
                 )
             lines.append("")
 

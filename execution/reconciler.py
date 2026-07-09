@@ -129,6 +129,45 @@ class Reconciler:
         # 全局默认杠杆（兼容旧代码）；实际用 account.leverage_for(pair) 拿 per-pair
         self.leverage = int(config["strategy"]["leverage"])
 
+    @staticmethod
+    def _match_position_history(rows: list[dict], side: str, close_px: float,
+                                  close_time_iso: str) -> dict | None:
+        """在 positions-history 里找与当前 exit 对应的那条仓位。
+        匹配键: posSide + closeAvgPx≈fill_px(相对 5bp) + uTime≈fill_time(±5min)。
+        posSide 用 db.side("long"/"short") 直接对齐; 都命不中返回 None。
+        """
+        if not rows or close_px <= 0:
+            return None
+        try:
+            close_ms = int(datetime.fromisoformat(close_time_iso).timestamp() * 1000)
+        except (ValueError, TypeError):
+            close_ms = 0
+
+        best: tuple[int, dict] | None = None  # (score_lower_better, row)
+        for r in rows:
+            if str(r.get("posSide", "")).lower() != side.lower():
+                continue
+            try:
+                cap = float(r.get("closeAvgPx") or 0)
+            except (TypeError, ValueError):
+                cap = 0
+            if cap <= 0:
+                continue
+            # 5bp 容差; 触发价与实际成交常有 1~2bp 滑点
+            if abs(cap - close_px) / close_px > 5e-4:
+                continue
+            try:
+                u_ms = int(r.get("uTime") or 0)
+            except (TypeError, ValueError):
+                u_ms = 0
+            if close_ms and u_ms and abs(u_ms - close_ms) > 5 * 60 * 1000:
+                continue
+            # 越接近的越优
+            score = abs(u_ms - close_ms) if close_ms and u_ms else 0
+            if best is None or score < best[0]:
+                best = (score, r)
+        return best[1] if best else None
+
     def run_once(self) -> int:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
         try:
@@ -149,9 +188,12 @@ class Reconciler:
         # 1) by_algo: 主 algo 直接下的入场订单（其 algoId == 主 algo 的 algoId）
         # 2) by_pair: 该 pair 全部已成交订单（按 fillTime 升序），用于 TP/SL 平仓匹配
         #    因为 OKX 的 TP/SL attach 触发后会生成独立的 algoId，跟主 algo 无关联字段。
+        # 3) pos_hist_by_pair: 该 pair 的历史仓位（含 realizedPnl 净口径），
+        #    用于把 db.pnl 对齐到 OKX 界面显示。
         pairs = {t["pair"] for t in open_trades if t.get("pair")}
         orders_by_algo: dict[str, list[dict]] = {}
         orders_by_pair: dict[str, list[dict]] = {}
+        pos_hist_by_pair: dict[str, list[dict]] = {}
         for pair in pairs:
             try:
                 rows = self.okx.list_order_history(instId=pair, state="filled", limit=100)
@@ -170,6 +212,17 @@ class Reconciler:
                 except (TypeError, ValueError):
                     return 0
             orders_by_pair[pair] = sorted(rows, key=_ft)
+            # 拉一次仓位历史（净收益权威源）。失败不阻塞对账,回退到 orders 累加口径。
+            try:
+                pos_hist_by_pair[pair] = self.okx.list_positions_history(
+                    instId=pair, limit=100
+                )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] list_positions_history({pair}) failed: {e}"
+                    )
+                pos_hist_by_pair[pair] = []
 
         # 已被匹配过的 order（避免同一平仓订单匹配到多个 open trade）
         matched_ord_ids: set[str] = set()
@@ -267,19 +320,14 @@ class Reconciler:
                             pass
 
                     # ============================================================
-                    # PnL / Fee 全部从 OKX 累加,不本地估算
+                    # PnL / Fee 全部从 OKX 拿真值,不本地估算
                     # ============================================================
-                    # 累加规则:
-                    #   pnl:  该 trade 全部相关 orders 的 pnl 字段之和
-                    #         (OKX 名义盈亏,不含手续费)
-                    #   fee:  该 trade 全部相关 orders 的 fee 字段之和
-                    #         (OKX 是负值,存绝对值方便展示)
-                    #
-                    # 相关 orders:
-                    #   a) 主 algoId 下的全部 orders (entry + 可能的 partial fills)
-                    #   b) 时间窗口匹配到的 exit (TP/SL attach algo 独立 algoId)
-                    def _num(o: dict, k: str) -> float:
-                        v = o.get(k)
+                    # 首选: positions-history.realizedPnl (OKX 界面显示的净收益,
+                    #   已扣手续费 + 资金费,与 UI 完全一致)。
+                    # 兜底: 累加 orders 的 pnl - |fee| (若 positions-history 未返回或
+                    #   匹配不上,例如老仓位、API 限流)。
+                    def _num(d: dict, k: str) -> float:
+                        v = d.get(k)
                         if v in (None, ""):
                             return 0.0
                         try:
@@ -291,24 +339,41 @@ class Reconciler:
                     if exit_ and exit_ not in related:
                         related.append(exit_)
 
-                    pnl_sum = sum(_num(o, "pnl") for o in related)
-                    fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
-                    fee_total = abs(fee_raw_sum)
-                    pnl_net = pnl_sum + fee_raw_sum  # fee 负值,直接加就是净
+                    # ---- 首选口径:positions-history 匹配 ----
+                    pos_row = self._match_position_history(
+                        pos_hist_by_pair.get(t["pair"], []),
+                        side=t.get("side", ""),
+                        close_px=fill_px,
+                        close_time_iso=fill_time,
+                    )
+                    if pos_row is not None:
+                        pnl_net = _num(pos_row, "realizedPnl")
+                        fee_raw = _num(pos_row, "fee")           # 负值
+                        funding_raw = _num(pos_row, "fundingFee")  # 负值
+                        fee_total = abs(fee_raw) + abs(funding_raw)
+                        pnl_gross = pnl_net + abs(fee_raw) + abs(funding_raw)
+                        src = "positions-history"
+                    else:
+                        pnl_gross = sum(_num(o, "pnl") for o in related)
+                        fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
+                        fee_total = abs(fee_raw_sum)
+                        pnl_net = pnl_gross + fee_raw_sum
+                        src = f"orders×{len(related)}(fallback)"
 
+                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee 仅供展示
                     self.db.update_trade_exit(
                         trade_id=t["id"],
                         exit_price=fill_px,
                         exit_reason=reason,
-                        pnl=pnl_sum,
+                        pnl=pnl_net,
                         exit_time=fill_time,
                         fee=fee_total,
                     )
                     if self.logger:
                         self.logger.info(
                             f"[reconcile] exit filled: trade#{t['id']} {t['pair']} "
-                            f"{reason} @ {fill_px} 名义pnl={pnl_sum:+.4f} 手续费={fee_total:.4f} "
-                            f"净={pnl_net:+.4f} (合并 {len(related)} 个 OKX orders)"
+                            f"{reason} @ {fill_px} 名义={pnl_gross:+.4f} 手续费={fee_total:.4f} "
+                            f"净={pnl_net:+.4f} src={src}"
                         )
 
                     # 结算账户状态:余额按净 pnl 更新(与 OKX 服务端实际扣减一致)

@@ -283,6 +283,19 @@ class OKXClient:
         data = self._request("GET", "/api/v5/trade/orders-history", params=params)
         return data.get("data", [])
 
+    def list_positions_history(self, instType: str = "SWAP",
+                                instId: str | None = None,
+                                limit: int = 100) -> list[dict]:
+        """已平仓的 position 历史。字段 realizedPnl 就是 OKX 界面显示的
+        "已实现收益"（净口径,已扣手续费+资金费）。
+        字段还有 pnl(=realizedPnl-fee-fundingFee 反向,基本等价)、fee(已扣手续费,负)、
+        fundingFee(资金费,负)、closeAvgPx、uTime(平仓时间 ms)、posSide 等。"""
+        params: dict[str, Any] = {"instType": instType, "limit": str(limit)}
+        if instId:
+            params["instId"] = instId
+        data = self._request("GET", "/api/v5/account/positions-history", params=params)
+        return data.get("data", [])
+
     # ---------------- health ----------------
 
     def test_connection(self) -> bool:

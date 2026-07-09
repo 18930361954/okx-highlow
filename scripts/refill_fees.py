@@ -1,9 +1,10 @@
 """从 OKX 补拉历史 trade 的 pnl 与 fee 真值。
 
 背景:
-  reconciler 之前会在 OKX 无 pnl 字段时按 margin*lev*pct 本地估算,与 OKX 真值有差异。
-  现在已移除估算,但历史 db 里可能仍有本地估算值或 fee=0 的记录。
-  本脚本从 OKX orders-history 补拉真值,同时修正 db.balance。
+  reconciler 现在把 db.pnl 存"净口径"(从 OKX positions-history.realizedPnl 拿),
+  与 OKX 界面显示的"已实现收益"完全一致。历史 db 里的 pnl 可能仍是旧的"名义口径"
+  (需要减手续费才得净),存在 0.01 精度误差。本脚本从 OKX 拉真值刷新,同时修正
+  db.balance(按新旧净口径差价)。
 
 用法:
   python scripts/refill_fees.py                          # 处理所有账户
@@ -131,10 +132,12 @@ def main() -> None:
         c = sqlite3.connect(str(db.path))
         c.row_factory = sqlite3.Row
         if args.force:
-            where = ("SELECT id, pair, entry_time, exit_time, okx_order_id, pnl, fee "
+            where = ("SELECT id, pair, side, entry_time, exit_time, exit_price, "
+                     "okx_order_id, pnl, fee "
                      "FROM trades WHERE account=? AND exit_price IS NOT NULL ORDER BY id")
         else:
-            where = ("SELECT id, pair, entry_time, exit_time, okx_order_id, pnl, fee "
+            where = ("SELECT id, pair, side, entry_time, exit_time, exit_price, "
+                     "okx_order_id, pnl, fee "
                      "FROM trades WHERE account=? AND exit_price IS NOT NULL "
                      "AND (fee IS NULL OR fee = 0.0) ORDER BY id")
         rows = c.execute(where, (name,)).fetchall()
@@ -166,27 +169,55 @@ def main() -> None:
                 except Exception:
                     entry_ts_ms = 0
 
-            related = _find_related_orders(okx, pair, algo_id, entry_ts_ms)
-            if not related:
-                print(f"  #{trade_id} {pair} algoId={algo_id[:12]}: OKX 未找到相关 orders,跳过")
-                continue
+            # 首选 positions-history (与 OKX UI 一致的净口径)
+            pos_row = None
+            try:
+                pos_hist = okx.list_positions_history(instId=pair, limit=100)
+            except Exception as e:
+                print(f"  ! list_positions_history({pair}) 失败: {e}")
+                pos_hist = []
+            if pos_hist and r["exit_time"] and r["exit_price"]:
+                from execution.reconciler import Reconciler
+                try:
+                    close_px = float(r["exit_price"] or 0)
+                except (TypeError, ValueError):
+                    close_px = 0.0
+                pos_row = Reconciler._match_position_history(
+                    pos_hist, side=r["side"] or "",
+                    close_px=close_px, close_time_iso=r["exit_time"],
+                )
 
-            pnl_new = sum(_num(o, "pnl") for o in related)
-            fee_raw = sum(_num(o, "fee") for o in related)  # 负值
-            fee_new = abs(fee_raw)
-            net_new = pnl_new + fee_raw  # fee 负值直接加
+            if pos_row is not None:
+                # positions-history: pnl=净值; fee/fundingFee 均为负,合成展示 fee
+                net_new = _num(pos_row, "realizedPnl")
+                fee_new = abs(_num(pos_row, "fee")) + abs(_num(pos_row, "fundingFee"))
+                pnl_new = net_new  # db.pnl 存净口径(新)
+                src = "positions-history"
+            else:
+                related = _find_related_orders(okx, pair, algo_id, entry_ts_ms)
+                if not related:
+                    print(f"  #{trade_id} {pair} algoId={algo_id[:12]}: OKX 未找到相关数据,跳过")
+                    continue
+                pnl_gross = sum(_num(o, "pnl") for o in related)
+                fee_raw = sum(_num(o, "fee") for o in related)  # 负值
+                fee_new = abs(fee_raw)
+                net_new = pnl_gross + fee_raw
+                pnl_new = net_new  # 新口径统一存净值
+                src = f"orders×{len(related)}"
 
             pnl_old = r["pnl"] or 0
             fee_old = r["fee"] or 0
-            net_old = pnl_old - fee_old  # 旧口径是 pnl - abs(fee)
+            # 旧口径: pnl 是名义, net_old = pnl_old - fee_old
+            # 新口径: pnl 就是净, net_new = pnl_new
             # balance 之前按 net_old 加过 → 补差价
+            net_old = pnl_old - fee_old
             delta = net_new - net_old
 
             print(f"  #{trade_id} {pair}: "
-                  f"pnl {pnl_old:+.4f}→{pnl_new:+.4f}, "
+                  f"pnl {pnl_old:+.4f}→{pnl_new:+.4f}(净), "
                   f"fee {fee_old:.4f}→{fee_new:.4f}, "
                   f"net {net_old:+.4f}→{net_new:+.4f} "
-                  f"(balance Δ {delta:+.4f}, 合并 {len(related)} 个 OKX orders)")
+                  f"(balance Δ {delta:+.4f}, src={src})")
 
             if args.dry_run:
                 continue

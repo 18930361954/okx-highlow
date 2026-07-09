@@ -1,3 +1,4 @@
+import math
 import threading
 from datetime import datetime, timezone
 
@@ -10,15 +11,29 @@ from rich.table import Table
 UTC = timezone.utc
 
 
+def _trunc2(x: float) -> float:
+    """向零截断到 2 位小数, 与 OKX 界面显示口径一致(避免 6.7774 四舍五入
+    到 6.78 而 OKX 显示 6.77 的 0.01 差异)。"""
+    if x >= 0:
+        return math.floor(x * 100) / 100
+    return -math.floor(-x * 100) / 100
+
+
+def _fmt2(x: float, sign: bool = True) -> str:
+    v = _trunc2(x)
+    return f"{v:+,.2f}" if sign else f"{v:,.2f}"
+
+
 class PositionMonitor:
     """终端面板 — 多账户版。5 秒刷新。
 
     数据来源:
       - 余额:db.state.current_balance (由 reconciler 按 OKX 净值累计更新)
       - 挂单/持仓:OKX list_pending_algos / get_positions 实时拉
-      - 名义 PnL / 手续费 / 净 PnL:db.trades.pnl / fee (reconciler 从
-        OKX orders-history 累加真值,不本地估算)
-      - 净 PnL = 名义 pnl - 手续费(与 OKX 界面口径一致)
+      - 净 PnL:db.trades.pnl (reconciler 直接从 OKX positions-history.realizedPnl
+        写入的净口径, 已扣手续费+资金费, 与 OKX 界面显示的"已实现收益"完全一致)
+      - 手续费:db.trades.fee (仅展示用, |fee|+|fundingFee|)
+      - 名义 PnL:pnl + fee (反推展示, 便于对账)
 
     构造两种模式:
       1. 多账户 (推荐): 传 runtimes=[...] 列表,面板显示所有账户
@@ -101,9 +116,10 @@ class PositionMonitor:
                 today_filled = [r for r in all_rows
                                 if r.get("exit_price") is not None
                                 and (r.get("exit_time") or "")[:10] == today_iso]
-                today_pnl = sum((r.get("pnl") or 0) for r in today_filled)
+                # db.pnl 已是净口径; 名义 = 净 + 手续费(反推展示)
+                today_net = sum((r.get("pnl") or 0) for r in today_filled)
                 today_fee = sum((r.get("fee") or 0) for r in today_filled)
-                today_net = today_pnl - today_fee
+                today_pnl = today_net + today_fee
             except Exception:
                 today_filled, today_pnl, today_fee, today_net = [], 0.0, 0.0, 0.0
 
@@ -145,9 +161,9 @@ class PositionMonitor:
             f"[bold]总余额[/bold] {total_bal:,.2f}   "
             f"[bold]挂单[/bold] {total_pending}   "
             f"[bold]持仓[/bold] {total_positions}   "
-            f"[bold]今日名义[/bold] {total_today_pnl:+,.2f}   "
+            f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
             f"[bold]手续费[/bold] {total_today_fee:.4f}   "
-            f"[bold]净盈亏[/bold] {total_today_net:+,.2f}",
+            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}",
             f"[bold]now[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
 
@@ -159,8 +175,8 @@ class PositionMonitor:
         for a in snap:
             cd = "[red]是[/red]" if a["in_cd"] else "[green]否[/green]"
             losses = f"{a['losses']}/{a['max_losses']}"
-            pnl_str = f"{a['today_pnl']:+,.2f}"
-            net_str = f"{a['today_net']:+,.2f}"
+            pnl_str = _fmt2(a['today_pnl'])
+            net_str = _fmt2(a['today_net'])
             net_style = "green" if a["today_net"] > 0 else ("red" if a["today_net"] < 0 else "")
             acc_tbl.add_row(
                 a["name"], a["env"], a["signal_bar"],
@@ -228,17 +244,19 @@ class PositionMonitor:
         all_today.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
         for aname, r in all_today[:20]:  # 最多 20 条
             any_t = True
-            pnl = r.get("pnl") or 0
+            # db.pnl 已是净口径; 名义 = 净 + 手续费(反推展示)
+            net = r.get("pnl") or 0
             fee = r.get("fee") or 0
-            net = pnl - fee
+            pnl = net + fee
             style = "green" if net > 0 else ("red" if net < 0 else "")
-            net_cell = f"[{style}]{net:+,.2f}[/{style}]" if style else f"{net:+,.2f}"
+            net_str = _fmt2(net)
+            net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str
             trade_tbl.add_row(
                 (r.get("exit_time") or "")[:19], aname,
                 r.get("pair", ""), r.get("side", ""),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
                 r.get("exit_reason", ""),
-                f"{pnl:+,.2f}", f"{fee:.4f}", net_cell,
+                _fmt2(pnl), f"{fee:.4f}", net_cell,
             )
         if not any_t:
             trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "")
