@@ -24,6 +24,16 @@ def _fmt2(x: float, sign: bool = True) -> str:
     return f"{v:+,.2f}" if sign else f"{v:,.2f}"
 
 
+def _dir_zh(raw: str) -> str:
+    """方向字段中文化。兼容 db.side/OKX posSide('long'/'short') 和 OKX side('buy'/'sell')。"""
+    v = str(raw or "").lower()
+    if v in ("long", "buy"):
+        return "[green]做多[/green]"
+    if v in ("short", "sell"):
+        return "[red]做空[/red]"
+    return raw or ""
+
+
 class PositionMonitor:
     """终端面板 — 多账户版。5 秒刷新。
 
@@ -199,7 +209,7 @@ class PositionMonitor:
             for o in a["pendings"]:
                 any_p = True
                 pending_tbl.add_row(
-                    a["name"], str(o.get("instId", "")), str(o.get("side", "")),
+                    a["name"], str(o.get("instId", "")), _dir_zh(o.get("side", "")),
                     str(o.get("triggerPx", "")), str(o.get("tpTriggerPx", "")),
                     str(o.get("slTriggerPx", "")), str(o.get("algoId", ""))[:18],
                 )
@@ -223,7 +233,7 @@ class PositionMonitor:
                 except (ValueError, TypeError):
                     upl_cell = upl
                 pos_tbl.add_row(
-                    a["name"], str(p.get("instId", "")), str(p.get("posSide", "")),
+                    a["name"], str(p.get("instId", "")), _dir_zh(p.get("posSide", "")),
                     str(p.get("pos", "")), str(p.get("avgPx", "")), upl_cell,
                 )
         if not any_pos:
@@ -253,7 +263,7 @@ class PositionMonitor:
             net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str
             trade_tbl.add_row(
                 (r.get("exit_time") or "")[:19], aname,
-                r.get("pair", ""), r.get("side", ""),
+                r.get("pair", ""), _dir_zh(r.get("side", "")),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
                 r.get("exit_reason", ""),
                 _fmt2(pnl), f"{fee:.4f}", net_cell,
