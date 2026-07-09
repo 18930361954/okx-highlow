@@ -13,6 +13,13 @@ UTC = timezone.utc
 class PositionMonitor:
     """终端面板 — 多账户版。5 秒刷新。
 
+    数据来源:
+      - 余额:db.state.current_balance (由 reconciler 按 OKX 净值累计更新)
+      - 挂单/持仓:OKX list_pending_algos / get_positions 实时拉
+      - 名义 PnL / 手续费 / 净 PnL:db.trades.pnl / fee (reconciler 从
+        OKX orders-history 累加真值,不本地估算)
+      - 净 PnL = 名义 pnl - 手续费(与 OKX 界面口径一致)
+
     构造两种模式:
       1. 多账户 (推荐): 传 runtimes=[...] 列表,面板显示所有账户
       2. 单账户 (旧兼容): 传 okx_client / account_state / config,面板显示一个账户

@@ -86,12 +86,12 @@ def test_entry_only_backfills_entry_time(tmp_path):
 def test_full_exit_settles_and_updates_account(tmp_path):
     db, acc = _fresh(tmp_path)
     _mk_open_trade(db, algo_id="A1", side="short", entry_price=60000.0, margin=100.0)
-    # short：60000 入 → 59400 平（-1%），margin=100, lev=100 → pnl = 100*100*0.01 = +100
+    # short：60000 入 → 59400 平，OKX exit order 携带 pnl=100 (直接用 OKX 值,不再本地估算)
     okx = FakeOKX({"BTC-USDT-SWAP": [
         {"algoId": "A1", "fillPx": "60000", "fillTime": "1751328000000",
-         "reduceOnly": "false"},
+         "reduceOnly": "false", "pnl": "0"},
         {"algoId": "A1", "fillPx": "59400", "fillTime": "1751331600000",
-         "reduceOnly": "true", "category": "tp"},
+         "reduceOnly": "true", "category": "tp", "pnl": "100"},
     ]})
     r = Reconciler(okx, db, acc, CONFIG)
     assert r.run_once() == 2  # 一个 entry 回填 + 一个 exit 结算
@@ -107,12 +107,12 @@ def test_full_exit_settles_and_updates_account(tmp_path):
 def test_loss_increments_streak(tmp_path):
     db, acc = _fresh(tmp_path)
     _mk_open_trade(db, algo_id="A1", side="long", entry_price=60000.0, margin=100.0)
-    # long：60000 入 → 59700 平（-0.5%），pnl = 100*100*(-0.005) = -50
+    # long：60000 入 → 59700 平,OKX exit order 携带 pnl=-50
     okx = FakeOKX({"BTC-USDT-SWAP": [
         {"algoId": "A1", "fillPx": "60000", "fillTime": "1751328000000",
-         "reduceOnly": "false"},
+         "reduceOnly": "false", "pnl": "0"},
         {"algoId": "A1", "fillPx": "59700", "fillTime": "1751331600000",
-         "reduceOnly": "true", "category": "sl"},
+         "reduceOnly": "true", "category": "sl", "pnl": "-50"},
     ]})
     r = Reconciler(okx, db, acc, CONFIG)
     r.run_once()
@@ -174,11 +174,11 @@ def test_exit_via_time_window_fallback_when_algo_id_differs(tmp_path):
     okx = FakeOKX({"BTC-USDT-SWAP": [
         {"algoId": "MAIN_ALGO", "ordId": "O1",
          "fillPx": "60000", "fillTime": "1782914400000",
-         "reduceOnly": "false"},
+         "reduceOnly": "false", "pnl": "0"},
         # 平仓：algoId 是独立的（模拟 OKX attach 触发生成的新 algoId）
         {"algoId": "DIFF_ALGO_XYZ", "ordId": "O2",
          "fillPx": "59400", "fillTime": "1782918000000",
-         "reduceOnly": "true", "category": "tp"},
+         "reduceOnly": "true", "category": "tp", "pnl": "100"},
     ]})
     r = Reconciler(okx, db, acc, CONFIG)
     r.run_once()

@@ -266,55 +266,49 @@ class Reconciler:
                         except Exception:
                             pass
 
-                    # pnl 优先取 OKX 提供的名义 pnl(不含手续费);
-                    # 拿不到就按 margin*lev*pct 估算(与回测一致)。
-                    pnl_raw = exit_.get("pnl")
-                    try:
-                        pnl = float(pnl_raw) if pnl_raw not in (None, "") else None
-                    except (TypeError, ValueError):
-                        pnl = None
-                    if pnl is None:
-                        entry_px = float(t.get("entry_price") or 0)
-                        margin = float(t.get("margin") or 0)
-                        if entry_px > 0 and margin > 0:
-                            if t.get("side") == "long":
-                                pct = (fill_px - entry_px) / entry_px
-                            else:
-                                pct = (entry_px - fill_px) / entry_px
-                            pair_lev = self.account.leverage_for(t.get("pair"))
-                            pnl = margin * pair_lev * pct
-                        else:
-                            pnl = 0.0
-
-                    # 累加真实手续费:entry order 的 fee + exit order 的 fee
-                    # OKX fee 字段是负值(扣除),取绝对值。
-                    def _fee_of(o: dict | None) -> float:
-                        if not o:
-                            return 0.0
-                        v = o.get("fee")
+                    # ============================================================
+                    # PnL / Fee 全部从 OKX 累加,不本地估算
+                    # ============================================================
+                    # 累加规则:
+                    #   pnl:  该 trade 全部相关 orders 的 pnl 字段之和
+                    #         (OKX 名义盈亏,不含手续费)
+                    #   fee:  该 trade 全部相关 orders 的 fee 字段之和
+                    #         (OKX 是负值,存绝对值方便展示)
+                    #
+                    # 相关 orders:
+                    #   a) 主 algoId 下的全部 orders (entry + 可能的 partial fills)
+                    #   b) 时间窗口匹配到的 exit (TP/SL attach algo 独立 algoId)
+                    def _num(o: dict, k: str) -> float:
+                        v = o.get(k)
                         if v in (None, ""):
                             return 0.0
                         try:
-                            return abs(float(v))
+                            return float(v)
                         except (TypeError, ValueError):
                             return 0.0
 
-                    fee_total = _fee_of(entry) + _fee_of(exit_)
-                    pnl_net = pnl - fee_total  # 净盈亏(实际影响余额)
+                    related: list[dict] = list(orders_by_algo.get(algo_id, []))
+                    if exit_ and exit_ not in related:
+                        related.append(exit_)
+
+                    pnl_sum = sum(_num(o, "pnl") for o in related)
+                    fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
+                    fee_total = abs(fee_raw_sum)
+                    pnl_net = pnl_sum + fee_raw_sum  # fee 负值,直接加就是净
 
                     self.db.update_trade_exit(
                         trade_id=t["id"],
                         exit_price=fill_px,
                         exit_reason=reason,
-                        pnl=pnl,
+                        pnl=pnl_sum,
                         exit_time=fill_time,
                         fee=fee_total,
                     )
                     if self.logger:
                         self.logger.info(
                             f"[reconcile] exit filled: trade#{t['id']} {t['pair']} "
-                            f"{reason} @ {fill_px} pnl={pnl:+.4f} fee={fee_total:.4f} "
-                            f"net={pnl_net:+.4f}"
+                            f"{reason} @ {fill_px} 名义pnl={pnl_sum:+.4f} 手续费={fee_total:.4f} "
+                            f"净={pnl_net:+.4f} (合并 {len(related)} 个 OKX orders)"
                         )
 
                     # 结算账户状态:余额按净 pnl 更新(与 OKX 服务端实际扣减一致)
