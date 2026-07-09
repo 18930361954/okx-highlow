@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_reason TEXT,
     margin REAL,
     mode TEXT,
-    pnl REAL,
+    pnl REAL,                    -- OKX 名义盈亏(不含手续费)
+    fee REAL DEFAULT 0.0,        -- 该笔累计手续费(绝对值,来自 OKX orders-history)
     entry_time TEXT,
     exit_time TEXT,
     okx_order_id TEXT,
@@ -62,12 +63,14 @@ class DB:
     def _init_schema(self) -> None:
         with self._conn() as c:
             c.execute(_SCHEMA_TRADES)
-            # trades 迁移：既有库补 attempt / account 列
+            # trades 迁移：既有库补 attempt / account / fee 列
             cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
             if "attempt" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN attempt INTEGER DEFAULT 1")
             if "account" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN account TEXT NOT NULL DEFAULT 'default'")
+            if "fee" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0.0")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -122,13 +125,21 @@ class DB:
         exit_reason: str,
         pnl: float,
         exit_time: str,
+        fee: float | None = None,
     ) -> None:
         with self._conn() as c:
-            c.execute(
-                """UPDATE trades SET exit_price=?, exit_reason=?, pnl=?, exit_time=?
-                   WHERE id=?""",
-                (exit_price, exit_reason, pnl, exit_time, trade_id),
-            )
+            if fee is not None:
+                c.execute(
+                    """UPDATE trades SET exit_price=?, exit_reason=?, pnl=?, fee=?, exit_time=?
+                       WHERE id=?""",
+                    (exit_price, exit_reason, pnl, fee, exit_time, trade_id),
+                )
+            else:
+                c.execute(
+                    """UPDATE trades SET exit_price=?, exit_reason=?, pnl=?, exit_time=?
+                       WHERE id=?""",
+                    (exit_price, exit_reason, pnl, exit_time, trade_id),
+                )
 
     def update_trade_entry(self, trade_id: int, entry_time: str,
                            entry_price: float | None = None) -> None:

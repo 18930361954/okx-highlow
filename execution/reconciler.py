@@ -266,8 +266,8 @@ class Reconciler:
                         except Exception:
                             pass
 
-                    # pnl 优先取 OKX 提供的实际 pnl（含手续费/资金费口径），
-                    # 拿不到就按 margin*lev*pct 估算（与回测一致）。
+                    # pnl 优先取 OKX 提供的名义 pnl(不含手续费);
+                    # 拿不到就按 margin*lev*pct 估算(与回测一致)。
                     pnl_raw = exit_.get("pnl")
                     try:
                         pnl = float(pnl_raw) if pnl_raw not in (None, "") else None
@@ -281,11 +281,26 @@ class Reconciler:
                                 pct = (fill_px - entry_px) / entry_px
                             else:
                                 pct = (entry_px - fill_px) / entry_px
-                            # per-pair leverage：SOL 50x、BTC/ETH 100x
                             pair_lev = self.account.leverage_for(t.get("pair"))
                             pnl = margin * pair_lev * pct
                         else:
                             pnl = 0.0
+
+                    # 累加真实手续费:entry order 的 fee + exit order 的 fee
+                    # OKX fee 字段是负值(扣除),取绝对值。
+                    def _fee_of(o: dict | None) -> float:
+                        if not o:
+                            return 0.0
+                        v = o.get("fee")
+                        if v in (None, ""):
+                            return 0.0
+                        try:
+                            return abs(float(v))
+                        except (TypeError, ValueError):
+                            return 0.0
+
+                    fee_total = _fee_of(entry) + _fee_of(exit_)
+                    pnl_net = pnl - fee_total  # 净盈亏(实际影响余额)
 
                     self.db.update_trade_exit(
                         trade_id=t["id"],
@@ -293,20 +308,22 @@ class Reconciler:
                         exit_reason=reason,
                         pnl=pnl,
                         exit_time=fill_time,
+                        fee=fee_total,
                     )
                     if self.logger:
                         self.logger.info(
                             f"[reconcile] exit filled: trade#{t['id']} {t['pair']} "
-                            f"{reason} @ {fill_px} pnl={pnl:+.4f}"
+                            f"{reason} @ {fill_px} pnl={pnl:+.4f} fee={fee_total:.4f} "
+                            f"net={pnl_net:+.4f}"
                         )
 
-                    # 结算账户状态：余额/连亏/熔断
+                    # 结算账户状态:余额按净 pnl 更新(与 OKX 服务端实际扣减一致)
                     exit_dt = None
                     try:
                         exit_dt = datetime.fromisoformat(fill_time) if fill_time else None
                     except ValueError:
                         exit_dt = None
-                    self.account.on_trade_filled(pnl=pnl, exit_time=exit_dt)
+                    self.account.on_trade_filled(pnl=pnl_net, exit_time=exit_dt)
                     processed += 1
 
                     # 日内重挂：只有 SL 平仓 + pair 启用 reentry_floats + attempt<最大 + 当日 UTC 未跨天

@@ -153,27 +153,20 @@ class OrderManager:
         except Exception as e:
             place_err = e
             resp = None
-            # 51149 首次超时后重试可能回 code=1 msg=""（OKX 侧幂等键已建单，只是响应异常）。
-            # 这类先降级为 WARNING，走下面的 clOrdId 回查兜底；回查失败再抬回 ERROR
-            if self.logger:
-                self.logger.warning(f"place_algo_order {pair} raised: {e}（走 clOrdId 兜底）")
+            # 51149 首次超时后重试可能回 code=1 msg=""(OKX 侧幂等键已建单,只是响应异常)。
+            # 静默不打 log,走下面的 clOrdId 回查兜底;回查成功后 INFO 提示,失败才 ERROR
 
         data = resp.get("data", []) if isinstance(resp, dict) else []
         algo_id = data[0].get("algoId") if data else None
 
-        # 边界：resp 未含 algoId（返回格式异常 / 请求侧异常，比如 51149 下单超时）。
-        # 挂单请求带了 algoClOrdId 幂等键，OKX 侧只会建一次 —— 回查 pending
-        # 按 algoClOrdId 精确匹配，把 algoId 取回来，避免 db 缺记录导致下次 catchup 重复挂。
+        # 边界:resp 未含 algoId(返回格式异常 / 请求侧异常,比如 51149 下单超时)。
+        # 挂单请求带了 algoClOrdId 幂等键,OKX 侧只会建一次 → 回查 pending
+        # 按 algoClOrdId 精确匹配,把 algoId 取回来,避免 db 缺记录导致下次 catchup 重复挂。
         if not algo_id:
-            if self.logger:
-                if place_err:
-                    self.logger.warning(
-                        f"[order] {pair} 下单请求异常，按 clOrdId 回查 pending: clOrdId={algo_cl_ord_id}"
-                    )
-                else:
-                    self.logger.warning(
-                        f"[order] {pair} place resp 未含 algoId，回查 pending：resp={resp}"
-                    )
+            if self.logger and not place_err:
+                self.logger.warning(
+                    f"[order] {pair} place resp 未含 algoId,回查 pending: resp={resp}"
+                )
             try:
                 for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
                     if o.get("algoClOrdId") == algo_cl_ord_id:
@@ -183,8 +176,13 @@ class OrderManager:
                 if self.logger:
                     self.logger.error(f"[order] 回查 pending 失败: {e}")
 
-            if not algo_id and place_err and self.logger:
-                # 回查也没找到 → 真的失败了，抬回 ERROR
+            if algo_id and place_err and self.logger:
+                # 回查成功 → 说明是 51149 超时/幂等键已建单,现在拿到 algoId,只提示不告警
+                self.logger.info(
+                    f"[order] {pair} 首次超时/空响应,通过 clOrdId 兜底拿到 algoId={algo_id}"
+                )
+            elif not algo_id and place_err and self.logger:
+                # 回查也没找到 → 真的失败了,抬回 ERROR
                 self.logger.error(
                     f"place_algo_order {pair} failed 且 clOrdId={algo_cl_ord_id} 回查未命中: {place_err}"
                 )

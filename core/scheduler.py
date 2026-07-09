@@ -106,19 +106,21 @@ def add_account_jobs(
     signal_bar: str = "1D",
     report_hour: int = 23,
     report_minute: int = 55,
+    signal_second_offset: int = 0,
 ) -> None:
     """把一个账户的所有 job 注册进已有 scheduler。
     signal_bar → 每天 N 次 signal / N 次 cancel cron。
     report 每日 1 次(账户级报告在 main 里全局出一份)。
+    signal_second_offset: 秒偏移,不同账户错开(避免 OKX 51149 并发超时)。
     """
     prefix = account_name
     hours = signal_hours_for(signal_bar)
 
-    # signal: 每个 hour 挂一个;job id 带 hour 区分
+    # signal: 每个 hour 挂一个;job id 带 hour 区分。加秒偏移防多账户并发
     for h in hours:
         sched.add_job(
             daily_signal_fn,
-            trigger=CronTrigger(hour=h, minute=0, timezone=UTC),
+            trigger=CronTrigger(hour=h, minute=0, second=signal_second_offset, timezone=UTC),
             id=f"{prefix}.signal_{h:02d}",
             misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
         )

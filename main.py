@@ -302,10 +302,12 @@ def main():
     sched = BackgroundScheduler(timezone=UTC)
     rep_h, rep_m = map(int, str(config["system"]["daily_report_time_utc"]).split(":"))
 
-    for rt in ok_runtimes:
+    for idx, rt in enumerate(ok_runtimes):
         signal_bar = rt.strategy.signal_bar
+        # 账户级秒偏移:防多账户同秒触发导致 OKX 51149 并发超时
+        sec_offset = idx * 3
         base_logger.info(f"[{rt.name}] signal_bar={signal_bar}, "
-                          f"每天 {len(signal_hours_for(signal_bar))} 次挂单")
+                          f"每天 {len(signal_hours_for(signal_bar))} 次挂单,秒偏移 +{sec_offset}s")
         add_account_jobs(
             sched,
             account_name=rt.name,
@@ -316,6 +318,7 @@ def main():
             reconcile_interval_seconds=20,
             signal_bar=signal_bar,
             report_hour=rep_h, report_minute=rep_m,
+            signal_second_offset=sec_offset,
         )
 
     # 全局 1 次总报告
