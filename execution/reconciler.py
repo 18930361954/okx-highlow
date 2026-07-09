@@ -8,6 +8,9 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
+
+from core.okx_client import OKXError
 from data.db import DEFAULT_ACCOUNT
 
 UTC = timezone.utc
@@ -128,6 +131,9 @@ class Reconciler:
         self.pairs: list[str] = list(config["strategy"]["pairs"])
         # 全局默认杠杆（兼容旧代码）；实际用 account.leverage_for(pair) 拿 per-pair
         self.leverage = int(config["strategy"]["leverage"])
+        # 本轮 run_once 中是否遇到过网络异常。tick 层据此做熔断退避,防止 DNS/断网时刷屏。
+        # 每轮 run_once 开头重置。
+        self.last_run_had_net_error: bool = False
 
     @staticmethod
     def _match_position_history(rows: list[dict], side: str, close_px: float,
@@ -168,8 +174,16 @@ class Reconciler:
                 best = (score, r)
         return best[1] if best else None
 
+    def _mark_if_net_error(self, exc: BaseException) -> None:
+        """OKX 业务错误不算网络问题;requests 层的连接/DNS/超时算。tick 层据此熔断退避。"""
+        if isinstance(exc, OKXError):
+            return
+        if isinstance(exc, requests.RequestException):
+            self.last_run_had_net_error = True
+
     def run_once(self) -> int:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
+        self.last_run_had_net_error = False
         try:
             open_trades = self.db.list_open_trades(account=self.account_name)
         except Exception as e:
@@ -198,6 +212,7 @@ class Reconciler:
             try:
                 rows = self.okx.list_order_history(instId=pair, state="filled", limit=100)
             except Exception as e:
+                self._mark_if_net_error(e)
                 if self.logger:
                     self.logger.warning(f"[reconcile] list_order_history({pair}) failed: {e}")
                 continue
@@ -218,6 +233,7 @@ class Reconciler:
                     instId=pair, limit=100
                 )
             except Exception as e:
+                self._mark_if_net_error(e)
                 if self.logger:
                     self.logger.warning(
                         f"[reconcile] list_positions_history({pair}) failed: {e}"
@@ -558,6 +574,7 @@ class Reconciler:
                         self.logger.info(f"[catchup-exit] {pair} 已有 pending,跳过")
                     return
         except Exception as e:
+            self._mark_if_net_error(e)
             if self.logger:
                 self.logger.warning(f"[catchup-exit] {pair} list_pending 失败: {e}")
             return
@@ -568,6 +585,7 @@ class Reconciler:
                         self.logger.info(f"[catchup-exit] {pair} 仍有持仓,跳过")
                     return
         except Exception as e:
+            self._mark_if_net_error(e)
             if self.logger:
                 self.logger.warning(f"[catchup-exit] {pair} get_positions 失败: {e}")
             return
@@ -622,6 +640,7 @@ class Reconciler:
         try:
             all_pending = self.okx.list_pending_algos(ordType="trigger")
         except Exception as e:
+            self._mark_if_net_error(e)
             if self.logger:
                 self.logger.warning(f"[reconcile] cleanup: list_pending_algos failed: {e}")
             return

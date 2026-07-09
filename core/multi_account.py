@@ -13,12 +13,15 @@ from __future__ import annotations
 import copy
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from core.account_state import AccountState
-from core.okx_client import OKXClient
+from core.okx_client import OKXClient, OKXError
 from data.db import DB, DEFAULT_ACCOUNT
 from execution.order_manager import OrderManager
 from execution.reconciler import Reconciler
@@ -175,6 +178,20 @@ def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
     )
 
 
+# reconcile 网络熔断参数:连续 N 次网络异常后开始退避,防止 DNS/断网时刷屏。
+# 单账户 reconcile 每 20s 一次,3 次约 60s → 判定"确实断网"。
+_RECON_NET_FAIL_THRESHOLD = 3
+_RECON_BACKOFF_BASE_SECS = 30
+_RECON_BACKOFF_MAX_SECS = 300
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """业务错误(OKXError)不算网络问题;requests 层的连接/DNS/超时算。"""
+    if isinstance(exc, OKXError):
+        return False
+    return isinstance(exc, requests.RequestException)
+
+
 @dataclass
 class AccountRuntime:
     """一个账户跑起来所需的全部对象。共享 db。"""
@@ -186,19 +203,55 @@ class AccountRuntime:
     order_manager: OrderManager
     reconciler: Reconciler
     logger: Any = field(default=None, repr=False)
+    # 网络失败熔断状态
+    _net_fail_count: int = field(default=0, repr=False)
+    _skip_until: float = field(default=0.0, repr=False)
 
     @property
     def name(self) -> str:
         return self.cfg.name
 
     def reconcile_tick(self) -> None:
+        # 熔断退避期内直接跳过这轮
+        if self._skip_until and time.monotonic() < self._skip_until:
+            return
+        net_error = False
         try:
             n = self.reconciler.run_once()
             if n and self.logger:
                 self.logger.info(f"[reconcile] settled {n} trade update(s)")
+            # reconciler 内部把 OKX 网络异常吞成 warning,通过 last_run_had_net_error 上报
+            net_error = self.reconciler.last_run_had_net_error
         except Exception as e:
-            if self.logger:
-                self.logger.error(f"[reconcile] tick failed: {e}")
+            if _is_network_error(e):
+                net_error = True
+            else:
+                if self.logger:
+                    self.logger.error(f"[reconcile] tick failed: {e}")
+                return
+
+        if net_error:
+            self._net_fail_count += 1
+            if self._net_fail_count >= _RECON_NET_FAIL_THRESHOLD:
+                over = self._net_fail_count - _RECON_NET_FAIL_THRESHOLD
+                backoff = min(
+                    _RECON_BACKOFF_BASE_SECS * (2 ** over),
+                    _RECON_BACKOFF_MAX_SECS,
+                )
+                self._skip_until = time.monotonic() + backoff
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] 连续 {self._net_fail_count} 轮网络失败,退避 {backoff}s"
+                    )
+            return
+
+        # 本轮成功:清零计数
+        if self._net_fail_count and self.logger:
+            self.logger.info(
+                f"[reconcile] 网络恢复,清零失败计数(此前 {self._net_fail_count} 轮)"
+            )
+        self._net_fail_count = 0
+        self._skip_until = 0.0
 
 
 def build_runtime(cfg: AccountConfig, db: DB, base_logger) -> AccountRuntime:

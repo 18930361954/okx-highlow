@@ -1,5 +1,6 @@
 from typing import Callable
 
+from core.okx_client import OKXError
 from data.db import DEFAULT_ACCOUNT
 
 
@@ -77,6 +78,18 @@ class OrderManager:
             self._lev_confirmed[pair] = leverage
             if self.logger:
                 self.logger.info(f"[lev] {pair} = {leverage}x ({self.td_mode}) ok")
+        except OKXError as e:
+            # 59669: 已有 pending trigger 单,无法调整杠杆。假设已在目标档位,登记缓存跳过。
+            if e.code == "59669":
+                self._lev_confirmed[pair] = leverage
+                if self.logger:
+                    self.logger.info(
+                        f"[lev] {pair} = {leverage}x ({self.td_mode}) 已有 pending 单,跳过 set"
+                    )
+            elif self.logger:
+                self.logger.warning(
+                    f"set_leverage {pair} lev={leverage} mode={self.td_mode} failed: {e}"
+                )
         except Exception as e:
             if self.logger:
                 self.logger.warning(
@@ -153,7 +166,7 @@ class OrderManager:
         except Exception as e:
             place_err = e
             resp = None
-            # 51149 首次超时后重试可能回 code=1 msg=""(OKX 侧幂等键已建单,只是响应异常)。
+            # 51149 下单超时 / code=1 空响应：OKX 侧用 algoClOrdId 幂等键建单成功但响应异常。
             # 静默不打 log,走下面的 clOrdId 回查兜底;回查成功后 INFO 提示,失败才 ERROR
 
         data = resp.get("data", []) if isinstance(resp, dict) else []

@@ -13,7 +13,9 @@ OKX_BASE_URL = "https://www.okx.com"
 
 
 class OKXError(Exception):
-    pass
+    def __init__(self, msg: str, code: str = ""):
+        super().__init__(msg)
+        self.code = code
 
 
 class OKXClient:
@@ -67,10 +69,12 @@ class OKXClient:
         return h
 
     # 可安全退避重试的 OKX 业务错误码：
-    #   51149 下单超时 —— OKX 内部处理超时，配合 algoClOrdId 幂等键可安全重下
     #   51290 Trading bot engine currently upgrading —— OKX 明确要求重试，纯读端接口重试无副作用；
     #         下单端配合 algoClOrdId 幂等键也安全
-    _RETRYABLE_OKX_CODES = {"51149", "51290"}
+    # 注意：51149 曾在这里，但观测到 OKX 侧其实已用 algoClOrdId 幂等键建单，只是响应超时；
+    # 底层再 retry 反而把幂等键“用掉”后返回 code=1 空响应，同时留下 2~3 张 pending 需 reconcile 撤。
+    # 现在 51149 直接抛给上层 order_manager，由 place_algo_orders 的 clOrdId 回查兜底把 algoId 取回。
+    _RETRYABLE_OKX_CODES = {"51290"}
 
     def _request(
         self,
@@ -105,9 +109,12 @@ class OKXClient:
                     code = str(data.get("code", ""))
                     msg = f"OKX error code={code} msg={data.get('msg')} endpoint={endpoint}"
                     if self.logger:
-                        self.logger.warning(msg)
+                        # 59669：set_leverage 被 pending trigger 单卡住,是上层已知不阻断状态,不打 WARNING
+                        # 让 main.py 的 except 分支决定日志级别
+                        if code != "59669":
+                            self.logger.warning(msg)
                     if code in self._RETRYABLE_OKX_CODES and attempt < max_retries - 1:
-                        last_err = OKXError(msg)
+                        last_err = OKXError(msg, code=code)
                         wait = 2 ** attempt
                         if self.logger:
                             self.logger.warning(
@@ -115,7 +122,7 @@ class OKXClient:
                             )
                         time.sleep(wait)
                         continue
-                    raise OKXError(msg)
+                    raise OKXError(msg, code=code)
                 return data
             except (requests.RequestException, ValueError) as e:
                 last_err = e

@@ -450,3 +450,66 @@ def test_reentry_skipped_when_reached_max(tmp_path):
     r.run_once()
     # attempt=2 已存在，不再挂 attempt=3
     assert om_stub.calls == []
+
+
+# ---------------- P3: 网络失败信号 ----------------
+
+class RaisingOKX:
+    """按调用序列抛出不同错误的 OKX,用于验证 last_run_had_net_error 标记。"""
+
+    def __init__(self, exc_seq):
+        self._exc_seq = list(exc_seq)
+        self._i = 0
+
+    def _next_exc(self):
+        exc = self._exc_seq[self._i]
+        self._i = min(self._i + 1, len(self._exc_seq) - 1)
+        return exc
+
+    def list_order_history(self, instId=None, state="filled", limit=100):
+        raise self._next_exc()
+
+    def list_pending_algos(self, instType="SWAP", instId=None, ordType="trigger"):
+        raise self._next_exc()
+
+    def list_positions_history(self, instType="SWAP", instId=None, limit=100):
+        raise self._next_exc()
+
+    def cancel_algo_order(self, algoId, instId):  # pragma: no cover
+        return {"code": "0"}
+
+
+def test_run_once_marks_net_error_on_requests_exception(tmp_path):
+    import requests
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1")
+    # list_pending_algos(cleanup 里第一个调) → 网络异常
+    okx = RaisingOKX([requests.ConnectionError("dns failed")])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert r.last_run_had_net_error is True
+
+
+def test_run_once_okx_business_error_not_flagged_as_net(tmp_path):
+    from core.okx_client import OKXError
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1")
+    okx = RaisingOKX([OKXError("code=51000 msg=param err", code="51000")])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert r.last_run_had_net_error is False
+
+
+def test_run_once_net_error_flag_resets_each_call(tmp_path):
+    """先失败一轮标记为 True,下一轮全成功应重置为 False。"""
+    import requests
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1")
+    okx = FakeOKX({"BTC-USDT-SWAP": [
+        {"algoId": "A1", "fillPx": "60050", "fillTime": "1751328000000",
+         "reduceOnly": "false"},
+    ]})
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.last_run_had_net_error = True  # 假装上轮有网络失败
+    r.run_once()
+    assert r.last_run_had_net_error is False

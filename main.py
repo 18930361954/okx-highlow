@@ -14,6 +14,7 @@ import yaml
 from dotenv import load_dotenv
 
 from core.multi_account import AccountRuntime, load_accounts
+from core.okx_client import OKXError
 from core.scheduler import add_account_jobs, signal_hours_for
 from apscheduler.schedulers.background import BackgroundScheduler
 from data.db import DB
@@ -284,6 +285,18 @@ def main():
                 rt.okx.set_leverage(pair, lev, mgnMode=rt.cfg.td_mode)
                 rt.order_manager.mark_leverage_confirmed(pair, lev)
                 rt.logger.info(f"[lev] {pair} = {lev}x ({rt.cfg.td_mode}) ok")
+            except OKXError as e:
+                # 59669: 已有 pending trigger 单,无法调整杠杆。属预期状态(重启时常见),
+                # 假设账户此前已经设成目标杠杆,登记进缓存跳过后续尝试。
+                if e.code == "59669":
+                    rt.order_manager.mark_leverage_confirmed(pair, lev)
+                    rt.logger.info(
+                        f"[lev] {pair} = {lev}x ({rt.cfg.td_mode}) 已有 pending 单,跳过 set(沿用当前档位)"
+                    )
+                else:
+                    rt.logger.warning(
+                        f"set_leverage {pair} {lev}x {rt.cfg.td_mode} failed (可到 OKX 手动设): {e}"
+                    )
             except Exception as e:
                 rt.logger.warning(
                     f"set_leverage {pair} {lev}x {rt.cfg.td_mode} failed (可到 OKX 手动设): {e}"
