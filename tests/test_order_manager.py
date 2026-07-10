@@ -175,6 +175,63 @@ def test_okx_client_builds_attach_algo_ords(tmp_path):
     assert a["slTriggerPxType"] == "last"
 
 
+def test_get_algo_order_returns_row_when_found():
+    """OKXClient.get_algo_order 命中时返回单条 dict。"""
+    from core.okx_client import OKXClient
+    cli = OKXClient("k", "s", "p", env="demo")
+
+    def fake_request(method, endpoint, params=None, body=None, **kw):
+        assert method == "GET"
+        assert endpoint == "/api/v5/trade/order-algo"
+        assert params == {"algoClOrdId": "hlBTC20260629l1"}
+        return {"code": "0", "data": [{"algoId": "A9", "algoClOrdId": "hlBTC20260629l1",
+                                        "state": "live"}]}
+
+    cli._request = fake_request
+    row = cli.get_algo_order(algoClOrdId="hlBTC20260629l1")
+    assert row is not None
+    assert row["algoId"] == "A9"
+
+
+def test_get_algo_order_returns_none_when_not_found():
+    """空 data → None,不抛异常。"""
+    from core.okx_client import OKXClient
+    cli = OKXClient("k", "s", "p", env="demo")
+    cli._request = lambda *a, **kw: {"code": "0", "data": []}
+    assert cli.get_algo_order(algoClOrdId="does-not-exist") is None
+
+
+def test_get_algo_order_swallows_not_found_codes():
+    """OKX 侧 51000/51603 表示未找到,应返回 None 而不是抛。"""
+    from core.okx_client import OKXClient, OKXError
+    cli = OKXClient("k", "s", "p", env="demo")
+
+    def fake_request(*a, **kw):
+        raise OKXError("not exist", code="51603")
+
+    cli._request = fake_request
+    assert cli.get_algo_order(algoClOrdId="x") is None
+
+
+def test_get_algo_order_reraises_other_okx_errors():
+    """其它 OKX 错误码应向上抛,不能吞。"""
+    from core.okx_client import OKXClient, OKXError
+    import pytest as _pytest
+    cli = OKXClient("k", "s", "p", env="demo")
+    cli._request = lambda *a, **kw: (_ for _ in ()).throw(OKXError("boom", code="50011"))
+    with _pytest.raises(OKXError):
+        cli.get_algo_order(algoClOrdId="x")
+
+
+def test_get_algo_order_requires_key():
+    """两个 key 都不传应抛 ValueError。"""
+    from core.okx_client import OKXClient
+    import pytest as _pytest
+    cli = OKXClient("k", "s", "p", env="demo")
+    with _pytest.raises(ValueError):
+        cli.get_algo_order()
+
+
 def test_persisted_trade_records_algoId_and_margin(tmp_path):
     db = DB(tmp_path / "t.db")
     okx = MagicMock()

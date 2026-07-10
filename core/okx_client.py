@@ -277,6 +277,28 @@ class OKXClient:
         data = self._request("GET", "/api/v5/trade/orders-algo-history", params=params)
         return data.get("data", [])
 
+    def get_algo_order(self, algoClOrdId: str | None = None,
+                       algoId: str | None = None) -> dict | None:
+        """按 algoClOrdId 或 algoId 查单条 algo 单,任意状态(live/effective/canceled/order_failed)。
+        找不到时(空 data 或 OKX 51000/51603 not-found)返回 None,其它错误抛出。
+        用于 51149 timeout 后按幂等键回查:pending 索引可能延迟,但单据接口能拿到。"""
+        params: dict[str, Any] = {}
+        if algoClOrdId:
+            params["algoClOrdId"] = algoClOrdId
+        if algoId:
+            params["algoId"] = algoId
+        if not params:
+            raise ValueError("get_algo_order requires algoClOrdId or algoId")
+        try:
+            data = self._request("GET", "/api/v5/trade/order-algo", params=params)
+        except OKXError as e:
+            # 51000: parameter error (含 not-found); 51603: order not exist
+            if e.code in ("51000", "51603"):
+                return None
+            raise
+        rows = data.get("data", [])
+        return rows[0] if rows else None
+
     def list_order_history(self, instType: str = "SWAP",
                            instId: str | None = None,
                            state: str = "filled",
