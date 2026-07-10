@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Callable
 
@@ -5,12 +6,15 @@ from core.okx_client import OKXError
 from data.db import DEFAULT_ACCOUNT
 
 
-# 各品种合约面值。OKX SWAP 张数与标的数量换算用。
-DEFAULT_CT_VAL = {
-    "BTC-USDT-SWAP": 0.01,
-    "ETH-USDT-SWAP": 0.1,
-    "SOL-USDT-SWAP": 1.0,
+# 兜底面值/步长(OKX instruments 拉取失败时才用)。首选运行时拉,见 OrderManager._get_meta。
+# 三币的 lotSz 现在都是 0.01,允许小数张;ctVal 是合约面值(1 张 = ctVal 个币)。
+DEFAULT_INSTRUMENT_META = {
+    "BTC-USDT-SWAP": {"ctVal": 0.01, "lotSz": 0.01, "minSz": 0.01},
+    "ETH-USDT-SWAP": {"ctVal": 0.1,  "lotSz": 0.01, "minSz": 0.01},
+    "SOL-USDT-SWAP": {"ctVal": 1.0,  "lotSz": 0.01, "minSz": 0.01},
 }
+# 兼容旧调用:外部若还传 ct_val 参数,合并进 DEFAULT_INSTRUMENT_META 的 ctVal 覆盖
+DEFAULT_CT_VAL = {k: v["ctVal"] for k, v in DEFAULT_INSTRUMENT_META.items()}
 
 # 触发价相对触发价的限价小步长（用于 trigger 后的限价委托价）。
 # 触发后立刻挂限价，价格放宽 SLIP_PCT 以提高成交概率（但仍是限价）。
@@ -37,7 +41,15 @@ class OrderManager:
         self.okx = okx_client
         self.db = db
         self.logger = logger
-        self.ct_val = {**DEFAULT_CT_VAL, **(ct_val or {})}
+        # instrument 元信息缓存 pair → {ctVal, lotSz, minSz}
+        # 首选:首次下单时从 OKX 拉真值;拉不到用 DEFAULT_INSTRUMENT_META 兜底
+        self._meta: dict[str, dict] = {}
+        # 外部若传 ct_val(旧签名兼容),塞进 _meta 的 ctVal 字段
+        if ct_val:
+            for p, v in ct_val.items():
+                base = dict(DEFAULT_INSTRUMENT_META.get(p, {"ctVal": 0.01, "lotSz": 0.01, "minSz": 0.01}))
+                base["ctVal"] = v
+                self._meta[p] = base
         self.td_mode = td_mode
         self.account = account
         # 缓存 pair → 已确认设置成功的 leverage,避免每次挂单都调 set_leverage。
@@ -51,25 +63,83 @@ class OrderManager:
 
     # ---------- helpers ----------
 
+    def _get_meta(self, pair: str) -> dict:
+        """拉/缓存 pair 的 ctVal/lotSz/minSz。OKX API 挂了才用 DEFAULT_INSTRUMENT_META。"""
+        if pair in self._meta:
+            return self._meta[pair]
+        try:
+            rows = self.okx.get_instruments(instType="SWAP", instId=pair)
+            if rows:
+                r = rows[0]
+                m = {
+                    "ctVal": float(r["ctVal"]),
+                    "lotSz": float(r["lotSz"]),
+                    "minSz": float(r["minSz"]),
+                }
+                self._meta[pair] = m
+                if self.logger:
+                    self.logger.info(
+                        f"[order] {pair} instrument: ctVal={m['ctVal']} "
+                        f"lotSz={m['lotSz']} minSz={m['minSz']}"
+                    )
+                return m
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(
+                    f"[order] {pair} get_instruments 失败,回退默认: {e}"
+                )
+        m = dict(DEFAULT_INSTRUMENT_META.get(pair, {"ctVal": 0.01, "lotSz": 0.01, "minSz": 0.01}))
+        self._meta[pair] = m
+        return m
+
+    @staticmethod
+    def _floor_to_step(value: float, step: float) -> float:
+        """按 step 向下取整。避免浮点尾巴:先转 step 的整数倍再乘回。"""
+        if step <= 0:
+            return value
+        return math.floor(value / step + 1e-9) * step
+
+    @staticmethod
+    def _fmt_sz(value: float, step: float) -> str:
+        """把 sz 格式化成字符串,保留 step 精度对应的小数位数,去掉多余尾零。"""
+        # step=0.01 → 2 位;step=0.1 → 1 位;step=1 → 0 位
+        if step >= 1:
+            return str(int(round(value)))
+        # 小数位数 = -log10(step)
+        digits = max(0, int(round(-math.log10(step))))
+        s = f"{value:.{digits}f}"
+        # 去掉可能出现的浮点尾巴
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
     def _calc_size(self, pair: str, margin_usdt: float, leverage: int,
-                   entry_price: float, max_contracts: int | None = None) -> str:
+                   entry_price: float, max_contracts: float | None = None) -> str:
         """
-        size 单位:张数(OKX SWAP)
+        size 单位:张数(OKX SWAP,可小数,按 lotSz 步长)
         notional = margin × leverage
         coin_qty = notional / entry_price
-        contracts = coin_qty / ct_val,再按 max_contracts 截断
+        contracts_raw = coin_qty / ctVal
+        contracts = floor(contracts_raw / lotSz) * lotSz,再按 max_contracts / minSz 截断
         """
-        ct_val = self.ct_val.get(pair, 0.01)
+        m = self._get_meta(pair)
+        ct_val = m["ctVal"]
+        lot_sz = m["lotSz"]
+        min_sz = m["minSz"]
         notional = margin_usdt * leverage
         coin_qty = notional / entry_price
-        contracts = max(1, int(coin_qty / ct_val))
+        contracts_raw = coin_qty / ct_val
+        contracts = self._floor_to_step(contracts_raw, lot_sz)
+        # 保证不低于最小张数
+        if contracts < min_sz:
+            contracts = min_sz
         if max_contracts and contracts > max_contracts:
             if self.logger:
                 self.logger.info(
                     f"[order] {pair} 张数从 {contracts} 封顶到 {max_contracts}"
                 )
-            contracts = max_contracts
-        return str(contracts)
+            contracts = float(max_contracts)
+            # 封顶后再按 lotSz 对齐(万一 max_contracts 不是 lotSz 整数倍)
+            contracts = self._floor_to_step(contracts, lot_sz)
+        return self._fmt_sz(contracts, lot_sz)
 
     def _ensure_leverage(self, pair: str, leverage: int) -> None:
         """
@@ -140,7 +210,7 @@ class OrderManager:
         leverage: int,
         td_mode: str | None = None,
         attempt: int = 1,
-        max_contracts: int | None = None,
+        max_contracts: float | None = None,
     ) -> str | None:
         pair = signal["pair"]
         direction = signal["direction"]

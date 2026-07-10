@@ -156,6 +156,16 @@ class OKXClient:
         data = self._request("GET", "/api/v5/market/history-candles", params=params)
         return data.get("data", [])
 
+    def get_instruments(self, instType: str = "SWAP",
+                        instId: str | None = None) -> list[dict]:
+        """拉合约元信息:ctVal(面值)、lotSz(下单最小步长)、minSz(最小张数)、
+        tickSz(价格步长)等。用于把张数从整张精度放宽到 lotSz。"""
+        params: dict[str, Any] = {"instType": instType}
+        if instId:
+            params["instId"] = instId
+        data = self._request("GET", "/api/v5/public/instruments", params=params)
+        return data.get("data", [])
+
     # ---------------- account ----------------
 
     def get_balance(self, ccy: str = "USDT") -> float:
