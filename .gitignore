@@ -14,6 +14,9 @@ data/*.db-wal
 # 日志（含 rotate 后的 bot.log.YYYY-MM-DD）
 logs/
 
+# 日报输出
+docs/daily_reports/
+
 # IDE
 .idea/
 .vscode/
