@@ -131,14 +131,80 @@ def test_cancel_all_pending(tmp_path):
     assert okx.cancel_algo_order.call_count == 2
 
 
-def test_place_algo_handles_failure(tmp_path):
+def test_place_algo_handles_failure(tmp_path, monkeypatch):
+    """挂单本身抛出且回查也 miss → 返回 None,且不写 db(避免脏数据)。"""
+    import execution.order_manager as _om
+    monkeypatch.setattr(_om, "_POLL_BACKOFFS", (0.0, 0.0))  # 加速测试
     db = DB(tmp_path / "t.db")
     okx = MagicMock()
     okx.set_leverage.return_value = {"code": "0"}
     okx.place_algo_order.side_effect = RuntimeError("api down")
+    okx.get_algo_order.return_value = None
+    okx.list_pending_algos.return_value = []
     om = OrderManager(okx, db)
     algo_id = om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
     assert algo_id is None
+    # 关键回归:不再插脏 trade 到 db
+    assert db.list_trades_by_date("2026-06-29") == []
+
+
+def test_place_recovers_via_cl_ord_id_poll_after_51149(tmp_path, monkeypatch):
+    """51149 timeout → get_algo_order 第 2 轮拿到 algoId → 正常 insert_trade。"""
+    import execution.order_manager as _om
+    from core.okx_client import OKXError
+    monkeypatch.setattr(_om, "_POLL_BACKOFFS", (0.0, 0.0, 0.0))
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.side_effect = OKXError("Order timed out", code="51149")
+    # 第 1 轮返回 None,第 2 轮返回单据
+    okx.get_algo_order.side_effect = [
+        None,
+        {"algoId": "RECOVERED_A", "algoClOrdId": "hlBTC20260629l1", "state": "live"},
+    ]
+    okx.list_pending_algos.return_value = []
+
+    om = OrderManager(okx, db)
+    aid = om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    assert aid == "RECOVERED_A"
+    rows = db.list_trades_by_date("2026-06-29")
+    assert len(rows) == 1
+    assert rows[0]["okx_order_id"] == "RECOVERED_A"
+
+
+def test_place_falls_back_to_pending_scan_when_get_algo_fails(tmp_path, monkeypatch):
+    """get_algo_order 抛异常时,同轮 list_pending_algos 兜底能拿到 algoId。"""
+    import execution.order_manager as _om
+    from core.okx_client import OKXError
+    monkeypatch.setattr(_om, "_POLL_BACKOFFS", (0.0,))
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.side_effect = OKXError("timeout", code="51149")
+    okx.get_algo_order.side_effect = RuntimeError("network")
+    okx.list_pending_algos.return_value = [
+        {"algoId": "PB1", "algoClOrdId": "hlBTC20260629l1", "instId": "BTC-USDT-SWAP"},
+    ]
+    om = OrderManager(okx, db)
+    aid = om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    assert aid == "PB1"
+
+
+def test_place_all_poll_rounds_miss_returns_none_no_db(tmp_path, monkeypatch):
+    """全轮 miss:返回 None + 不 insert_trade,让下轮 scheduler/catchup 用同 clOrdId 重试。"""
+    import execution.order_manager as _om
+    from core.okx_client import OKXError
+    monkeypatch.setattr(_om, "_POLL_BACKOFFS", (0.0, 0.0, 0.0, 0.0))
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.side_effect = OKXError("timeout", code="51149")
+    okx.get_algo_order.return_value = None
+    okx.list_pending_algos.return_value = []
+    om = OrderManager(okx, db)
+    aid = om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    assert aid is None
+    assert db.list_trades_by_date("2026-06-29") == []
 
 
 def test_okx_client_builds_attach_algo_ords(tmp_path):

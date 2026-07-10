@@ -1,3 +1,4 @@
+import time
 from typing import Callable
 
 from core.okx_client import OKXError
@@ -15,6 +16,11 @@ DEFAULT_CT_VAL = {
 # 触发后立刻挂限价，价格放宽 SLIP_PCT 以提高成交概率（但仍是限价）。
 # 0.01% = 保守偏移，绝大部分情况能作为 maker 挂单；极少数快速行情才会跨过成为 taker。
 SLIP_PCT = 0.0001  # 0.01%
+
+# 51149/code=1 挂单超时后按 algoClOrdId 回查的退避序列(秒)。
+# OKX 侧实际已用幂等键建单成功但响应超时,pending 索引落库需要一小段时间。
+# 4 轮共 ~3.2s,覆盖绝大多数落库延迟;仍找不到才算真正失败。
+_POLL_BACKOFFS = (0.2, 0.5, 1.0, 1.5)
 
 
 class OrderManager:
@@ -98,6 +104,35 @@ class OrderManager:
 
     # ---------- algo orders ----------
 
+    def _poll_algo_by_cl_ord_id(self, pair: str, algo_cl_ord_id: str) -> str | None:
+        """51149/code=1 timeout 后按幂等键回查 algoId。
+        每轮先调 get_algo_order(状态无关),失败再回退 list_pending_algos 扫。
+        任一轮拿到 algoId 立即返回;全轮 miss 返回 None。
+        _POLL_BACKOFFS 总耗时约 3.2s,阻塞挂单主流程,但比错误 insert None 安全。
+        """
+        for i, wait in enumerate(_POLL_BACKOFFS):
+            time.sleep(wait)
+            # 首选:单据接口,任意状态可查
+            try:
+                row = self.okx.get_algo_order(algoClOrdId=algo_cl_ord_id)
+                if row and row.get("algoId"):
+                    return row["algoId"]
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        f"[order] poll get_algo_order attempt {i+1} failed: {e}"
+                    )
+            # 兜底:pending 列表扫
+            try:
+                for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
+                    if o.get("algoClOrdId") == algo_cl_ord_id:
+                        aid = o.get("algoId")
+                        if aid:
+                            return aid
+            except Exception:
+                pass
+        return None
+
     def place_algo_orders(
         self,
         signal: dict,
@@ -173,32 +208,30 @@ class OrderManager:
         algo_id = data[0].get("algoId") if data else None
 
         # 边界:resp 未含 algoId(返回格式异常 / 请求侧异常,比如 51149 下单超时)。
-        # 挂单请求带了 algoClOrdId 幂等键,OKX 侧只会建一次 → 回查 pending
-        # 按 algoClOrdId 精确匹配,把 algoId 取回来,避免 db 缺记录导致下次 catchup 重复挂。
+        # 挂单带了 algoClOrdId 幂等键 → 按幂等键多轮延时回查,覆盖 OKX pending 索引落库延迟。
+        # 关键:仍未拿到 algoId 时,直接 return None 且不写 db —— 避免 reconciler 后续把
+        # algoId=None 的脏 db trade 误消化到无关孤儿 pending 上(2026-07-09 ETH 事故根因)。
         if not algo_id:
             if self.logger and not place_err:
                 self.logger.warning(
-                    f"[order] {pair} place resp 未含 algoId,回查 pending: resp={resp}"
+                    f"[order] {pair} place resp 未含 algoId,回查 clOrdId: resp={resp}"
                 )
-            try:
-                for o in self.okx.list_pending_algos(instId=pair, ordType="trigger"):
-                    if o.get("algoClOrdId") == algo_cl_ord_id:
-                        algo_id = o.get("algoId")
-                        break
-            except Exception as e:
-                if self.logger:
-                    self.logger.error(f"[order] 回查 pending 失败: {e}")
+            algo_id = self._poll_algo_by_cl_ord_id(pair, algo_cl_ord_id)
 
-            if algo_id and place_err and self.logger:
-                # 回查成功 → 说明是 51149 超时/幂等键已建单,现在拿到 algoId,只提示不告警
+            if algo_id and self.logger:
                 self.logger.info(
-                    f"[order] {pair} 首次超时/空响应,通过 clOrdId 兜底拿到 algoId={algo_id}"
+                    f"[order] {pair} 首次超时/空响应,通过 clOrdId 多轮兜底拿到 algoId={algo_id}"
                 )
-            elif not algo_id and place_err and self.logger:
-                # 回查也没找到 → 真的失败了,抬回 ERROR
-                self.logger.error(
-                    f"place_algo_order {pair} failed 且 clOrdId={algo_cl_ord_id} 回查未命中: {place_err}"
-                )
+            elif not algo_id:
+                if self.logger:
+                    err_desc = f": {place_err}" if place_err else ""
+                    self.logger.error(
+                        f"place_algo_order {pair} failed 且 clOrdId={algo_cl_ord_id} "
+                        f"多轮回查未命中,不写 db (避免脏数据){err_desc}"
+                    )
+                # 不写 db,直接返回。下轮 scheduler/catchup 用同 clOrdId 重试;
+                # OKX 幂等键保证同键不会重复建仓。
+                return None
 
         self.db.insert_trade(
             signal_date=signal.get("signal_date", ""),
