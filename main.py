@@ -345,8 +345,12 @@ def main():
 
     sched.start()
 
-    # 启动立刻各账户跑一次 reconcile + catchup
+    # 启动立刻各账户跑一次 orphan 扫描(撤同 clOrdId 的历史重复单)+ reconcile + catchup
     for rt in ok_runtimes:
+        try:
+            rt.reconciler.startup_orphan_scan()
+        except Exception as e:
+            rt.logger.error(f"启动 orphan_scan 失败: {e}")
         try:
             rt.reconcile_tick()
         except Exception as e:

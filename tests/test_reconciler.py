@@ -292,6 +292,32 @@ def test_cleanup_rejects_wrong_signal_bucket(tmp_path):
     assert t["okx_order_id"] == "GONE"  # db 未变(桶未过,不标 ORPHAN)
 
 
+def test_startup_orphan_scan_cancels_duplicate_cl_ord_id(tmp_path):
+    """startup_orphan_scan 独立于 open_trades:全 pair 扫,同 clOrdId 保留最早撤其余。"""
+    db, acc = _fresh(tmp_path)
+    okx = FakeOKX(pending=[
+        {"algoId": "A_LATE", "instId": "BTC-USDT-SWAP", "cTime": "3000",
+         "posSide": "long", "algoClOrdId": "hlBTC20260630l1"},
+        {"algoId": "A_EARLY", "instId": "BTC-USDT-SWAP", "cTime": "1000",
+         "posSide": "long", "algoClOrdId": "hlBTC20260630l1"},
+        {"algoId": "B_ONLY", "instId": "ETH-USDT-SWAP", "cTime": "2000",
+         "posSide": "short", "algoClOrdId": "hlETH20260630s1"},  # 不重复,不动
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    n = r.startup_orphan_scan()
+    assert n == 1
+    assert {c[0] for c in okx.cancelled} == {"A_LATE"}
+    assert {o["algoId"] for o in okx.pending} == {"A_EARLY", "B_ONLY"}
+
+
+def test_startup_orphan_scan_no_pending(tmp_path):
+    """无 pending → 0 cancels,不炸。"""
+    db, acc = _fresh(tmp_path)
+    okx = FakeOKX(pending=[])
+    r = Reconciler(okx, db, acc, CONFIG)
+    assert r.startup_orphan_scan() == 0
+
+
 def test_cleanup_cancels_duplicate_cl_ord_id(tmp_path):
     """OKX 幂等键异常:同 algoClOrdId 出现 2 张 pending → 保留 cTime 最早,撤其余。"""
     db, acc = _fresh(tmp_path)

@@ -834,3 +834,48 @@ class Reconciler:
         except Exception as e:
             if self.logger:
                 self.logger.error(f"[reconcile] cleanup cancel {aid} failed: {e}")
+
+    def startup_orphan_scan(self) -> int:
+        """启动时全 pair 扫一遍 pending,同 algoClOrdId 出现 >1 张就撤晚的。
+        专防挂单 timeout 期间 OKX 幂等键异常留下的历史重复单——不撤会一起触发,
+        造成同向持仓翻倍。返回撤单数量。
+        """
+        try:
+            all_pending = self.okx.list_pending_algos(ordType="trigger")
+        except Exception as e:
+            self._mark_if_net_error(e)
+            if self.logger:
+                self.logger.warning(f"[startup] orphan_scan list_pending_algos failed: {e}")
+            return 0
+
+        # 复用 _dedup 逻辑,但要按 pair 分组分别调用(cancel_fn 需要 pair 参数)
+        cancelled_before = self._cancel_count if hasattr(self, "_cancel_count") else 0
+        self._cancel_count = cancelled_before
+
+        by_pair: dict[str, list[dict]] = {}
+        for o in all_pending:
+            inst = o.get("instId")
+            if inst:
+                by_pair.setdefault(inst, []).append(o)
+
+        cancelled = 0
+        for pair, orders in by_pair.items():
+            def _cancel_and_count(p: str, ord_dict: dict) -> None:
+                nonlocal cancelled
+                aid = ord_dict.get("algoId")
+                if not aid:
+                    return
+                try:
+                    self.okx.cancel_algo_order(aid, p or pair)
+                    cancelled += 1
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(
+                            f"[startup] cancel duplicate {aid} failed: {e}"
+                        )
+            _dedup_orphans_by_cl_ord_id(orders, self.logger, _cancel_and_count)
+        if self.logger and cancelled:
+            self.logger.warning(
+                f"[startup] orphan_scan cancelled {cancelled} duplicate algo(s)"
+            )
+        return cancelled
