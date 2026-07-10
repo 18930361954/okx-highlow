@@ -231,24 +231,81 @@ def test_cleanup_keeps_db_known_algo_id(tmp_path):
     assert t["okx_order_id"] == "A1"
 
 
-def test_cleanup_orphan_rebinds_db(tmp_path):
-    """db 记录的 algoId 已不在 OKX（可能因外部撤单），同 pair 有其它 pending →
-    保留 cTime 最早的，并把 db 的 algoId 改绑到它。"""
+def test_cleanup_orphan_rebinds_only_when_direction_and_prefix_match(tmp_path):
+    """新版硬校验:orphan 必须同时满足 posSide 方向 + algoClOrdId 前缀含 signal_date 桶。
+    命中 → 改绑,同时把无归属 survivor 撤单。"""
     db, acc = _fresh(tmp_path)
-    _mk_open_trade(db, algo_id="GONE")  # OKX 上找不到
+    _mk_open_trade(db, algo_id="GONE", side="short")  # 已丢
     okx = FakeOKX(pending=[
-        {"algoId": "X_LATE", "instId": "BTC-USDT-SWAP", "cTime": "2000"},
-        {"algoId": "X_EARLY", "instId": "BTC-USDT-SWAP", "cTime": "1000"},
+        # 方向对 + clOrdId 前缀对(BTC + 2026-06-30 alnum → hlBTC20260630)
+        {"algoId": "OK_MATCH", "instId": "BTC-USDT-SWAP", "cTime": "1000",
+         "posSide": "short", "algoClOrdId": "hlBTC20260630s1"},
+        # 无归属 → 撤单
+        {"algoId": "X_LATE", "instId": "BTC-USDT-SWAP", "cTime": "2000",
+         "posSide": "short", "algoClOrdId": "hlBTC20260701s1"},
     ])
     r = Reconciler(okx, db, acc, CONFIG)
     r.run_once()
     cancelled_ids = {c[0] for c in okx.cancelled}
     assert cancelled_ids == {"X_LATE"}
-    assert [o["algoId"] for o in okx.pending] == ["X_EARLY"]
-
-    # db 改绑到 X_EARLY
+    assert [o["algoId"] for o in okx.pending] == ["OK_MATCH"]
     t = db.list_trades(limit=1)[0]
-    assert t["okx_order_id"] == "X_EARLY"
+    assert t["okx_order_id"] == "OK_MATCH"
+
+
+def test_cleanup_rejects_wrong_direction_rebind(tmp_path):
+    """事故复现:db trade 是 short,唯一 orphan 是 long → 拒绝改绑,orphan 撤,
+    db trade 若桶已过则标 ORPHAN 平。"""
+    db, acc = _fresh(tmp_path)
+    tid = _mk_open_trade(db, algo_id="GONE", side="short")
+    # 用一个远古 signal_date 保证 _is_past_bucket 为 True
+    with db._conn() as c:
+        c.execute("UPDATE trades SET signal_date='2020-01-01' WHERE id=?", (tid,))
+    okx = FakeOKX(pending=[
+        {"algoId": "WRONG_DIR", "instId": "BTC-USDT-SWAP", "cTime": "1000",
+         "posSide": "long", "algoClOrdId": "hlBTC20200101l1"},
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    # orphan 必须被撤(未被消化)
+    assert {c[0] for c in okx.cancelled} == {"WRONG_DIR"}
+    # db trade algoId 保持不变(未错绑),已过桶则被标 ORPHAN 平掉
+    t = db.list_trades(limit=1)[0]
+    assert t["okx_order_id"] == "GONE"  # 未被错误改绑
+    assert t["exit_reason"] == "ORPHAN"
+    assert t["exit_price"] == 0.0
+
+
+def test_cleanup_rejects_wrong_signal_bucket(tmp_path):
+    """方向对但 clOrdId 桶不对(跨天/跨桶) → 拒绝改绑。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="GONE", side="long")  # signal_date=2026-06-30
+    okx = FakeOKX(pending=[
+        # 方向对,但 clOrdId 前缀是别桶
+        {"algoId": "WRONG_BKT", "instId": "BTC-USDT-SWAP", "cTime": "1000",
+         "posSide": "long", "algoClOrdId": "hlBTC20260701l1"},
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert {c[0] for c in okx.cancelled} == {"WRONG_BKT"}
+    t = db.list_trades(limit=1)[0]
+    assert t["okx_order_id"] == "GONE"  # db 未变(桶未过,不标 ORPHAN)
+
+
+def test_cleanup_cancels_duplicate_cl_ord_id(tmp_path):
+    """OKX 幂等键异常:同 algoClOrdId 出现 2 张 pending → 保留 cTime 最早,撤其余。"""
+    db, acc = _fresh(tmp_path)
+    # db 里没相关 trade → 走 "db 无 trade" 分支
+    okx = FakeOKX(pending=[
+        {"algoId": "DUP_LATE", "instId": "BTC-USDT-SWAP", "cTime": "2000",
+         "posSide": "long", "algoClOrdId": "hlBTC20260630l1"},
+        {"algoId": "DUP_EARLY", "instId": "BTC-USDT-SWAP", "cTime": "1000",
+         "posSide": "long", "algoClOrdId": "hlBTC20260630l1"},
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert {c[0] for c in okx.cancelled} == {"DUP_LATE"}
+    assert [o["algoId"] for o in okx.pending] == ["DUP_EARLY"]
 
 
 def test_cleanup_ignores_other_pairs(tmp_path):

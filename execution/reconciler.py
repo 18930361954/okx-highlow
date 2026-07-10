@@ -37,6 +37,50 @@ def _parse_sig_id(sig_id: str) -> datetime | None:
         return None
 
 
+def _cl_ord_id_prefix(coin: str, sig_id: str) -> str:
+    """与 order_manager.py:138 的 clOrdId 生成保持一致(不含 dir+attempt 后缀)。
+    孤儿改绑的硬校验依据:orphan 的 algoClOrdId 必须以此前缀开头才认。"""
+    sd = "".join(ch for ch in sig_id if ch.isalnum())[:12]
+    return f"hl{coin}{sd}"
+
+
+def _dedup_orphans_by_cl_ord_id(orphans: list[dict], logger,
+                                 cancel_fn) -> list[dict]:
+    """相同 algoClOrdId 的孤儿只保留 cTime 最早的一张,其余立即撤单。
+    OKX 幂等键异常场景:同 clOrdId 本应只建 1 张,若出现多张就是真重复,必撤。
+    cancel_fn(pair, order_dict) 由调用方注入。返回 survivor 列表。"""
+    def _c(o: dict) -> int:
+        try:
+            return int(o.get("cTime") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    by_cl: dict[str, list[dict]] = {}
+    no_cl: list[dict] = []
+    for o in orphans:
+        cl = o.get("algoClOrdId") or ""
+        if cl:
+            by_cl.setdefault(cl, []).append(o)
+        else:
+            no_cl.append(o)
+
+    survivors: list[dict] = []
+    for cl, group in by_cl.items():
+        group.sort(key=_c)
+        if len(group) > 1 and logger:
+            for extra in group[1:]:
+                logger.error(
+                    f"[reconcile] DUPLICATE clOrdId={cl} on OKX "
+                    f"→ cancel extra algoId={extra.get('algoId')} "
+                    f"cTime={extra.get('cTime')}"
+                )
+        survivors.append(group[0])
+        for extra in group[1:]:
+            cancel_fn(extra.get("instId"), extra)
+    survivors.extend(no_cl)
+    return survivors
+
+
 def _ms_to_iso(ms: Any) -> str:
     try:
         ts = int(ms)
@@ -628,14 +672,49 @@ class Reconciler:
         if not algo_id and self.logger:
             self.logger.error(f"[catchup-exit] {pair} place_algo_orders 未拿到 algoId")
 
+    def _is_past_bucket(self, sig_id: str) -> bool:
+        """sig_id 对应桶的"挂单窗口"(sig_bucket + bucket_secs)已完全过完 → True。
+        用于孤儿改绑失败时判断是否要把 db trade 标 ORPHAN 平掉,防止脏数据长期挂着。"""
+        sig_dt = _parse_sig_id(sig_id)
+        if sig_dt is None:
+            return False
+        signal_bar = getattr(getattr(self, "strategy", None), "signal_bar", "1D")
+        bucket_secs = _BUCKET_SECS.get(signal_bar, 86400)
+        # 挂单窗口 = signal 桶后一桶结束时刻
+        window_end = sig_dt + timedelta(seconds=bucket_secs * 2)
+        return datetime.now(UTC) >= window_end
+
+    def _expire_as_orphan(self, db_t: dict) -> None:
+        """孤儿改绑失败且信号桶已过 → 把 db trade 标 exit_reason=ORPHAN 平掉。
+        pnl=0 fee=0 不影响余额/连亏统计,只是把 open 状态收干净。"""
+        try:
+            self.db.update_trade_exit(
+                trade_id=db_t["id"],
+                exit_price=0.0,
+                exit_reason="ORPHAN",
+                pnl=0.0,
+                exit_time=datetime.now(UTC).isoformat(),
+                fee=0.0,
+            )
+            if self.logger:
+                self.logger.error(
+                    f"[reconcile] trade#{db_t.get('id')} {db_t.get('pair')} "
+                    f"signal_date={db_t.get('signal_date')} algoId={db_t.get('okx_order_id')} "
+                    f"已过桶且 OKX 无安全匹配孤儿 → 标记 ORPHAN 平"
+                )
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"[reconcile] _expire_as_orphan trade#{db_t.get('id')} failed: {e}"
+                )
+
     def _cleanup_duplicate_pending(self, open_trades: list[dict]) -> None:
-        """扫每个策略 pair 的 pending algo，撤"重复"的。
-        判定"重复"时兼容日内重挂：db 里每条 open trade 对应一张合法 pending。
-        - 每张 pending 若能在 db 里匹配到 open trade（by algoId）→ 合法保留
-        - 剩余"孤儿" pending：
-            * 若 db 有 open trade 且 algoId 找不到 → 改绑 db 到 cTime 最早的孤儿；其它孤儿撤
-            * 若 db 无 open trade 且孤儿只 1 张 → 不动（reconciler 会走对账路径）
-            * 其它 → 撤除
+        """扫每个策略 pair 的 pending algo,撤"重复"/无归属的。
+        改绑硬校验:orphan 必须同时满足 posSide 方向 + algoClOrdId 前缀含
+        db_trade 的 signal_date 桶,才能"消化"该 db trade。宁可把 db trade
+        标 ORPHAN 收干净,也不做方向/桶错配的改绑(2026-07-09 ETH 事故根因:
+        short trade 被错绑到 long algo)。
+        另:同 algoClOrdId 出现 >1 张 pending → 保留 cTime 最早,其余立即撤(OKX 幂等键异常自愈)。
         """
         try:
             all_pending = self.okx.list_pending_algos(ordType="trigger")
@@ -661,6 +740,7 @@ class Reconciler:
                 open_algos_by_pair.setdefault(pair, {})[aid] = t
 
         for pair, orders in pending_by_pair.items():
+            coin = pair.split("-")[0]
             db_algo_map = open_algos_by_pair.get(pair, {})
             db_algo_ids = set(db_algo_map.keys())
 
@@ -669,52 +749,75 @@ class Reconciler:
             orphans = [o for o in orders if o.get("algoId") not in db_algo_ids]
 
             if not orphans:
-                continue  # 全部合法（或没 pending）
+                continue
 
-            # 有孤儿。分两种情况：
-            if db_algo_map and orphans:
-                # db 里有记录但对不上：改绑 db 里"algoId 不在 pending"的 trade 到 cTime 最早的孤儿
-                missing_db = [t for aid, t in db_algo_map.items()
-                              if aid not in {o.get("algoId") for o in legit}]
-                def _c(o: dict) -> int:
-                    try:
-                        return int(o.get("cTime") or 0)
-                    except (TypeError, ValueError):
-                        return 0
-                orphans_sorted = sorted(orphans, key=_c)
-                # 每个"缺失"的 db trade 消化一个孤儿
-                keep_orphans_ids: set[str] = set()
-                for db_t, orphan in zip(missing_db, orphans_sorted):
-                    try:
-                        self.db.update_trade_algo_id(db_t["id"], orphan["algoId"])
-                        keep_orphans_ids.add(orphan["algoId"])
-                        if self.logger:
-                            self.logger.warning(
-                                f"[reconcile] cleanup {pair}: db trade#{db_t['id']} "
-                                f"algoId {db_t.get('okx_order_id')} → {orphan['algoId']}（原 algoId 已不在 OKX pending）"
-                            )
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.error(f"[reconcile] cleanup update algoId failed: {e}")
-                # 剩余孤儿撤
-                for o in orphans:
-                    if o.get("algoId") in keep_orphans_ids:
-                        continue
-                    self._cancel_pending(pair, o)
-            else:
-                # db 里啥都没：只 1 张孤儿 → 不动（可能是外部/历史遗留）；多张 → 保留最早、撤其余
-                if len(orphans) <= 1:
+            # 步骤 1: 同 algoClOrdId 去重(OKX 幂等键异常自愈)
+            survivors = _dedup_orphans_by_cl_ord_id(
+                orphans, self.logger, self._cancel_pending
+            )
+
+            if not db_algo_map:
+                # db 里啥都没:1 张 survivor → 保留观察;多张(clOrdId 各异) → 保留 cTime 最早、撤其余
+                if len(survivors) <= 1:
                     continue
                 def _c(o: dict) -> int:
                     try:
                         return int(o.get("cTime") or 0)
                     except (TypeError, ValueError):
                         return 0
-                orphans_sorted = sorted(orphans, key=_c)
-                keep = orphans_sorted[0]
-                for o in orphans_sorted[1:]:
-                    if o.get("algoId") == keep.get("algoId"):
+                survivors_sorted = sorted(survivors, key=_c)
+                for o in survivors_sorted[1:]:
+                    self._cancel_pending(pair, o)
+                continue
+
+            # 步骤 2: db 有缺失 trade → 用 survivors 硬校验后改绑
+            missing_db = [t for aid, t in db_algo_map.items()
+                          if aid not in {o.get("algoId") for o in legit}]
+            used_orphan_ids: set[str] = set()
+            for db_t in missing_db:
+                expected_dir = str(db_t.get("side") or "").lower()  # long/short
+                expected_sig = db_t.get("signal_date") or ""
+                expected_prefix = _cl_ord_id_prefix(coin, expected_sig)
+                match = None
+                for o in survivors:
+                    if o.get("algoId") in used_orphan_ids:
                         continue
+                    if str(o.get("posSide") or "").lower() != expected_dir:
+                        continue
+                    if not str(o.get("algoClOrdId") or "").startswith(expected_prefix):
+                        continue
+                    match = o
+                    break
+                if match:
+                    try:
+                        self.db.update_trade_algo_id(db_t["id"], match["algoId"])
+                        used_orphan_ids.add(match["algoId"])
+                        if self.logger:
+                            self.logger.warning(
+                                f"[reconcile] cleanup {pair}: SAFE rebind db trade#{db_t['id']} "
+                                f"({expected_dir}, sig={expected_sig}) "
+                                f"algoId {db_t.get('okx_order_id')} → {match['algoId']} "
+                                f"(clOrdId={match.get('algoClOrdId')})"
+                            )
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(
+                                f"[reconcile] cleanup update algoId failed: {e}"
+                            )
+                else:
+                    if self.logger:
+                        self.logger.error(
+                            f"[reconcile] cleanup {pair}: trade#{db_t['id']} "
+                            f"algoId {db_t.get('okx_order_id')} 已不在 OKX pending, "
+                            f"且无匹配孤儿(需 posSide={expected_dir}, clOrdId 前缀 "
+                            f"{expected_prefix}) → 不改绑"
+                        )
+                    if self._is_past_bucket(expected_sig):
+                        self._expire_as_orphan(db_t)
+
+            # 步骤 3: 剩余未被消化的 survivor 全撤(真正的重复/外部单)
+            for o in survivors:
+                if o.get("algoId") not in used_orphan_ids:
                     self._cancel_pending(pair, o)
 
     def _cancel_pending(self, pair: str, o: dict) -> None:
