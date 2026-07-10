@@ -117,10 +117,12 @@ def add_account_jobs(
     hours = signal_hours_for(signal_bar)
 
     # signal: 每个 hour 挂一个;job id 带 hour 区分。加秒偏移防多账户并发
+    # minute=2:整点触发时 OKX 侧新桶可能还没落盘,顺延 2 分钟等上一桶完全收盘,
+    # 与后面按 ts 精挑 K 线双重保险,防挂单价错配到上上一桶(曾致 4H BTC 空单挂错 8h 前的高点)
     for h in hours:
         sched.add_job(
             daily_signal_fn,
-            trigger=CronTrigger(hour=h, minute=0, second=signal_second_offset, timezone=UTC),
+            trigger=CronTrigger(hour=h, minute=2, second=signal_second_offset, timezone=UTC),
             id=f"{prefix}.signal_{h:02d}",
             misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
         )

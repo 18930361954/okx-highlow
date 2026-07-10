@@ -20,7 +20,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from data.db import DB
 from execution.position_monitor import PositionMonitor
 from utils.logger import get_logger
-from utils.time_helper import utc_now, yesterday_utc_date
+from utils.time_helper import (
+    fetch_prev_bucket_candles,
+    to_ms,
+    utc_now,
+    yesterday_utc_date,
+)
 
 
 UTC = timezone.utc
@@ -108,21 +113,26 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
             logger.info(f"[skip] {pair}: 当前有持仓,暂不挂单(平仓后由对账器补挂)")
             continue
 
-        # 1D 用 24 根 1H 聚合(与旧行为一致);其它周期直接拉 bar=signal_bar limit=2 取上一桶
+        # 按 prev_bkt ts 精挑上一桶 K 线,防 OKX 桶延迟返回错位到上上一桶
         try:
-            if signal_bar == "1D":
-                raw = rt.okx.get_candles(pair, bar="1H", limit=24)
-            else:
-                raw = rt.okx.get_candles(pair, bar=signal_bar, limit=2)
-                if raw and len(raw) >= 2:
-                    # OKX 按时间倒序:[最新, 次新]。次新才是上一桶
-                    raw = [raw[1]]
+            raw = fetch_prev_bucket_candles(rt.okx, pair, signal_bar, prev_bkt, logger)
         except Exception as e:
             logger.error(f"get_candles({pair}) failed: {e}")
             continue
 
         if not raw:
-            logger.warning(f"{pair}: no candles returned")
+            logger.warning(f"{pair}: prev-bucket K 线未获取到,跳过下单")
+            continue
+
+        # sanity check:确保挑到的 K 线 ts 跟 scheduler 算出的 prev_bkt 一致
+        expected_ms = to_ms(prev_bkt)
+        if signal_bar == "1D":
+            actual_ms = min(int(k[0]) for k in raw)
+        else:
+            actual_ms = int(raw[0][0])
+        if actual_ms != expected_ms:
+            logger.error(f"{pair}: K 线 ts 不匹配 expected={expected_ms}({sig_id}) "
+                          f"actual={actual_ms} —— 不下单")
             continue
 
         signal_dict = rt.strategy.compute_signal(pair, raw, signal_date=sig_id)

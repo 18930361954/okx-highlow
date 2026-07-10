@@ -634,19 +634,28 @@ class Reconciler:
                 self.logger.warning(f"[catchup-exit] {pair} get_positions 失败: {e}")
             return
 
-        # 拉上一桶 K → compute_signal
+        # 按 prev_bkt ts 精挑上一桶 K,防 OKX 桶延迟返回错位到上上一桶
+        from utils.time_helper import fetch_prev_bucket_candles, to_ms
         try:
-            if signal_bar == "1D":
-                raw = self.okx.get_candles(pair, bar="1H", limit=24)
-            else:
-                raw = self.okx.get_candles(pair, bar=signal_bar, limit=2)
-                if raw and len(raw) >= 2:
-                    raw = [raw[1]]
+            raw = fetch_prev_bucket_candles(self.okx, pair, signal_bar, prev, self.logger)
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"[catchup-exit] {pair} get_candles 失败: {e}")
             return
         if not raw:
+            if self.logger:
+                self.logger.warning(f"[catchup-exit] {pair} 未拿到 prev-bucket K,不补挂")
+            return
+
+        # sanity check:确保挑到的 K 线 ts 与算出的 prev 一致
+        expected_ms = to_ms(prev)
+        actual_ms = min(int(k[0]) for k in raw) if signal_bar == "1D" else int(raw[0][0])
+        if actual_ms != expected_ms:
+            if self.logger:
+                self.logger.error(
+                    f"[catchup-exit] {pair} K 线 ts 不匹配 expected={expected_ms}({sig_id}) "
+                    f"actual={actual_ms},不补挂"
+                )
             return
 
         signal = self.strategy.compute_signal(pair, raw, signal_date=sig_id)
