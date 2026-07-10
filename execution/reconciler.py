@@ -410,29 +410,34 @@ class Reconciler:
                         pnl_net = _num(pos_row, "realizedPnl")
                         fee_raw = _num(pos_row, "fee")           # 负值
                         funding_raw = _num(pos_row, "fundingFee")  # 负值
-                        fee_total = abs(fee_raw) + abs(funding_raw)
-                        pnl_gross = pnl_net + abs(fee_raw) + abs(funding_raw)
+                        fee_abs = abs(fee_raw)
+                        funding_abs = abs(funding_raw)
+                        pnl_gross = pnl_net + fee_abs + funding_abs
                         src = "positions-history"
                     else:
+                        # orders fallback 拿不到 fundingFee(OKX orders 接口不返),置 0
                         pnl_gross = sum(_num(o, "pnl") for o in related)
                         fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
-                        fee_total = abs(fee_raw_sum)
+                        fee_abs = abs(fee_raw_sum)
+                        funding_abs = 0.0
                         pnl_net = pnl_gross + fee_raw_sum
-                        src = f"orders×{len(related)}(fallback)"
+                        src = f"orders×{len(related)}(fallback,funding=0)"
 
-                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee 仅供展示
+                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee/funding 仅供展示
                     self.db.update_trade_exit(
                         trade_id=t["id"],
                         exit_price=fill_px,
                         exit_reason=reason,
                         pnl=pnl_net,
                         exit_time=fill_time,
-                        fee=fee_total,
+                        fee=fee_abs,
+                        funding=funding_abs,
                     )
                     if self.logger:
                         self.logger.info(
                             f"[reconcile] exit filled: trade#{t['id']} {t['pair']} "
-                            f"{reason} @ {fill_px} 名义={pnl_gross:+.4f} 手续费={fee_total:.4f} "
+                            f"{reason} @ {fill_px} 名义={pnl_gross:+.4f} "
+                            f"手续费={fee_abs:.4f} 资金费={funding_abs:.4f} "
                             f"净={pnl_net:+.4f} src={src}"
                         )
 

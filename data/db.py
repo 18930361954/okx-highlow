@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS trades (
     margin REAL,
     mode TEXT,
     pnl REAL,                    -- OKX 净盈亏(realizedPnl,已扣手续费+资金费,与 UI 一致)
-    fee REAL DEFAULT 0.0,        -- 该笔累计手续费+资金费(绝对值,仅供展示)
+    fee REAL DEFAULT 0.0,        -- 该笔手续费(绝对值,来源 OKX positions-history.fee,仅供展示)
+    funding REAL DEFAULT 0.0,    -- 该笔资金费(绝对值,来源 OKX positions-history.fundingFee,仅供展示)
     entry_time TEXT,
     exit_time TEXT,
     okx_order_id TEXT,
@@ -71,6 +72,10 @@ class DB:
                 c.execute("ALTER TABLE trades ADD COLUMN account TEXT NOT NULL DEFAULT 'default'")
             if "fee" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0.0")
+            # funding 列(资金费):新拆出的字段。老数据的 fee 里可能混着 funding,
+            # 已发生的历史数据不回补 —— funding 列填 0,fee 保持原值(视为"含 funding 的老 fee")。
+            if "funding" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN funding REAL DEFAULT 0.0")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -126,20 +131,18 @@ class DB:
         pnl: float,
         exit_time: str,
         fee: float | None = None,
+        funding: float | None = None,
     ) -> None:
+        """fee / funding 均为绝对值(展示口径),来源 OKX positions-history。"""
         with self._conn() as c:
+            sets = ["exit_price=?", "exit_reason=?", "pnl=?", "exit_time=?"]
+            vals: list[Any] = [exit_price, exit_reason, pnl, exit_time]
             if fee is not None:
-                c.execute(
-                    """UPDATE trades SET exit_price=?, exit_reason=?, pnl=?, fee=?, exit_time=?
-                       WHERE id=?""",
-                    (exit_price, exit_reason, pnl, fee, exit_time, trade_id),
-                )
-            else:
-                c.execute(
-                    """UPDATE trades SET exit_price=?, exit_reason=?, pnl=?, exit_time=?
-                       WHERE id=?""",
-                    (exit_price, exit_reason, pnl, exit_time, trade_id),
-                )
+                sets.append("fee=?"); vals.append(fee)
+            if funding is not None:
+                sets.append("funding=?"); vals.append(funding)
+            vals.append(trade_id)
+            c.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", vals)
 
     def update_trade_entry(self, trade_id: int, entry_time: str,
                            entry_price: float | None = None) -> None:
