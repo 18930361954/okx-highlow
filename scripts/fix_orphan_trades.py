@@ -71,6 +71,10 @@ def verify_and_orphan(db: DB, okx: OKXClient, account: str, trade_id: int,
     if r.get("exit_price") is not None:
         print(f"  #{trade_id}: 已闭合 (exit_price={r['exit_price']}),跳过")
         return False
+    if r.get("entry_time"):
+        print(f"  #{trade_id}: entry_time={r['entry_time']} 已入场,是活持仓,"
+              f"拒绝标 ORPHAN")
+        return False
 
     pair = r["pair"]
     side = r["side"]
