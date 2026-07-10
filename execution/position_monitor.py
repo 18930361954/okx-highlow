@@ -121,10 +121,11 @@ class PositionMonitor:
             except Exception:
                 positions = []
             # 今日成交(按 exit_time 落在今天 UTC)
+            # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
             try:
                 all_rows = rt.db.list_trades(limit=500, account=rt.name)
                 today_filled = [r for r in all_rows
-                                if r.get("exit_price") is not None
+                                if (r.get("exit_price") or 0) > 0
                                 and (r.get("exit_time") or "")[:10] == today_iso]
                 # db.pnl 已是净口径; 名义 = 净 + 手续费(反推展示)
                 today_net = sum((r.get("pnl") or 0) for r in today_filled)

@@ -92,8 +92,9 @@ def generate_report(db, account, config, target_date: str | None = None,
     # 「当日成交」按 exit_time 落在 today 聚合：一笔前几天挂的单可能今天才平仓，
     # 之前按 signal_date 分组会漏掉这类跨日成交（例如 07-05 signal 的 SOL 07-07 才平仓）。
     all_trades = db.list_trades(limit=10000, account=account_name)
+    # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
     filled = [t for t in all_trades
-              if t.get("exit_price") is not None
+              if (t.get("exit_price") or 0) > 0
               and (t.get("exit_time") or "")[:10] == today]
 
     start_balance_str = db.get_state(f"balance_start_{today}", account=account_name)
@@ -276,8 +277,9 @@ def _summarize_account(db, rt_like, today: str) -> dict:
     sig_date = (datetime.fromisoformat(today).date() - timedelta(days=1)).isoformat()
 
     all_trades = db.list_trades(limit=10000, account=name)
+    # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
     today_filled = [t for t in all_trades
-                    if t.get("exit_price") is not None
+                    if (t.get("exit_price") or 0) > 0
                     and (t.get("exit_time") or "")[:10] == today]
     # db.pnl 已是净口径; 名义 = 净 + 手续费
     total_net = sum((t.get("pnl") or 0) for t in today_filled)
