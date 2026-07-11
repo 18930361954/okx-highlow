@@ -24,6 +24,21 @@ def _fmt2(x: float, sign: bool = True) -> str:
     return f"{v:+,.2f}" if sign else f"{v:,.2f}"
 
 
+def _fmt_uptime(seconds: float) -> str:
+    """把秒数格式化成 Xd Yh Zm Ws 的紧凑字符串, 只显示最高的 2-3 段。"""
+    s = int(max(0, seconds))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def _dir_zh(raw: str) -> str:
     """方向字段中文化。兼容 db.side/OKX posSide('long'/'short') 和 OKX side('buy'/'sell')。"""
     v = str(raw or "").lower()
@@ -73,6 +88,7 @@ class PositionMonitor:
         self.console = Console()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._started_at = datetime.now(UTC)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -171,6 +187,8 @@ class PositionMonitor:
         header = Table.grid(expand=True)
         header.add_column(justify="left")
         header.add_column(justify="right")
+        now = datetime.now(UTC)
+        uptime = _fmt_uptime((now - self._started_at).total_seconds())
         header.add_row(
             f"[bold]账户[/bold] {len(snap)}   "
             f"[bold]总余额[/bold] {total_bal:,.2f}   "
@@ -180,7 +198,8 @@ class PositionMonitor:
             f"[bold]手续费[/bold] {total_today_fee:.4f}   "
             f"[bold]资金费[/bold] {total_today_funding:.4f}   "
             f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}",
-            f"[bold]now[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            f"[bold]运行[/bold] {uptime}   "
+            f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
 
         # === 账户一览 ===
