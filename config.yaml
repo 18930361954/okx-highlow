@@ -61,8 +61,8 @@ accounts:
   # 「4H 三币组合」— 每天 6 次挂单
   - account_name: 初级炼气士-实盘
     enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
-    api_key: 4a5db4d2-3b73-4a39-b824-5209fa76bfae
-    secret_key: 456CC065FB5C3CF833E89AA18A668031
+    api_key: abf7c8b5-a75d-4470-866f-52b53bb14a86
+    secret_key: 0B7B65EF1A008BDD965F2C85DDA652B0
     passphrase: Zdx19971226@@
     env_adapt: real
     strategy:
@@ -75,8 +75,8 @@ accounts:
   # 「6H 三币组合」— 每天 4 次挂单
   - account_name: 初级炼气士2-实盘
     enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
-    api_key: b373cac5-3f42-46a3-9741-6b26a440e781
-    secret_key: 8879F75B9A45944DEFC7F442D2D256EA
+    api_key: 7ff7534b-0975-43e7-88d1-13642a3c8391
+    secret_key: ADAFDBEDAA3F4AEFDBAEFB965B75E215
     passphrase: Zdx19971226@@
     env_adapt: real
     strategy:
@@ -89,8 +89,8 @@ accounts:
   # 「12H 三币组合」— 每天 2 次挂单
   - account_name: 初级炼气士3-实盘
     enabled: false                    # ← 先跑模拟盘,验证 3-5 天后再改 true
-    api_key: e27a1897-27ef-495a-81bc-0b014e02219a
-    secret_key: 049CA31D8CE0B652676FFA9EA045C970
+    api_key: 8725f04a-af67-4fb8-aad2-ae62e8cf8ce7
+    secret_key: 044B421FB88EBC5DDBFE291A3F6BACC9
     passphrase: Zdx19971226@@
     env_adapt: real
     strategy:
