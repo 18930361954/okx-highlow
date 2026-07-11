@@ -1,5 +1,6 @@
 import math
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
 from core.okx_client import OKXError
@@ -318,13 +319,19 @@ class OrderManager:
         return algo_id
 
     def cancel_all_pending(self, pair: str | None = None) -> int:
-        """撤当前所有未触发 algo 单。返回撤掉的数量。"""
+        """撤当前所有未触发 algo 单, 并同步标记 db 里对应的 open trade。返回撤掉的数量。
+
+        db 同步:撤单成功的 algoId 对应的 open trade (未 entry_time, 即未成交入场)
+        标 exit_reason='CANCELLED' 收干净, 防止 daily_cancel 后 db 里堆积僵尸 open 记录。
+        已入场的持仓 (entry_time 有值) 不动 —— 那是活仓, 由 reconciler 走 TP/SL 平仓流程。
+        """
         try:
             pending = self.okx.list_pending_algos(instId=pair, ordType="trigger")
         except Exception as e:
             if self.logger:
                 self.logger.error(f"list_pending_algos failed: {e}")
             return 0
+        cancelled_algo_ids: set[str] = set()
         cnt = 0
         for o in pending:
             algo_id = o.get("algoId")
@@ -333,10 +340,42 @@ class OrderManager:
                 continue
             try:
                 self.okx.cancel_algo_order(algo_id, inst)
+                cancelled_algo_ids.add(str(algo_id))
                 cnt += 1
             except Exception as e:
                 if self.logger:
                     self.logger.warning(f"cancel {algo_id} failed: {e}")
+
+        # 同步 db:标记对应的未入场 open trade 为 CANCELLED
+        if cancelled_algo_ids:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            synced = 0
+            try:
+                open_trades = self.db.list_open_trades(account=self.account)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"[cancel] list_open_trades failed for db sync: {e}")
+                open_trades = []
+            for t in open_trades:
+                aid = str(t.get("okx_order_id") or "")
+                if aid not in cancelled_algo_ids:
+                    continue
+                if t.get("entry_time"):
+                    continue  # 已入场是活持仓, 撤 trigger 不影响仓位
+                try:
+                    self.db.update_trade_exit(
+                        trade_id=t["id"], exit_price=0.0, exit_reason="CANCELLED",
+                        pnl=0.0, exit_time=now_iso, fee=0.0,
+                    )
+                    synced += 1
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(
+                            f"[cancel] mark db trade#{t['id']} CANCELLED failed: {e}"
+                        )
+            if synced and self.logger:
+                self.logger.info(f"[cancel] db 同步 {synced} 条 open trade → CANCELLED")
+
         if self.logger:
             self.logger.info(f"[cancel] cancelled {cnt} pending algos (pair={pair or 'ALL'})")
         return cnt

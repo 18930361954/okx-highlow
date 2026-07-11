@@ -22,6 +22,18 @@ _BUCKET_SECS = {
     "2H": 7200, "1H": 3600,
 }
 
+# 新挂 pending 的宽限窗口 (毫秒)。cTime > now - 此值 → 不判"孤儿"。
+# 场景:order_manager.place_algo_order 返回 algoId 后, insert_trade 完成前有 ~100ms 窗口,
+# reconciler 20s 一轮撞上就会把新单当孤儿撤 (2026-07-12 事故根因)。
+_FRESH_PENDING_GRACE_MS = 30_000
+
+
+def _c_time_ms(o: dict) -> int:
+    try:
+        return int(o.get("cTime") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 
 def _parse_sig_id(sig_id: str) -> datetime | None:
     """把 db.signal_date(可能是 '2026-07-08' 或 '2026-07-08T04:00Z')解析成桶起始 UTC。"""
@@ -228,6 +240,7 @@ class Reconciler:
     def run_once(self) -> int:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
         self.last_run_had_net_error = False
+        self._last_pending_algo_ids = None  # 每轮清空,避免 cleanup 异常时用到旧值
         try:
             open_trades = self.db.list_open_trades(account=self.account_name)
         except Exception as e:
@@ -240,6 +253,7 @@ class Reconciler:
         self._cleanup_duplicate_pending(open_trades)
 
         if not open_trades:
+            self._sweep_zombie_open()
             return 0
 
         # 按 pair 分组拉 orders-history。同时构建两份索引：
@@ -474,6 +488,8 @@ class Reconciler:
                     if self.logger:
                         self.logger.error(f"[reconcile] settle trade#{t.get('id')} failed: {e}")
 
+        # 尾部僵尸兜底: 主匹配跑完后,algoId 仍死、bucket 已过、未 entry filled 的 → ORPHAN
+        self._sweep_zombie_open()
         return processed
 
     def _try_reentry(self, sl_trade: dict, sl_time: datetime | None) -> None:
@@ -738,6 +754,11 @@ class Reconciler:
                 self.logger.warning(f"[reconcile] cleanup: list_pending_algos failed: {e}")
             return
 
+        # 全局 pending algoId 集合 (供末尾"僵尸 open"兜底扫描用)
+        all_pending_algo_ids = {o.get("algoId") for o in all_pending if o.get("algoId")}
+        # 新挂宽限阈值:cTime 早于此值才被当"过期孤儿"处理
+        fresh_threshold_ms = int(datetime.now(UTC).timestamp() * 1000) - _FRESH_PENDING_GRACE_MS
+
         # 按 pair 分组
         pending_by_pair: dict[str, list[dict]] = {}
         for o in all_pending:
@@ -761,6 +782,11 @@ class Reconciler:
             # 分类：合法（在 db）/ 孤儿（不在 db）
             legit = [o for o in orders if o.get("algoId") in db_algo_ids]
             orphans = [o for o in orders if o.get("algoId") not in db_algo_ids]
+
+            # 排除刚挂 <30s 的 pending:order_manager place → insert_trade 有 ~100ms 窗口,
+            # 期间 reconciler 会把新单当孤儿撤 (2026-07-12 事故根因)。
+            if orphans:
+                orphans = [o for o in orphans if _c_time_ms(o) < fresh_threshold_ms]
 
             if not orphans:
                 continue
@@ -833,6 +859,37 @@ class Reconciler:
             for o in survivors:
                 if o.get("algoId") not in used_orphan_ids:
                     self._cancel_pending(pair, o)
+
+        # 记录本轮 pending algoId 集合供 run_once 尾部 _sweep_zombie_open 使用
+        self._last_pending_algo_ids = all_pending_algo_ids
+
+    def _sweep_zombie_open(self) -> None:
+        """兜底扫 db.open trade: algoId 不在 OKX pending 且信号桶已过 → 标 ORPHAN。
+
+        覆盖场景:
+          - daily_cancel 撤了 OKX 单但 db 未同步 (老代码路径遗留)
+          - 同 pair 后续无新 pending → _cleanup_duplicate_pending 的 pair-loop 无法触发兜底
+
+        必须在 run_once 主 entry/exit 匹配之后才能跑,否则会误伤刚 entry filled 但 db
+        还没回填 entry_time 的 open trade。
+        """
+        pending_ids = getattr(self, "_last_pending_algo_ids", None)
+        if pending_ids is None:
+            return  # cleanup 因异常提前 return 了, 本轮跳过
+        try:
+            current_open = self.db.list_open_trades(account=self.account_name)
+        except Exception:
+            return
+        for t in current_open:
+            aid = t.get("okx_order_id")
+            if not aid or aid in pending_ids:
+                continue
+            if t.get("entry_time"):
+                continue  # 已入场是活持仓, 由 exit 匹配流程处理
+            sig = t.get("signal_date") or ""
+            if not self._is_past_bucket(sig):
+                continue
+            self._expire_as_orphan(t)
 
     def _cancel_pending(self, pair: str, o: dict) -> None:
         aid = o.get("algoId")

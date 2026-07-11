@@ -131,6 +131,50 @@ def test_cancel_all_pending(tmp_path):
     assert okx.cancel_algo_order.call_count == 2
 
 
+def test_cancel_all_pending_syncs_db(tmp_path):
+    """2026-07-12 daily_cancel 撤 OKX 后 db 未同步 → 僵尸堆积事故防回归。
+    撤单成功后, db 里对应 open trade (无 entry_time) 应被标 CANCELLED。"""
+    db = DB(tmp_path / "t.db")
+    # 一条待撤的 open trade (未 entry filled)
+    tid = db.insert_trade(
+        signal_date="2026-06-30", pair="BTC-USDT-SWAP", side="short",
+        entry_price=60000.0, margin=100.0, mode="PCT",
+        okx_order_id="A1", entry_time=None,
+    )
+    okx = MagicMock()
+    okx.list_pending_algos.return_value = [
+        {"algoId": "A1", "instId": "BTC-USDT-SWAP"},
+    ]
+    om = OrderManager(okx, db)
+    n = om.cancel_all_pending()
+    assert n == 1
+    # db 已同步
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "CANCELLED"
+    assert t["exit_price"] == 0.0
+    assert t["pnl"] == 0.0
+
+
+def test_cancel_all_pending_skips_filled_position(tmp_path):
+    """已 entry filled 的持仓不该被 cancel_all_pending 误标 CANCELLED
+    (即使碰巧 pending 列表里有其 algoId,由 OKX 返回)。"""
+    db = DB(tmp_path / "t.db")
+    tid = db.insert_trade(
+        signal_date="2026-06-30", pair="BTC-USDT-SWAP", side="short",
+        entry_price=60000.0, margin=100.0, mode="PCT",
+        okx_order_id="A_LIVE", entry_time="2026-06-30T12:00:00+00:00",
+    )
+    okx = MagicMock()
+    okx.list_pending_algos.return_value = [
+        {"algoId": "A_LIVE", "instId": "BTC-USDT-SWAP"},
+    ]
+    om = OrderManager(okx, db)
+    om.cancel_all_pending()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] is None  # 活持仓, 不动
+    assert t["entry_time"]
+
+
 def test_place_algo_handles_failure(tmp_path, monkeypatch):
     """挂单本身抛出且回查也 miss → 返回 None,且不写 db(避免脏数据)。"""
     import execution.order_manager as _om

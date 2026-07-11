@@ -370,6 +370,85 @@ def test_cleanup_keeps_two_legit_reentry_pendings(tmp_path):
     assert okx.cancelled == []
 
 
+def test_cleanup_ignores_fresh_orphan(tmp_path):
+    """2026-07-12 race 事故防回归:cTime < 30s 的孤儿不当"过期孤儿"处理,防止
+    order_manager.place_algo_order → insert_trade 之间的窗口被 reconciler 撞上。"""
+    db, acc = _fresh(tmp_path)
+    # db 里没相关 trade,pending 是"刚挂 3s"的新孤儿
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    okx = FakeOKX(pending=[
+        {"algoId": "FRESH", "instId": "BTC-USDT-SWAP", "cTime": str(now_ms - 3000),
+         "posSide": "long", "algoClOrdId": "hlBTC20260712l1"},
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert okx.cancelled == []  # 不撤,给 insert_trade 缓冲窗口
+    assert [o["algoId"] for o in okx.pending] == ["FRESH"]
+
+
+def test_cleanup_still_cancels_stale_orphan(tmp_path):
+    """cTime > 30s 的孤儿依然按原逻辑撤(保持既有行为)。
+    构造:db 有一条 GONE 的 short trade, OKX pending 是老的孤儿且 clOrdId 前缀不匹配 → step 3 撤。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="GONE", side="short")  # signal_date=2026-06-30 (past)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    okx = FakeOKX(pending=[
+        # 60s 前挂, clOrdId 前缀 hlBTC20260712 与 db 的 20260630 不匹配 → 改绑失败 → step 3 撤
+        {"algoId": "STALE", "instId": "BTC-USDT-SWAP", "cTime": str(now_ms - 60_000),
+         "posSide": "short", "algoClOrdId": "hlBTC20260712s1"},
+    ])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert {c[0] for c in okx.cancelled} == {"STALE"}
+
+
+def test_sweep_zombie_open_past_bucket(tmp_path):
+    """db.open 但 algoId 不在 OKX pending 且信号桶已过 → 标 ORPHAN(僵尸兜底)。
+    2026-07-12 daily_cancel 撤 OKX 后不同步 db 的僵尸堆积事故防回归。"""
+    db, acc = _fresh(tmp_path)
+    tid = _mk_open_trade(db, algo_id="DEAD")  # signal_date=2026-06-30, 早过
+    okx = FakeOKX(pending=[])  # OKX 上啥都没
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "ORPHAN"
+    assert t["exit_price"] == 0.0
+
+
+def test_sweep_zombie_open_current_bucket_skips(tmp_path):
+    """当前桶(未过窗口)不应被 sweep 误伤。"""
+    db, acc = _fresh(tmp_path)
+    # 用今天的 signal_date, _is_past_bucket 判 False
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    db.insert_trade(
+        signal_date=today, pair="BTC-USDT-SWAP", side="short",
+        entry_price=60000.0, margin=100.0, mode="PCT",
+        okx_order_id="LIVE_TODAY", entry_time=None,
+    )
+    okx = FakeOKX(pending=[])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] is None  # 依然 open
+    assert t["exit_price"] is None
+
+
+def test_sweep_zombie_open_entry_filled_skips(tmp_path):
+    """已 entry_time (活持仓) 不该被 sweep 误伤 (test_entry_only_backfills_entry_time 场景)。"""
+    db, acc = _fresh(tmp_path)
+    tid = _mk_open_trade(db, algo_id="FILLED_ALGO")
+    # 手动设 entry_time (模拟已入场)
+    with db._conn() as c:
+        c.execute("UPDATE trades SET entry_time=? WHERE id=?",
+                  ("2026-06-30T12:00:00+00:00", tid))
+    okx = FakeOKX(pending=[])  # 已 triggered, 不在 pending
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] is None  # 持仓, 由 exit 匹配处理, 不该 ORPHAN
+    assert t["entry_time"]
+
+
 # ---------- 日内重挂 ----------
 
 class FakeStrategyReentry:
