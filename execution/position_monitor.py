@@ -65,6 +65,26 @@ def _exit_reason_zh(raw: str) -> str:
     return _EXIT_REASON_ZH.get(str(raw).upper(), str(raw))
 
 
+def _pending_tp_sl(o: dict) -> tuple[str, str]:
+    """从 OKX pending algo dict 中抽 TP / SL 触发价。
+
+    trigger 单的 TP/SL 挂在 attachAlgoOrds[0] 里, 顶层 tpTriggerPx/slTriggerPx 是空串
+    (order_manager 用 attachAlgoOrds 挂载, 顶层字段在 trigger 单上会被 OKX 静默丢弃)。
+    这里优先读 attachAlgoOrds[0], 兜底再看顶层, 空串返回 '-'。
+    """
+    tp = sl = ""
+    attach = o.get("attachAlgoOrds") or []
+    if attach and isinstance(attach, list):
+        first = attach[0] if isinstance(attach[0], dict) else {}
+        tp = str(first.get("tpTriggerPx") or "")
+        sl = str(first.get("slTriggerPx") or "")
+    if not tp:
+        tp = str(o.get("tpTriggerPx") or "")
+    if not sl:
+        sl = str(o.get("slTriggerPx") or "")
+    return (tp or "-", sl or "-")
+
+
 class PositionMonitor:
     """终端面板 — 多账户版。5 秒刷新。
 
@@ -263,10 +283,11 @@ class PositionMonitor:
         for a in snap:
             for o in a["pendings"]:
                 any_p = True
+                tp, sl = _pending_tp_sl(o)
                 pending_tbl.add_row(
                     a["name"], str(o.get("instId", "")), _dir_zh(o.get("side", "")),
-                    str(o.get("triggerPx", "")), str(o.get("tpTriggerPx", "")),
-                    str(o.get("slTriggerPx", "")), str(o.get("algoId", ""))[:18],
+                    str(o.get("triggerPx", "")), tp, sl,
+                    str(o.get("algoId", ""))[:18],
                 )
         if not any_p:
             pending_tbl.add_row("(无)", "", "", "", "", "", "")
