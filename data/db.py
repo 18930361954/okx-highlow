@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS trades (
     mode TEXT,
     pnl REAL,                    -- OKX 净盈亏(realizedPnl,已扣手续费+资金费,与 UI 一致)
     fee REAL DEFAULT 0.0,        -- 该笔手续费(绝对值,来源 OKX positions-history.fee,仅供展示)
-    funding REAL DEFAULT 0.0,    -- 该笔资金费(绝对值,来源 OKX positions-history.fundingFee,仅供展示)
+    funding REAL DEFAULT 0.0,    -- 该笔资金费(带符号:正=收/负=付,来源 OKX positions-history.fundingFee,仅供展示)
     entry_time TEXT,
     exit_time TEXT,
     okx_order_id TEXT,

@@ -422,22 +422,24 @@ class Reconciler:
                     )
                     if pos_row is not None:
                         pnl_net = _num(pos_row, "realizedPnl")
-                        fee_raw = _num(pos_row, "fee")           # 负值
-                        funding_raw = _num(pos_row, "fundingFee")  # 负值
-                        fee_abs = abs(fee_raw)
-                        funding_abs = abs(funding_raw)
-                        pnl_gross = pnl_net + fee_abs + funding_abs
+                        fee_raw = _num(pos_row, "fee")             # OKX 总是负 (成本)
+                        funding_raw = _num(pos_row, "fundingFee")  # 有正负: 负=付, 正=收
+                        fee_abs = abs(fee_raw)                     # 手续费展示恒正 (成本)
+                        # 资金费保留符号: 正=收到 (short 遇正 rate / long 遇负 rate),负=付出
+                        funding_signed = funding_raw
+                        # 名义 = 净 - fee_raw - funding_raw = 净 + |fee| - funding_signed
+                        pnl_gross = pnl_net + fee_abs - funding_signed
                         src = "positions-history"
                     else:
                         # orders fallback 拿不到 fundingFee(OKX orders 接口不返),置 0
                         pnl_gross = sum(_num(o, "pnl") for o in related)
                         fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
                         fee_abs = abs(fee_raw_sum)
-                        funding_abs = 0.0
+                        funding_signed = 0.0
                         pnl_net = pnl_gross + fee_raw_sum
                         src = f"orders×{len(related)}(fallback,funding=0)"
 
-                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee/funding 仅供展示
+                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee 恒正为成本, funding 带符号
                     self.db.update_trade_exit(
                         trade_id=t["id"],
                         exit_price=fill_px,
@@ -445,13 +447,13 @@ class Reconciler:
                         pnl=pnl_net,
                         exit_time=fill_time,
                         fee=fee_abs,
-                        funding=funding_abs,
+                        funding=funding_signed,
                     )
                     if self.logger:
                         self.logger.info(
                             f"[reconcile] exit filled: trade#{t['id']} {t['pair']} "
                             f"{reason} @ {fill_px} 名义={pnl_gross:+.4f} "
-                            f"手续费={fee_abs:.4f} 资金费={funding_abs:.4f} "
+                            f"手续费={fee_abs:.4f} 资金费={funding_signed:+.4f} "
                             f"净={pnl_net:+.4f} src={src}"
                         )
 

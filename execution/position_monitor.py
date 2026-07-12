@@ -171,8 +171,8 @@ class PositionMonitor:
       - 净 PnL:db.trades.pnl (reconciler 直接从 OKX positions-history.realizedPnl
         写入的净口径, 已扣手续费+资金费, 与 OKX 界面显示的"已实现收益"完全一致)
       - 手续费:db.trades.fee (仅展示用, |fee|, 来源 OKX positions-history.fee)
-      - 资金费:db.trades.funding (仅展示用, |fundingFee|, 来源 OKX positions-history.fundingFee)
-      - 名义 PnL:pnl + fee + funding (反推展示, 便于对账)
+      - 资金费:db.trades.funding (带符号, 正=收/负=付, 来源 OKX positions-history.fundingFee)
+      - 名义 PnL:pnl + fee - funding (反推展示, 便于对账; funding 带符号, 收入为正 → 从名义里扣掉)
 
     构造两种模式:
       1. 多账户 (推荐): 传 runtimes=[...] 列表,面板显示所有账户
@@ -292,11 +292,11 @@ class PositionMonitor:
                                    if str(r.get("exit_reason") or "").upper() == "ORPHAN")
                 today_cancelled = sum(1 for r in today_all
                                       if str(r.get("exit_reason") or "").upper() == "CANCELLED")
-                # db.pnl 已是净口径; 名义 = 净 + 手续费 + 资金费(反推展示)
+                # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
                 today_net = sum((r.get("pnl") or 0) for r in today_filled)
                 today_fee = sum((r.get("fee") or 0) for r in today_filled)
                 today_funding = sum((r.get("funding") or 0) for r in today_filled)
-                today_pnl = today_net + today_fee + today_funding
+                today_pnl = today_net + today_fee - today_funding  # funding 带符号 → 减
             except Exception:
                 today_filled, today_pnl, today_fee, today_funding, today_net = [], 0.0, 0.0, 0.0, 0.0
                 today_orphan, today_cancelled = 0, 0
@@ -355,7 +355,7 @@ class PositionMonitor:
             f"[bold]持仓[/bold] {total_positions}   "
             f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
             f"[bold]手续费[/bold] {total_today_fee:.4f}   "
-            f"[bold]资金费[/bold] {total_today_funding:.4f}   "
+            f"[bold]资金费[/bold] {total_today_funding:+.4f}   "
             f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}   "
             f"[bold]今日撤单[/bold] {total_today_cancelled}   "
             f"[bold]今日过期[/bold] {total_today_orphan}",
@@ -499,11 +499,12 @@ class PositionMonitor:
         any_t = False
         for aname, r in all_today[:self.today_trades_limit]:
             any_t = True
-            # db.pnl 已是净口径; 名义 = 净 + 手续费 + 资金费(反推展示)
+            # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
             net = r.get("pnl") or 0
             fee = r.get("fee") or 0
-            funding = r.get("funding") or 0
-            pnl = net + fee + funding
+            funding = r.get("funding") or 0  # 带符号: 正=收, 负=付
+            # 名义 = 净 + 手续费(成本) - 资金费(带符号) → 反推 pre-cost 毛盈亏
+            pnl = net + fee - funding
             style = "green" if net > 0 else ("red" if net < 0 else "")
             net_str = _fmt2(net)
             net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str
@@ -512,7 +513,7 @@ class PositionMonitor:
                 r.get("pair", ""), _dir_zh(r.get("side", "")),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
                 _exit_reason_zh(r.get("exit_reason", "")),
-                _fmt2(pnl), f"{fee:.4f}", f"{funding:.4f}", net_cell,
+                _fmt2(pnl), f"{fee:.4f}", f"{funding:+.4f}", net_cell,
             )
         if not any_t:
             trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "", "")
