@@ -3,10 +3,15 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from rich import box
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+
+# 紧凑边框: 每表比默认粗框 (box.HEAVY_HEAD) 少 2 行, 5 张表省 10 行
+_COMPACT_BOX = box.SIMPLE_HEAVY
 
 
 _LIFETIME_CACHE_TTL_MS = 30_000  # 累计业绩 30s 缓存, 防每 5s render 都全表扫
@@ -107,7 +112,7 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
     max_win = max((t.get("pnl") or 0) for t in valid)
     max_loss = min((t.get("pnl") or 0) for t in valid)
 
-    # 回撚%: 按 exit_time 排序 cumulative pnl → peak → dd。
+    # 回撤%: 按 exit_time 排序 cumulative pnl → peak → dd。
     # 基准权益 = 估算初始余额 + peak 时的累计 pnl。
     # 初始余额估算: 当前余额 - 全部累计 pnl (无法拿到历史 balance 时的近似)。
     sorted_by_time = sorted(valid, key=lambda t: t.get("exit_time") or "")
@@ -128,7 +133,7 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
     if peak_equity > 0:
         max_dd_pct = max_dd_abs / peak_equity * 100
     else:
-        # 无余额上下文: 用 peak cum 自身当分母, 至少能反映相对回撚幅度
+        # 无余额上下文: 用 peak cum 自身当分母, 至少能反映相对回撤幅度
         max_dd_pct = (max_dd_abs / peak_cum_at_max_dd * 100) if peak_cum_at_max_dd > 0 else 0.0
 
     return {
@@ -181,7 +186,7 @@ class PositionMonitor:
 
     def __init__(self, okx_client=None, db=None, account_state=None, config=None,
                  logger=None, refresh_seconds: float = 5.0, runtimes=None,
-                 today_trades_limit: int = 8):
+                 today_trades_limit: int = 3):
         self.runtimes = runtimes or []
         # 兼容旧签名(单账户):把入参包装成一个"pseudo runtime"
         if not self.runtimes and okx_client is not None:
@@ -363,60 +368,45 @@ class PositionMonitor:
             f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
 
-        # === 账户一览 ===
-        acc_tbl = Table(title="账户一览", show_header=True, header_style="bold cyan", expand=True)
-        for c in ("账户", "环境", "周期", "余额", "熔断", "连亏", "pending", "持仓",
-                  "今日笔数", "名义 PnL", "手续费", "资金费", "净 PnL", "今日撤单", "今日过期"):
+        # === 账户概览 (当前状态 + 全历史业绩合并成一张,省行) ===
+        # 列少了些冷字段: 连亏/今日笔/名义PnL/手续费/资金费/盈单/亏单/平均盈亏/最大盈亏。
+        # 详细看每日报告 (docs/daily_reports/report_YYYY-MM-DD.md)。
+        acc_tbl = Table(title="账户概览 (当前 + 全历史)", show_header=True,
+                        header_style="bold cyan", expand=True, box=_COMPACT_BOX)
+        for c in ("账户", "环境", "周期", "余额", "熔断", "pending", "持仓",
+                  "今日净", "撤/过", "总笔", "胜率", "净PnL", "盈亏比", "回撤%"):
             acc_tbl.add_column(c, no_wrap=True)
-        for a in snap:
-            cd = "[red]是[/red]" if a["in_cd"] else "[green]否[/green]"
-            losses = f"{a['losses']}/{a['max_losses']}"
-            pnl_str = _fmt2(a['today_pnl'])
-            net_str = _fmt2(a['today_net'])
-            net_style = "green" if a["today_net"] > 0 else ("red" if a["today_net"] < 0 else "")
-            acc_tbl.add_row(
-                a["name"], a["env"], a["signal_bar"],
-                f"{a['balance']:,.2f}", cd, losses,
-                str(len(a["pendings"])), str(len(a["positions"])),
-                str(len(a["today_filled"])),
-                pnl_str, f"{a['today_fee']:.4f}", f"{a['today_funding']:.4f}",
-                f"[{net_style}]{net_str}[/{net_style}]" if net_style else net_str,
-                str(a.get("today_cancelled", 0)), str(a.get("today_orphan", 0)),
-            )
-        if not snap:
-            acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
-
-        # === 累计业绩 (全历史 · TP/SL/EXIT · 按环境分组合计) ===
-        perf_tbl = Table(title="累计业绩 (全历史)", show_header=True,
-                          header_style="bold yellow", expand=True)
-        for c in ("账户", "环境", "总笔", "盈单", "亏单", "胜率", "净PnL",
-                  "平均盈", "平均亏", "盈亏比", "最大盈", "最大亏", "回撚%"):
-            perf_tbl.add_column(c, no_wrap=True)
 
         def _pf_str(pf: float) -> str:
             if pf == float("inf"):
                 return "∞"
             return f"{pf:.2f}"
 
-        def _add_perf_row(name: str, env: str, s: dict, bold: bool = False) -> None:
-            pnl_style = "green" if s["net_pnl"] > 0 else ("red" if s["net_pnl"] < 0 else "")
-            net_str = _fmt2(s["net_pnl"])
-            net_cell = f"[{pnl_style}]{net_str}[/{pnl_style}]" if pnl_style else net_str
+        def _pnl_cell(v: float) -> str:
+            style = "green" if v > 0 else ("red" if v < 0 else "")
+            s = _fmt2(v)
+            return f"[{style}]{s}[/{style}]" if style else s
+
+        def _add_acc_row(name: str, env: str, period: str, balance: float,
+                         in_cd: bool, pendings: int, positions: int,
+                         today_net: float, cancelled: int, orphan: int,
+                         lifetime: dict, bold: bool = False) -> None:
+            cd = "[red]是[/red]" if in_cd else "[green]否[/green]"
             name_cell = f"[bold]{name}[/bold]" if bold else name
-            perf_tbl.add_row(
-                name_cell, env,
-                str(s["total"]), str(s["wins"]), str(s["losses"]),
-                f"{s['win_rate']:.1f}%",
-                net_cell,
-                _fmt2(s["avg_win"], sign=False),
-                _fmt2(s["avg_loss"], sign=False),
-                _pf_str(s["profit_factor"]),
-                _fmt2(s["max_win"]),
-                _fmt2(s["max_loss"]),
-                f"{s['max_dd_pct']:.1f}%",
+            acc_tbl.add_row(
+                name_cell, env, period,
+                f"{balance:,.2f}", cd,
+                str(pendings), str(positions),
+                _pnl_cell(today_net),
+                f"{cancelled}/{orphan}",
+                str(lifetime["total"]),
+                f"{lifetime['win_rate']:.1f}%",
+                _pnl_cell(lifetime["net_pnl"]),
+                _pf_str(lifetime["profit_factor"]),
+                f"{lifetime['max_dd_pct']:.1f}%",
             )
 
-        # 按 env 分组: real 在前, demo 在后, 其它兜底
+        # 按 env 分组: real 在前, demo 在后
         by_env: dict[str, list[dict]] = {}
         for a in snap:
             env = a["env"] or "unknown"
@@ -427,21 +417,36 @@ class PositionMonitor:
         for env in env_order:
             accts = by_env[env]
             for a in accts:
-                _add_perf_row(a["name"], env, a["lifetime"])
-            # env 合计: 至少 1 个账户就出, 便于快速看总数; 合并 valid_trades 重算
-            merged = []
+                _add_acc_row(
+                    a["name"], env, a["signal_bar"], a["balance"],
+                    a["in_cd"], len(a["pendings"]), len(a["positions"]),
+                    a["today_net"], a.get("today_cancelled", 0),
+                    a.get("today_orphan", 0), a["lifetime"],
+                )
+            # env 合计: 合并 valid_trades 重算 lifetime
+            merged_trades = []
             for a in accts:
-                merged.extend(a["valid_trades"])
+                merged_trades.extend(a["valid_trades"])
             merged_bal = sum(a["balance"] for a in accts)
-            agg = _compute_lifetime_stats(merged, current_balance=merged_bal)
-            _add_perf_row(f"{env} 合计", "", agg, bold=True)
+            agg_life = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
+            merged_pending = sum(len(a["pendings"]) for a in accts)
+            merged_pos = sum(len(a["positions"]) for a in accts)
+            merged_today_net = sum(a["today_net"] for a in accts)
+            merged_cancelled = sum(a.get("today_cancelled", 0) for a in accts)
+            merged_orphan = sum(a.get("today_orphan", 0) for a in accts)
+            _add_acc_row(
+                f"{env} 合计", "", "", merged_bal,
+                False, merged_pending, merged_pos,
+                merged_today_net, merged_cancelled, merged_orphan,
+                agg_life, bold=True,
+            )
 
         if not snap:
-            perf_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "")
+            acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "", "")
 
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
-                             header_style="cyan", expand=True)
+                             header_style="cyan", expand=True, box=_COMPACT_BOX)
         for c in ("账户", "品种", "方向", "触发价", "TP", "SL", "AlgoID"):
             pending_tbl.add_column(c, no_wrap=True)
         any_p = False
@@ -459,7 +464,7 @@ class PositionMonitor:
 
         # === 当前持仓表 ===
         pos_tbl = Table(title="当前持仓 (全账户)", show_header=True,
-                         header_style="magenta", expand=True)
+                         header_style="magenta", expand=True, box=_COMPACT_BOX)
         for c in ("账户", "品种", "方向", "张数", "均价", "未实现盈亏"):
             pos_tbl.add_column(c, no_wrap=True)
         any_pos = False
@@ -492,7 +497,8 @@ class PositionMonitor:
         if len(all_today) > self.today_trades_limit:
             title += f" · 显示前 {self.today_trades_limit}/{len(all_today)} 条"
         trade_tbl = Table(title=title,
-                          show_header=True, header_style="green", expand=True)
+                          show_header=True, header_style="green", expand=True,
+                          box=_COMPACT_BOX)
         for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
                   "名义 PnL", "手续费", "资金费", "净 PnL"):
             trade_tbl.add_column(c, no_wrap=True)
@@ -517,14 +523,16 @@ class PositionMonitor:
         if not any_t:
             trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "", "")
 
-        # === 组装 ===
+        # === 组装 (空表隐藏, 省行给非空表) ===
         outer = Table.grid(expand=True)
         outer.add_row(header)
         outer.add_row(acc_tbl)
-        outer.add_row(perf_tbl)
-        outer.add_row(pending_tbl)
-        outer.add_row(pos_tbl)
-        outer.add_row(trade_tbl)
+        if any_p:
+            outer.add_row(pending_tbl)
+        if any_pos:
+            outer.add_row(pos_tbl)
+        if any_t:
+            outer.add_row(trade_tbl)
 
         return Panel(outer, title="HighLow Bot · 多账户监控 v2.0",
                      border_style="bright_blue")
