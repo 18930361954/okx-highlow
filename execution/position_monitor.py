@@ -180,7 +180,8 @@ class PositionMonitor:
     """
 
     def __init__(self, okx_client=None, db=None, account_state=None, config=None,
-                 logger=None, refresh_seconds: float = 5.0, runtimes=None):
+                 logger=None, refresh_seconds: float = 5.0, runtimes=None,
+                 today_trades_limit: int = 8):
         self.runtimes = runtimes or []
         # 兼容旧签名(单账户):把入参包装成一个"pseudo runtime"
         if not self.runtimes and okx_client is not None:
@@ -198,6 +199,9 @@ class PositionMonitor:
         self.db = db or (self.runtimes[0].db if self.runtimes else None)
         self.logger = logger
         self.refresh = refresh_seconds
+        # "今日已成交"表最多显示多少行; 太多会让面板超过终端高度被 crop 掉。
+        # 想看全天历史查 docs/daily_reports/report_YYYY-MM-DD.md。
+        self.today_trades_limit = int(today_trades_limit)
         self.console = Console()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -218,14 +222,15 @@ class PositionMonitor:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        # vertical_overflow='visible': 内容超过终端高度时按自然顺序打印, 溢出的部分留在
-        # 终端 scrollback buffer, 用户可向上滚动查看("今日已成交"等靠底部的表)。
-        # 默认 'ellipsis' 会把超出部分砍成省略号且丢弃, 且 Live 反复重绘 → 无法向上滚看。
-        with Live(self._render(), refresh_per_second=1, console=self.console,
-                  screen=False, vertical_overflow="visible") as live:
+        # auto_refresh=False: 关掉 rich.Live 每秒内部触发, 仅由下面 5s 外循环 update()。
+        # vertical_overflow='crop': 内容超出终端就砍掉底部, 保证单帧就地刷新不叠框。
+        # 之前 'visible' 会让 Live 无法覆盖旧帧, 帧堆到 scrollback 里越叠越乱。
+        # 内容如仍装不下, 靠调小 _today_trades_limit 或用户拉高终端解决, 不再靠滚动。
+        with Live(self._render(), console=self.console, screen=False,
+                  auto_refresh=False, vertical_overflow="crop") as live:
             while not self._stop.is_set():
                 try:
-                    live.update(self._render())
+                    live.update(self._render(), refresh=True)
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"monitor render error: {e}")
@@ -476,19 +481,23 @@ class PositionMonitor:
             pos_tbl.add_row("(无)", "", "", "", "", "")
 
         # === 今日成交表 ===
-        trade_tbl = Table(title="今日已成交 (全账户 · 按 UTC 日)",
-                          show_header=True, header_style="green", expand=True)
-        for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
-                  "名义 PnL", "手续费", "资金费", "净 PnL"):
-            trade_tbl.add_column(c, no_wrap=True)
-        any_t = False
-        # 汇总所有账户今日成交,按时间倒序
+        # 汇总所有账户今日成交,按时间倒序,最多展示 today_trades_limit 条
+        # (超出 crop 会砍表底部, 少展示以保证账户一览/累计业绩不被砍)
         all_today: list[tuple[str, dict]] = []
         for a in snap:
             for r in a["today_filled"]:
                 all_today.append((a["name"], r))
         all_today.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
-        for aname, r in all_today[:20]:  # 最多 20 条
+        title = "今日已成交 (全账户 · 按 UTC 日)"
+        if len(all_today) > self.today_trades_limit:
+            title += f" · 显示前 {self.today_trades_limit}/{len(all_today)} 条"
+        trade_tbl = Table(title=title,
+                          show_header=True, header_style="green", expand=True)
+        for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
+                  "名义 PnL", "手续费", "资金费", "净 PnL"):
+            trade_tbl.add_column(c, no_wrap=True)
+        any_t = False
+        for aname, r in all_today[:self.today_trades_limit]:
             any_t = True
             # db.pnl 已是净口径; 名义 = 净 + 手续费 + 资金费(反推展示)
             net = r.get("pnl") or 0
