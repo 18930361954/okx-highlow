@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -30,6 +31,8 @@ def get_logger(
         return logger
 
     formatter = logging.Formatter(_FMT, datefmt=_DATE_FMT)
+    # 日志时间戳统一 UTC, 与 signal_date / prev_bucket 等业务字段对齐, 免手动 +/-8 换算
+    formatter.converter = time.gmtime
 
     console = logging.StreamHandler()
     console.setFormatter(formatter)
@@ -63,5 +66,7 @@ def get_account_file_handler(account_name: str, keep_days: int = 30) -> logging.
         backupCount=keep_days, encoding="utf-8", utc=True,
     )
     h.suffix = "%Y-%m-%d"
-    h.setFormatter(logging.Formatter(_FMT, datefmt=_DATE_FMT))
+    fmt = logging.Formatter(_FMT, datefmt=_DATE_FMT)
+    fmt.converter = time.gmtime  # UTC 时间戳, 与主 logger 一致
+    h.setFormatter(fmt)
     return h

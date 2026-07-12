@@ -49,6 +49,22 @@ def _dir_zh(raw: str) -> str:
     return raw or ""
 
 
+_EXIT_REASON_ZH = {
+    "TP": "止盈",
+    "SL": "止损",
+    "EXIT": "平仓",
+    "ORPHAN": "过期",
+    "CANCELLED": "撤单",
+}
+
+
+def _exit_reason_zh(raw: str) -> str:
+    """db.exit_reason 中文化, 未知值原样返回。"""
+    if not raw:
+        return ""
+    return _EXIT_REASON_ZH.get(str(raw).upper(), str(raw))
+
+
 class PositionMonitor:
     """终端面板 — 多账户版。5 秒刷新。
 
@@ -139,11 +155,17 @@ class PositionMonitor:
                 positions = []
             # 今日成交(按 exit_time 落在今天 UTC)
             # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
+            # 但 ORPHAN / CANCELLED 计数单独统计, 供面板做"对账器 housekeeping"可视化
             try:
                 all_rows = rt.db.list_trades(limit=500, account=rt.name)
-                today_filled = [r for r in all_rows
-                                if (r.get("exit_price") or 0) > 0
-                                and (r.get("exit_time") or "")[:10] == today_iso]
+                today_all = [r for r in all_rows
+                             if (r.get("exit_time") or "")[:10] == today_iso]
+                today_filled = [r for r in today_all
+                                if (r.get("exit_price") or 0) > 0]
+                today_orphan = sum(1 for r in today_all
+                                   if str(r.get("exit_reason") or "").upper() == "ORPHAN")
+                today_cancelled = sum(1 for r in today_all
+                                      if str(r.get("exit_reason") or "").upper() == "CANCELLED")
                 # db.pnl 已是净口径; 名义 = 净 + 手续费 + 资金费(反推展示)
                 today_net = sum((r.get("pnl") or 0) for r in today_filled)
                 today_fee = sum((r.get("fee") or 0) for r in today_filled)
@@ -151,6 +173,7 @@ class PositionMonitor:
                 today_pnl = today_net + today_fee + today_funding
             except Exception:
                 today_filled, today_pnl, today_fee, today_funding, today_net = [], 0.0, 0.0, 0.0, 0.0
+                today_orphan, today_cancelled = 0, 0
 
             results.append({
                 "rt": rt,
@@ -168,6 +191,8 @@ class PositionMonitor:
                 "today_fee": today_fee,
                 "today_funding": today_funding,
                 "today_net": today_net,
+                "today_orphan": today_orphan,
+                "today_cancelled": today_cancelled,
             })
         return results
 
@@ -182,6 +207,8 @@ class PositionMonitor:
         total_today_fee = sum(a["today_fee"] for a in snap)
         total_today_funding = sum(a["today_funding"] for a in snap)
         total_today_net = sum(a["today_net"] for a in snap)
+        total_today_orphan = sum(a.get("today_orphan", 0) for a in snap)
+        total_today_cancelled = sum(a.get("today_cancelled", 0) for a in snap)
 
         # === 头部 ===
         header = Table.grid(expand=True)
@@ -197,7 +224,9 @@ class PositionMonitor:
             f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
             f"[bold]手续费[/bold] {total_today_fee:.4f}   "
             f"[bold]资金费[/bold] {total_today_funding:.4f}   "
-            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}",
+            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}   "
+            f"[bold]今日撤单[/bold] {total_today_cancelled}   "
+            f"[bold]今日过期[/bold] {total_today_orphan}",
             f"[bold]运行[/bold] {uptime}   "
             f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
@@ -205,7 +234,7 @@ class PositionMonitor:
         # === 账户一览 ===
         acc_tbl = Table(title="账户一览", show_header=True, header_style="bold cyan", expand=True)
         for c in ("账户", "环境", "周期", "余额", "熔断", "连亏", "pending", "持仓",
-                  "今日笔数", "名义 PnL", "手续费", "资金费", "净 PnL"):
+                  "今日笔数", "名义 PnL", "手续费", "资金费", "净 PnL", "今日撤单", "今日过期"):
             acc_tbl.add_column(c, no_wrap=True)
         for a in snap:
             cd = "[red]是[/red]" if a["in_cd"] else "[green]否[/green]"
@@ -220,9 +249,10 @@ class PositionMonitor:
                 str(len(a["today_filled"])),
                 pnl_str, f"{a['today_fee']:.4f}", f"{a['today_funding']:.4f}",
                 f"[{net_style}]{net_str}[/{net_style}]" if net_style else net_str,
+                str(a.get("today_cancelled", 0)), str(a.get("today_orphan", 0)),
             )
         if not snap:
-            acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "")
+            acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
 
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
@@ -291,7 +321,7 @@ class PositionMonitor:
                 (r.get("exit_time") or "")[:19], aname,
                 r.get("pair", ""), _dir_zh(r.get("side", "")),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
-                r.get("exit_reason", ""),
+                _exit_reason_zh(r.get("exit_reason", "")),
                 _fmt2(pnl), f"{fee:.4f}", f"{funding:.4f}", net_cell,
             )
         if not any_t:
