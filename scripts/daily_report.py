@@ -102,12 +102,13 @@ def generate_report(db, account, config, target_date: str | None = None,
 
     wins = sum(1 for t in filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in filled if (t.get("pnl") or 0) < 0)
-    # db.pnl 已是净口径(reconciler 从 OKX positions-history.realizedPnl 写入);
-    # funding 带符号(正=收/负=付); 名义 = 净 + 手续费 - 资金费
+    # 全部 OKX 直取: pnl=净, pnl_gross=名义(权威, 与 OKX 界面一致), 不本地反推。
+    # 老数据无 pnl_gross → fallback 反推。
     total_net = sum((t.get("pnl") or 0) for t in filled)
     total_fee = sum((t.get("fee") or 0) for t in filled)
     total_funding = sum((t.get("funding") or 0) for t in filled)
-    total_pnl = total_net + total_fee - total_funding
+    total_pnl = sum((t.get("pnl_gross") or ((t.get("pnl") or 0) + (t.get("fee") or 0) - (t.get("funding") or 0)))
+                    for t in filled)
 
     if start_balance_str is None:
         start_balance = end_balance - total_net
@@ -222,7 +223,8 @@ def generate_report(db, account, config, target_date: str | None = None,
             net = t.get("pnl") or 0
             fee = t.get("fee") or 0
             funding = t.get("funding") or 0  # 带符号: 正=收, 负=付
-            pnl = net + fee - funding  # 名义 = 净 + 手续费(成本) - 资金费(带符号)
+            # 名义读 OKX 存的 pnl_gross (权威); 老数据无 → fallback 反推
+            pnl = t.get("pnl_gross") or (net + fee - funding)
             lines.append(
                 f"| {ts} | {t.get('pair', '')} | {t.get('side', '')} | "
                 f"{t.get('entry_price', '')} | {t.get('exit_price', '')} | "
@@ -284,11 +286,12 @@ def _summarize_account(db, rt_like, today: str) -> dict:
     today_filled = [t for t in all_trades
                     if (t.get("exit_price") or 0) > 0
                     and (t.get("exit_time") or "")[:10] == today]
-    # db.pnl 已是净口径; funding 带符号; 名义 = 净 + 手续费 - 资金费
+    # 全部 OKX 直取: pnl_gross 是名义权威, 老数据无 → fallback 反推
     total_net = sum((t.get("pnl") or 0) for t in today_filled)
     total_fee = sum((t.get("fee") or 0) for t in today_filled)
     total_funding = sum((t.get("funding") or 0) for t in today_filled)
-    total_pnl = total_net + total_fee - total_funding
+    total_pnl = sum((t.get("pnl_gross") or ((t.get("pnl") or 0) + (t.get("fee") or 0) - (t.get("funding") or 0)))
+                    for t in today_filled)
     wins = sum(1 for t in today_filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in today_filled if (t.get("pnl") or 0) < 0)
 
@@ -406,7 +409,8 @@ def generate_multi_account_report(runtimes, config, target_date: str | None = No
                 net = t.get("pnl") or 0
                 fee = t.get("fee") or 0
                 funding = t.get("funding") or 0  # 带符号: 正=收, 负=付
-                pnl = net + fee - funding  # 名义 = 净 + 手续费(成本) - 资金费(带符号)
+                # 名义读 OKX 存的 pnl_gross (权威); 老数据无 → fallback 反推
+                pnl = t.get("pnl_gross") or (net + fee - funding)
                 lines.append(
                     f"| {ts} | {t.get('pair', '')} | {t.get('side', '')} | "
                     f"{t.get('entry_price', '')} | {t.get('exit_price', '')} | "

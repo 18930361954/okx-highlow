@@ -292,11 +292,13 @@ class PositionMonitor:
                                    if str(r.get("exit_reason") or "").upper() == "ORPHAN")
                 today_cancelled = sum(1 for r in today_all
                                       if str(r.get("exit_reason") or "").upper() == "CANCELLED")
-                # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
+                # 全部 OKX 直取:pnl=净, pnl_gross=名义, fee=成本, funding=带符号
+                # 老数据无 pnl_gross → fallback 本地反推
                 today_net = sum((r.get("pnl") or 0) for r in today_filled)
                 today_fee = sum((r.get("fee") or 0) for r in today_filled)
                 today_funding = sum((r.get("funding") or 0) for r in today_filled)
-                today_pnl = today_net + today_fee - today_funding  # funding 带符号 → 减
+                today_pnl = sum((r.get("pnl_gross") or ((r.get("pnl") or 0) + (r.get("fee") or 0) - (r.get("funding") or 0)))
+                                for r in today_filled)
             except Exception:
                 today_filled, today_pnl, today_fee, today_funding, today_net = [], 0.0, 0.0, 0.0, 0.0
                 today_orphan, today_cancelled = 0, 0
@@ -503,8 +505,9 @@ class PositionMonitor:
             net = r.get("pnl") or 0
             fee = r.get("fee") or 0
             funding = r.get("funding") or 0  # 带符号: 正=收, 负=付
-            # 名义 = 净 + 手续费(成本) - 资金费(带符号) → 反推 pre-cost 毛盈亏
-            pnl = net + fee - funding
+            # 名义 PnL 直接读 OKX 存的 pnl_gross, 不本地反推 (与 OKX 界面一致)
+            # 老数据 (无 pnl_gross) fallback 到反推
+            pnl = r.get("pnl_gross") or (net + fee - funding)
             style = "green" if net > 0 else ("red" if net < 0 else "")
             net_str = _fmt2(net)
             net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str

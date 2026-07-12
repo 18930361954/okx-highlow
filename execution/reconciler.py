@@ -421,25 +421,29 @@ class Reconciler:
                         close_time_iso=fill_time,
                     )
                     if pos_row is not None:
-                        pnl_net = _num(pos_row, "realizedPnl")
+                        # 全部字段直接 OKX positions-history 取, 不本地反推:
+                        pnl_net = _num(pos_row, "realizedPnl")     # 净盈亏 (已扣所有成本)
+                        pnl_gross = _num(pos_row, "pnl")           # 名义盈亏 (OKX 界面显示的"未扣费"口径)
                         fee_raw = _num(pos_row, "fee")             # OKX 总是负 (成本)
                         funding_raw = _num(pos_row, "fundingFee")  # 有正负: 负=付, 正=收
                         fee_abs = abs(fee_raw)                     # 手续费展示恒正 (成本)
-                        # 资金费保留符号: 正=收到 (short 遇正 rate / long 遇负 rate),负=付出
-                        funding_signed = funding_raw
-                        # 名义 = 净 - fee_raw - funding_raw = 净 + |fee| - funding_signed
-                        pnl_gross = pnl_net + fee_abs - funding_signed
+                        funding_signed = funding_raw               # 资金费保留符号
                         src = "positions-history"
                     else:
-                        # orders fallback 拿不到 fundingFee(OKX orders 接口不返),置 0
+                        # orders fallback: OKX orders 接口不返 fundingFee,置 0;
+                        # 名义 = orders 累加 pnl (与 OKX 界面"每笔 order 的 pnl"口径一致)
                         pnl_gross = sum(_num(o, "pnl") for o in related)
                         fee_raw_sum = sum(_num(o, "fee") for o in related)  # 负值
                         fee_abs = abs(fee_raw_sum)
                         funding_signed = 0.0
-                        pnl_net = pnl_gross + fee_raw_sum
+                        pnl_net = pnl_gross + fee_raw_sum  # 只能本地反推 (无 positions-history)
                         src = f"orders×{len(related)}(fallback,funding=0)"
 
-                    # db.pnl 存净口径(与 OKX 界面显示的收益一致);fee 恒正为成本, funding 带符号
+                    # db 存 4 个字段全部来自 OKX (positions-history 走优先, orders 走 fallback):
+                    #   pnl        = realizedPnl (净, 权威)
+                    #   pnl_gross  = pnl (名义, 权威, 与 OKX 界面一致)
+                    #   fee        = |fee| (成本)
+                    #   funding    = fundingFee (带符号)
                     self.db.update_trade_exit(
                         trade_id=t["id"],
                         exit_price=fill_px,
@@ -448,6 +452,7 @@ class Reconciler:
                         exit_time=fill_time,
                         fee=fee_abs,
                         funding=funding_signed,
+                        pnl_gross=pnl_gross,
                     )
                     if self.logger:
                         self.logger.info(

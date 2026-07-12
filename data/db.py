@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS trades (
     margin REAL,
     mode TEXT,
     pnl REAL,                    -- OKX 净盈亏(realizedPnl,已扣手续费+资金费,与 UI 一致)
+    pnl_gross REAL DEFAULT 0.0,  -- OKX 名义盈亏(positions-history.pnl,权威值,不做本地反推)
     fee REAL DEFAULT 0.0,        -- 该笔手续费(绝对值,来源 OKX positions-history.fee,仅供展示)
     funding REAL DEFAULT 0.0,    -- 该笔资金费(带符号:正=收/负=付,来源 OKX positions-history.fundingFee,仅供展示)
     entry_time TEXT,
@@ -76,6 +77,10 @@ class DB:
             # 已发生的历史数据不回补 —— funding 列填 0,fee 保持原值(视为"含 funding 的老 fee")。
             if "funding" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN funding REAL DEFAULT 0.0")
+            # pnl_gross 列:直接存 OKX positions-history.pnl (名义/毛盈亏, 权威值),
+            # 避免本地 net + fee - funding 反推带来的浮点/舍入不一致 (与 OKX 界面对不上)。
+            if "pnl_gross" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN pnl_gross REAL DEFAULT 0.0")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -132,8 +137,10 @@ class DB:
         exit_time: str,
         fee: float | None = None,
         funding: float | None = None,
+        pnl_gross: float | None = None,
     ) -> None:
-        """fee / funding 均为绝对值(展示口径),来源 OKX positions-history。"""
+        """pnl=净口径 (realizedPnl); pnl_gross=名义口径 (OKX positions-history.pnl, 权威);
+        fee=绝对值(成本); funding=带符号(正=收/负=付)。全部 OKX 直返, 不本地算。"""
         with self._conn() as c:
             sets = ["exit_price=?", "exit_reason=?", "pnl=?", "exit_time=?"]
             vals: list[Any] = [exit_price, exit_reason, pnl, exit_time]
@@ -141,6 +148,8 @@ class DB:
                 sets.append("fee=?"); vals.append(fee)
             if funding is not None:
                 sets.append("funding=?"); vals.append(funding)
+            if pnl_gross is not None:
+                sets.append("pnl_gross=?"); vals.append(pnl_gross)
             vals.append(trade_id)
             c.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", vals)
 
