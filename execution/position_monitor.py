@@ -1,11 +1,18 @@
 import math
 import threading
+import time
 from datetime import datetime, timezone
 
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+
+_LIFETIME_CACHE_TTL_MS = 30_000  # 累计业绩 30s 缓存, 防每 5s render 都全表扫
+
+# 计入"累计业绩"的成交口径 (ORPHAN/CANCELLED 不算真实成交)
+_VALID_EXIT_REASONS = {"TP", "SL", "EXIT"}
 
 
 UTC = timezone.utc
@@ -63,6 +70,76 @@ def _exit_reason_zh(raw: str) -> str:
     if not raw:
         return ""
     return _EXIT_REASON_ZH.get(str(raw).upper(), str(raw))
+
+
+def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) -> dict:
+    """按传入的 trades 集合聚合业绩指标, 只统计真实成交(TP/SL/EXIT)。
+
+    返回字段:
+      raw: total, wins, losses, sum_win, sum_loss_abs, net_pnl, max_win, max_loss
+      derived: win_rate, avg_win, avg_loss, profit_factor, max_dd_pct
+    """
+    valid = [t for t in trades
+             if str(t.get("exit_reason") or "").upper() in _VALID_EXIT_REASONS]
+    total = len(valid)
+    if total == 0:
+        return {"total": 0, "wins": 0, "losses": 0,
+                "sum_win": 0.0, "sum_loss_abs": 0.0, "net_pnl": 0.0,
+                "max_win": 0.0, "max_loss": 0.0,
+                "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+                "profit_factor": 0.0, "max_dd_pct": 0.0}
+
+    wins = [t for t in valid if (t.get("pnl") or 0) > 0]
+    losses = [t for t in valid if (t.get("pnl") or 0) < 0]
+    net_pnl = sum((t.get("pnl") or 0) for t in valid)
+    sum_win = sum((t.get("pnl") or 0) for t in wins)
+    sum_loss_abs = sum(abs(t.get("pnl") or 0) for t in losses)
+
+    avg_win = sum_win / len(wins) if wins else 0.0
+    avg_loss = sum_loss_abs / len(losses) if losses else 0.0
+    if sum_loss_abs > 0:
+        profit_factor = sum_win / sum_loss_abs
+    elif sum_win > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+
+    max_win = max((t.get("pnl") or 0) for t in valid)
+    max_loss = min((t.get("pnl") or 0) for t in valid)
+
+    # 回撚%: 按 exit_time 排序 cumulative pnl → peak → dd。
+    # 基准权益 = 估算初始余额 + peak 时的累计 pnl。
+    # 初始余额估算: 当前余额 - 全部累计 pnl (无法拿到历史 balance 时的近似)。
+    sorted_by_time = sorted(valid, key=lambda t: t.get("exit_time") or "")
+    cum = 0.0
+    peak = 0.0
+    max_dd_abs = 0.0
+    peak_cum_at_max_dd = 0.0
+    for t in sorted_by_time:
+        cum += t.get("pnl") or 0
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd_abs:
+            max_dd_abs = dd
+            peak_cum_at_max_dd = peak
+    initial_est = max(0.0, current_balance - cum) if current_balance > 0 else 0.0
+    peak_equity = initial_est + peak_cum_at_max_dd
+    if peak_equity > 0:
+        max_dd_pct = max_dd_abs / peak_equity * 100
+    else:
+        # 无余额上下文: 用 peak cum 自身当分母, 至少能反映相对回撚幅度
+        max_dd_pct = (max_dd_abs / peak_cum_at_max_dd * 100) if peak_cum_at_max_dd > 0 else 0.0
+
+    return {
+        "total": total, "wins": len(wins), "losses": len(losses),
+        "sum_win": sum_win, "sum_loss_abs": sum_loss_abs, "net_pnl": net_pnl,
+        "max_win": max_win, "max_loss": max_loss,
+        "win_rate": len(wins) / total * 100,
+        "avg_win": avg_win, "avg_loss": avg_loss,
+        "profit_factor": profit_factor,
+        "max_dd_pct": max_dd_pct,
+    }
 
 
 def _pending_tp_sl(o: dict) -> tuple[str, str]:
@@ -125,6 +202,9 @@ class PositionMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started_at = datetime.now(UTC)
+        # 累计业绩缓存: {account_name: (expiry_ms, valid_trades_list)}
+        # 存 raw valid trades 而非 stats, 方便 env 合计时二次聚合。
+        self._lifetime_cache: dict[str, tuple[int, list[dict]]] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -146,6 +226,23 @@ class PositionMonitor:
                     if self.logger:
                         self.logger.error(f"monitor render error: {e}")
                 self._stop.wait(self.refresh)
+
+    # ---------- 累计业绩: 缓存 30s 防止每 5s 全表扫 ----------
+
+    def _valid_trades_for(self, rt) -> list[dict]:
+        """拿该账户全历史"真实成交" trades (TP/SL/EXIT)。30s 缓存。"""
+        now_ms = int(time.time() * 1000)
+        cached = self._lifetime_cache.get(rt.name)
+        if cached and cached[0] > now_ms:
+            return cached[1]
+        try:
+            rows = rt.db.list_trades(limit=100_000, account=rt.name)
+        except Exception:
+            rows = []
+        valid = [r for r in rows
+                 if str(r.get("exit_reason") or "").upper() in _VALID_EXIT_REASONS]
+        self._lifetime_cache[rt.name] = (now_ms + _LIFETIME_CACHE_TTL_MS, valid)
+        return valid
 
     # ---------- 数据采集(一次采,多处用)----------
 
@@ -195,6 +292,10 @@ class PositionMonitor:
                 today_filled, today_pnl, today_fee, today_funding, today_net = [], 0.0, 0.0, 0.0, 0.0
                 today_orphan, today_cancelled = 0, 0
 
+            # 累计业绩 (30s 缓存)
+            valid_trades = self._valid_trades_for(rt)
+            lifetime = _compute_lifetime_stats(valid_trades, current_balance=bal)
+
             results.append({
                 "rt": rt,
                 "name": rt.name,
@@ -213,6 +314,8 @@ class PositionMonitor:
                 "today_net": today_net,
                 "today_orphan": today_orphan,
                 "today_cancelled": today_cancelled,
+                "lifetime": lifetime,
+                "valid_trades": valid_trades,  # env 合计时二次聚合用
             })
         return results
 
@@ -273,6 +376,59 @@ class PositionMonitor:
             )
         if not snap:
             acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
+
+        # === 累计业绩 (全历史 · TP/SL/EXIT · 按环境分组合计) ===
+        perf_tbl = Table(title="累计业绩 (全历史)", show_header=True,
+                          header_style="bold yellow", expand=True)
+        for c in ("账户", "环境", "总笔", "盈单", "亏单", "胜率", "净PnL",
+                  "平均盈", "平均亏", "盈亏比", "最大盈", "最大亏", "回撚%"):
+            perf_tbl.add_column(c, no_wrap=True)
+
+        def _pf_str(pf: float) -> str:
+            if pf == float("inf"):
+                return "∞"
+            return f"{pf:.2f}"
+
+        def _add_perf_row(name: str, env: str, s: dict, bold: bool = False) -> None:
+            pnl_style = "green" if s["net_pnl"] > 0 else ("red" if s["net_pnl"] < 0 else "")
+            net_str = _fmt2(s["net_pnl"])
+            net_cell = f"[{pnl_style}]{net_str}[/{pnl_style}]" if pnl_style else net_str
+            name_cell = f"[bold]{name}[/bold]" if bold else name
+            perf_tbl.add_row(
+                name_cell, env,
+                str(s["total"]), str(s["wins"]), str(s["losses"]),
+                f"{s['win_rate']:.1f}%",
+                net_cell,
+                _fmt2(s["avg_win"], sign=False),
+                _fmt2(s["avg_loss"], sign=False),
+                _pf_str(s["profit_factor"]),
+                _fmt2(s["max_win"]),
+                _fmt2(s["max_loss"]),
+                f"{s['max_dd_pct']:.1f}%",
+            )
+
+        # 按 env 分组: real 在前, demo 在后, 其它兜底
+        by_env: dict[str, list[dict]] = {}
+        for a in snap:
+            env = a["env"] or "unknown"
+            by_env.setdefault(env, []).append(a)
+        env_order = [e for e in ("real", "live", "demo") if e in by_env] + \
+                    [e for e in by_env if e not in ("real", "live", "demo")]
+
+        for env in env_order:
+            accts = by_env[env]
+            for a in accts:
+                _add_perf_row(a["name"], env, a["lifetime"])
+            # env 合计: 至少 1 个账户就出, 便于快速看总数; 合并 valid_trades 重算
+            merged = []
+            for a in accts:
+                merged.extend(a["valid_trades"])
+            merged_bal = sum(a["balance"] for a in accts)
+            agg = _compute_lifetime_stats(merged, current_balance=merged_bal)
+            _add_perf_row(f"{env} 合计", "", agg, bold=True)
+
+        if not snap:
+            perf_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "")
 
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
@@ -352,6 +508,7 @@ class PositionMonitor:
         outer = Table.grid(expand=True)
         outer.add_row(header)
         outer.add_row(acc_tbl)
+        outer.add_row(perf_tbl)
         outer.add_row(pending_tbl)
         outer.add_row(pos_tbl)
         outer.add_row(trade_tbl)
