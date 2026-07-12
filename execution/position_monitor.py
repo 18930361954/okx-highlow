@@ -218,7 +218,11 @@ class PositionMonitor:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        with Live(self._render(), refresh_per_second=1, console=self.console, screen=False) as live:
+        # vertical_overflow='visible': 内容超过终端高度时按自然顺序打印, 溢出的部分留在
+        # 终端 scrollback buffer, 用户可向上滚动查看("今日已成交"等靠底部的表)。
+        # 默认 'ellipsis' 会把超出部分砍成省略号且丢弃, 且 Live 反复重绘 → 无法向上滚看。
+        with Live(self._render(), refresh_per_second=1, console=self.console,
+                  screen=False, vertical_overflow="visible") as live:
             while not self._stop.is_set():
                 try:
                     live.update(self._render())
