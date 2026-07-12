@@ -3,15 +3,10 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from rich import box
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-
-
-# 紧凑边框: 每表比默认粗框 (box.HEAVY_HEAD) 少 2 行, 5 张表省 10 行
-_COMPACT_BOX = box.SIMPLE_HEAVY
 
 
 _LIFETIME_CACHE_TTL_MS = 30_000  # 累计业绩 30s 缓存, 防每 5s render 都全表扫
@@ -368,11 +363,11 @@ class PositionMonitor:
             f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
 
-        # === 账户概览 (当前状态 + 全历史业绩合并成一张,省行) ===
+        # === 账户概览 (当前状态 + 全历史业绩合并成一张) ===
         # 列少了些冷字段: 连亏/今日笔/名义PnL/手续费/资金费/盈单/亏单/平均盈亏/最大盈亏。
         # 详细看每日报告 (docs/daily_reports/report_YYYY-MM-DD.md)。
         acc_tbl = Table(title="账户概览 (当前 + 全历史)", show_header=True,
-                        header_style="bold cyan", expand=True, box=_COMPACT_BOX)
+                        header_style="bold cyan", expand=True)
         for c in ("账户", "环境", "周期", "余额", "熔断", "pending", "持仓",
                   "今日净", "撤/过", "总笔", "胜率", "净PnL", "盈亏比", "回撤%"):
             acc_tbl.add_column(c, no_wrap=True)
@@ -446,7 +441,7 @@ class PositionMonitor:
 
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
-                             header_style="cyan", expand=True, box=_COMPACT_BOX)
+                             header_style="cyan", expand=True)
         for c in ("账户", "品种", "方向", "触发价", "TP", "SL", "AlgoID"):
             pending_tbl.add_column(c, no_wrap=True)
         any_p = False
@@ -464,7 +459,7 @@ class PositionMonitor:
 
         # === 当前持仓表 ===
         pos_tbl = Table(title="当前持仓 (全账户)", show_header=True,
-                         header_style="magenta", expand=True, box=_COMPACT_BOX)
+                         header_style="magenta", expand=True)
         for c in ("账户", "品种", "方向", "张数", "均价", "未实现盈亏"):
             pos_tbl.add_column(c, no_wrap=True)
         any_pos = False
@@ -497,8 +492,7 @@ class PositionMonitor:
         if len(all_today) > self.today_trades_limit:
             title += f" · 显示前 {self.today_trades_limit}/{len(all_today)} 条"
         trade_tbl = Table(title=title,
-                          show_header=True, header_style="green", expand=True,
-                          box=_COMPACT_BOX)
+                          show_header=True, header_style="green", expand=True)
         for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
                   "名义 PnL", "手续费", "资金费", "净 PnL"):
             trade_tbl.add_column(c, no_wrap=True)
