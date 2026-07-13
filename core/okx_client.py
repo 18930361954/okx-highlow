@@ -107,7 +107,17 @@ class OKXClient:
                 data = resp.json()
                 if str(data.get("code", "")) != "0":
                     code = str(data.get("code", ""))
-                    msg = f"OKX error code={code} msg={data.get('msg')} endpoint={endpoint}"
+                    top_msg = data.get("msg") or ""
+                    # code=1 (batch endpoint 部分失败) 真错因在 data[0].sMsg,顶层 msg 是空。
+                    # 例: order-algo posMode 错、余额不足等. 展开子错误好排查。
+                    sub_msg = ""
+                    rows = data.get("data") or []
+                    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                        s_code = rows[0].get("sCode") or ""
+                        s_msg = rows[0].get("sMsg") or ""
+                        if s_code or s_msg:
+                            sub_msg = f" sCode={s_code} sMsg={s_msg}"
+                    msg = f"OKX error code={code} msg={top_msg}{sub_msg} endpoint={endpoint}"
                     if self.logger:
                         # 59669：set_leverage 被 pending trigger 单卡住,是上层已知不阻断状态,不打 WARNING
                         # 让 main.py 的 except 分支决定日志级别
