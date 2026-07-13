@@ -180,7 +180,8 @@ class PositionMonitor:
 
     def __init__(self, okx_client=None, db=None, account_state=None, config=None,
                  logger=None, refresh_seconds: float = 5.0, runtimes=None,
-                 today_trades_limit: int | None = None):
+                 recent_trades_limit: int = 5,
+                 today_trades_limit: int | None = None):  # 旧参数保留兼容, 已废弃
         self.runtimes = runtimes or []
         # 兼容旧签名(单账户):把入参包装成一个"pseudo runtime"
         if not self.runtimes and okx_client is not None:
@@ -198,9 +199,9 @@ class PositionMonitor:
         self.db = db or (self.runtimes[0].db if self.runtimes else None)
         self.logger = logger
         self.refresh = refresh_seconds
-        # "今日已成交"表最多显示多少行; None 表示不限, 全部展示。
-        # 若终端高度不够导致底部被 crop, 传具体数字 (如 5/10) 收窄。
-        self.today_trades_limit = int(today_trades_limit) if today_trades_limit else None
+        # "最近成交"表显示最近 N 笔真实成交 (跨所有账户, 按 exit_time 倒序)。
+        # 默认 5 条; 想看全天详情去 daily_reports/。
+        self.recent_trades_limit = int(recent_trades_limit)
         self.console = Console()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -481,21 +482,16 @@ class PositionMonitor:
         if not any_pos:
             pos_tbl.add_row("(无)", "", "", "", "", "")
 
-        # === 今日成交表 ===
-        # 汇总所有账户今日成交,按时间倒序,最多展示 today_trades_limit 条
-        # (超出 crop 会砍表底部, 少展示以保证账户一览/累计业绩不被砍)
-        all_today: list[tuple[str, dict]] = []
+        # === 最近成交表 ===
+        # 全账户 · 全历史真实成交(TP/SL/EXIT), 按 exit_time 倒序, 取最近 N 条
+        all_recent: list[tuple[str, dict]] = []
         for a in snap:
-            for r in a["today_filled"]:
-                all_today.append((a["name"], r))
-        all_today.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
-        title = "今日已成交 (全账户 · 按 UTC 日)"
-        # limit=None → 全部展示; 有 limit 且超过时截断并标注
-        if self.today_trades_limit and len(all_today) > self.today_trades_limit:
-            title += f" · 显示前 {self.today_trades_limit}/{len(all_today)} 条"
-            shown = all_today[:self.today_trades_limit]
-        else:
-            shown = all_today
+            for r in a["valid_trades"]:
+                all_recent.append((a["name"], r))
+        all_recent.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
+        total = len(all_recent)
+        shown = all_recent[:self.recent_trades_limit]
+        title = f"最近成交 (全账户) · 显示 {len(shown)}/{total} 条"
         trade_tbl = Table(title=title,
                           show_header=True, header_style="green", expand=True)
         for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
