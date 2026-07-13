@@ -181,7 +181,7 @@ class PositionMonitor:
 
     def __init__(self, okx_client=None, db=None, account_state=None, config=None,
                  logger=None, refresh_seconds: float = 5.0, runtimes=None,
-                 today_trades_limit: int = 3):
+                 today_trades_limit: int | None = None):
         self.runtimes = runtimes or []
         # 兼容旧签名(单账户):把入参包装成一个"pseudo runtime"
         if not self.runtimes and okx_client is not None:
@@ -199,9 +199,9 @@ class PositionMonitor:
         self.db = db or (self.runtimes[0].db if self.runtimes else None)
         self.logger = logger
         self.refresh = refresh_seconds
-        # "今日已成交"表最多显示多少行; 太多会让面板超过终端高度被 crop 掉。
-        # 想看全天历史查 docs/daily_reports/report_YYYY-MM-DD.md。
-        self.today_trades_limit = int(today_trades_limit)
+        # "今日已成交"表最多显示多少行; None 表示不限, 全部展示。
+        # 若终端高度不够导致底部被 crop, 传具体数字 (如 5/10) 收窄。
+        self.today_trades_limit = int(today_trades_limit) if today_trades_limit else None
         self.console = Console()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -491,15 +491,19 @@ class PositionMonitor:
                 all_today.append((a["name"], r))
         all_today.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
         title = "今日已成交 (全账户 · 按 UTC 日)"
-        if len(all_today) > self.today_trades_limit:
+        # limit=None → 全部展示; 有 limit 且超过时截断并标注
+        if self.today_trades_limit and len(all_today) > self.today_trades_limit:
             title += f" · 显示前 {self.today_trades_limit}/{len(all_today)} 条"
+            shown = all_today[:self.today_trades_limit]
+        else:
+            shown = all_today
         trade_tbl = Table(title=title,
                           show_header=True, header_style="green", expand=True)
         for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
                   "名义 PnL", "手续费", "资金费", "净 PnL"):
             trade_tbl.add_column(c, no_wrap=True)
         any_t = False
-        for aname, r in all_today[:self.today_trades_limit]:
+        for aname, r in shown:
             any_t = True
             # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
             net = r.get("pnl") or 0
