@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timezone
 
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -222,19 +221,19 @@ class PositionMonitor:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        # auto_refresh=False: 关掉 rich.Live 每秒内部触发, 仅由下面 5s 外循环 update()。
-        # vertical_overflow='crop': 内容超出终端就砍掉底部, 保证单帧就地刷新不叠框。
-        # 之前 'visible' 会让 Live 无法覆盖旧帧, 帧堆到 scrollback 里越叠越乱。
-        # 内容如仍装不下, 靠调小 _today_trades_limit 或用户拉高终端解决, 不再靠滚动。
-        with Live(self._render(), console=self.console, screen=False,
-                  auto_refresh=False, vertical_overflow="crop") as live:
-            while not self._stop.is_set():
-                try:
-                    live.update(self._render(), refresh=True)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(f"monitor render error: {e}")
-                self._stop.wait(self.refresh)
+        # 不用 rich.Live 的"就地覆盖"模式: 那种模式内容超出终端必然砍底部, 且无法向上滚。
+        # 改成直接 print 整帧, 终端自然把上一帧推到 scrollback, 用户随时向上滚动看:
+        #   - 当前帧被终端底部砍掉的部分
+        #   - 历史帧 (直到 scrollback 满)
+        # 代价: 每 refresh 秒 append 一屏内容, scrollback 消耗较快 (5s × 40 行 ≈ 500 行/分钟)。
+        # 想减少可加大 refresh_seconds 或缩终端字号让面板变紧。
+        while not self._stop.is_set():
+            try:
+                self.console.print(self._render())
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"monitor render error: {e}")
+            self._stop.wait(self.refresh)
 
     # ---------- 累计业绩: 缓存 30s 防止每 5s 全表扫 ----------
 
