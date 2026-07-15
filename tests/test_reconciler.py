@@ -27,9 +27,13 @@ class FakeOKX:
     """按 pair 返回预设的 orders-history 与 pending algos。"""
 
     def __init__(self, history_by_pair: dict | None = None,
-                 pending: list[dict] | None = None):
+                 pending: list[dict] | None = None,
+                 balance: float | None = None,
+                 positions: list[dict] | None = None):
         self.history_by_pair = history_by_pair or {}
         self.pending = list(pending or [])
+        self.balance = balance  # None → get_balance 返 0,余额同步跳过
+        self.positions = list(positions or [])
         self.cancelled: list[tuple[str, str]] = []
         self.calls = 0
 
@@ -44,6 +48,12 @@ class FakeOKX:
         self.cancelled.append((algoId, instId))
         self.pending = [o for o in self.pending if o.get("algoId") != algoId]
         return {"code": "0"}
+
+    def get_positions(self, instId=None):
+        return [p for p in self.positions if not instId or p.get("instId") == instId]
+
+    def get_balance(self, ccy="USDT"):
+        return float(self.balance) if self.balance is not None else 0.0
 
 
 def _fresh(tmp_path):
@@ -675,3 +685,52 @@ def test_run_once_net_error_flag_resets_each_call(tmp_path):
     r.last_run_had_net_error = True  # 假装上轮有网络失败
     r.run_once()
     assert r.last_run_had_net_error is False
+
+
+# ---------------- 平仓后余额同步 (吸收充值/提现) ----------------
+
+def _tp_history():
+    return {"BTC-USDT-SWAP": [
+        {"algoId": "A1", "fillPx": "60000", "fillTime": "1751328000000",
+         "reduceOnly": "false", "pnl": "0"},
+        {"algoId": "A1", "fillPx": "59400", "fillTime": "1751331600000",
+         "reduceOnly": "true", "category": "tp", "pnl": "100"},
+    ]}
+
+
+def test_exit_syncs_balance_from_okx_when_flat(tmp_path):
+    """平仓结算后无持仓 → 用 OKX 余额覆盖本地(中途充值 500 被吸收)。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1", side="short", entry_price=60000.0, margin=100.0)
+    # 本地口径 1000+100=1100,但 OKX 上用户充了 500 → 1600
+    okx = FakeOKX(_tp_history(), balance=1600.0)
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert acc.get_balance() == pytest.approx(1600.0)
+
+
+def test_exit_skips_balance_sync_when_position_held(tmp_path):
+    """其它 pair 还有持仓 → OKX eq 含未实现盈亏,不覆盖本地累加值。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1", side="short", entry_price=60000.0, margin=100.0)
+    okx = FakeOKX(_tp_history(), balance=1600.0,
+                  positions=[{"instId": "ETH-USDT-SWAP", "pos": "3"}])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert acc.get_balance() == pytest.approx(1100.0)  # 本地累加 1000+100
+
+
+def test_exit_keeps_local_balance_when_okx_fetch_fails(tmp_path):
+    """get_balance 抛异常 → 沿用本地累加值,不影响结算。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1", side="short", entry_price=60000.0, margin=100.0)
+
+    class BalanceFailOKX(FakeOKX):
+        def get_balance(self, ccy="USDT"):
+            import requests
+            raise requests.ConnectionError("dns failed")
+
+    okx = BalanceFailOKX(_tp_history())
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert acc.get_balance() == pytest.approx(1100.0)

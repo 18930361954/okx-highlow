@@ -237,6 +237,32 @@ class Reconciler:
         if isinstance(exc, requests.RequestException):
             self.last_run_had_net_error = True
 
+    def _sync_balance_after_exit(self) -> None:
+        """平仓结算后把本地余额对齐 OKX 真值,吸收充值/提现等本地感知不到的资金变动。
+        有持仓时跳过(OKX eq 含未实现盈亏,会污染余额);拉取失败沿用本地累加值。
+        """
+        try:
+            for p in self.okx.get_positions():
+                if float(p.get("pos", 0) or 0) != 0:
+                    return
+            okx_bal = float(self.okx.get_balance("USDT"))
+        except Exception as e:
+            self._mark_if_net_error(e)
+            if self.logger:
+                self.logger.warning(f"[balance-sync] 拉取 OKX 余额失败,沿用本地值: {e}")
+            return
+        if okx_bal <= 0:
+            return
+        local = self.account.get_balance()
+        if abs(okx_bal - local) < 0.01:
+            return
+        self.account.set_balance(okx_bal)
+        if self.logger:
+            self.logger.info(
+                f"[balance-sync] 本地 {local:.2f} → OKX {okx_bal:.2f} USDT "
+                f"(差 {okx_bal - local:+.2f}, 含充值/提现等外部变动)"
+            )
+
     def run_once(self) -> int:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
         self.last_run_had_net_error = False
@@ -469,6 +495,7 @@ class Reconciler:
                     except ValueError:
                         exit_dt = None
                     self.account.on_trade_filled(pnl=pnl_net, exit_time=exit_dt)
+                    self._sync_balance_after_exit()
                     processed += 1
 
                     # 日内重挂：只有 SL 平仓 + pair 启用 reentry_floats + attempt<最大 + 当日 UTC 未跨天

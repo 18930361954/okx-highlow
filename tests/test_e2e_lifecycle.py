@@ -46,13 +46,14 @@ class FakeOKX:
         self.history: list[dict] = []
         self.positions: list[dict] = []
         self.next_algo_id = 1000
+        self.balance = 1000.0  # 服务端余额,平仓时随 pnl 变动 (与真实 OKX 一致)
 
     # --- account/leverage ---
     def set_leverage(self, *a, **kw):
         return {"code": "0"}
 
     def get_balance(self, ccy="USDT"):
-        return 1000.0
+        return self.balance
 
     def get_positions(self, instId=None):
         return [p for p in self.positions if not instId or p.get("instId") == instId]
@@ -107,6 +108,7 @@ class FakeOKX:
         })
         self.positions = [p for p in self.positions if p["instId"] != entry["instId"]]
         self.pending = [p for p in self.pending if p["algoId"] != algo_id]
+        self.balance += pnl
 
 
 def _mk_candles_bearish_day(base_ts_ms: int):
@@ -227,6 +229,7 @@ def test_three_consecutive_sl_triggers_cooldown_end_to_end(tmp_path):
         })
         okx.positions = [p for p in okx.positions if p["instId"] != "BTC-USDT-SWAP"]
         okx.pending = [p for p in okx.pending if p["algoId"] != algo_id]
+        okx.balance -= 50.0  # 服务端余额同步扣减,与 pnl 一致
 
         Reconciler(okx, db, account, CONFIG).run_once()
 
