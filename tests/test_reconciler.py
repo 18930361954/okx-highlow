@@ -29,12 +29,15 @@ class FakeOKX:
     def __init__(self, history_by_pair: dict | None = None,
                  pending: list[dict] | None = None,
                  balance: float | None = None,
-                 positions: list[dict] | None = None):
+                 positions: list[dict] | None = None,
+                 pending_orders: list[dict] | None = None):
         self.history_by_pair = history_by_pair or {}
         self.pending = list(pending or [])
         self.balance = balance  # None → get_balance 返 0,余额同步跳过
         self.positions = list(positions or [])
+        self.pending_orders = list(pending_orders or [])  # 普通挂单 (algo 触发后的残单)
         self.cancelled: list[tuple[str, str]] = []
+        self.cancelled_orders: list[tuple[str, str]] = []  # (instId, ordId)
         self.calls = 0
 
     def list_order_history(self, instId=None, state="filled", limit=100):
@@ -54,6 +57,16 @@ class FakeOKX:
 
     def get_balance(self, ccy="USDT"):
         return float(self.balance) if self.balance is not None else 0.0
+
+    def list_pending_orders(self, instType="SWAP", instId=None):
+        return [o for o in self.pending_orders
+                if not instId or o.get("instId") == instId]
+
+    def cancel_order(self, instId, ordId):
+        self.cancelled_orders.append((instId, ordId))
+        self.pending_orders = [o for o in self.pending_orders
+                               if o.get("ordId") != ordId]
+        return {"code": "0"}
 
 
 def _fresh(tmp_path):
@@ -423,6 +436,31 @@ def test_sweep_zombie_open_past_bucket(tmp_path):
     t = db.list_trades(limit=1)[0]
     assert t["exit_reason"] == "ORPHAN"
     assert t["exit_price"] == 0.0
+
+
+def test_orphan_expire_cancels_residual_triggered_order(tmp_path):
+    """2026-07-16 SOL 事故防回归: algo 触发后落地的限价单没成交 → algo 不在
+    trigger pending, db 标 ORPHAN 前必须撤掉盘口上那张残留普通限价单,
+    否则价格回来会以过期信号成交。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="TRIGGERED")  # signal_date=2026-06-30, 桶早过
+    okx = FakeOKX(
+        pending=[],  # algo 已触发 → 不在 trigger pending
+        pending_orders=[
+            # 触发后落地的限价单, 带 algoId 反查回主 algo
+            {"instId": "BTC-USDT-SWAP", "ordId": "ORD_RESIDUAL",
+             "algoId": "TRIGGERED", "state": "live"},
+            # 无关残单 (别的 algoId), 不该被撤
+            {"instId": "BTC-USDT-SWAP", "ordId": "ORD_OTHER",
+             "algoId": "SOMEONE_ELSE", "state": "live"},
+        ],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "ORPHAN"
+    # 残单被精确撤掉, 无关单不动
+    assert okx.cancelled_orders == [("BTC-USDT-SWAP", "ORD_RESIDUAL")]
 
 
 def test_sweep_zombie_open_current_bucket_skips(tmp_path):

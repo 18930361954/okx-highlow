@@ -76,7 +76,8 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
     """按传入的 trades 集合聚合业绩指标, 只统计真实成交(TP/SL/EXIT)。
 
     返回字段:
-      raw: total, wins, losses, sum_win, sum_loss_abs, net_pnl, max_win, max_loss
+      raw: total, wins, losses, sum_win, sum_loss_abs, net_pnl, max_win, max_loss,
+           sum_fee, sum_funding
       derived: win_rate, avg_win, avg_loss, profit_factor, max_dd_pct
     """
     valid = [t for t in trades
@@ -86,6 +87,7 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
         return {"total": 0, "wins": 0, "losses": 0,
                 "sum_win": 0.0, "sum_loss_abs": 0.0, "net_pnl": 0.0,
                 "max_win": 0.0, "max_loss": 0.0,
+                "sum_fee": 0.0, "sum_funding": 0.0,
                 "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
                 "profit_factor": 0.0, "max_dd_pct": 0.0}
 
@@ -94,6 +96,8 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
     net_pnl = sum((t.get("pnl") or 0) for t in valid)
     sum_win = sum((t.get("pnl") or 0) for t in wins)
     sum_loss_abs = sum(abs(t.get("pnl") or 0) for t in losses)
+    sum_fee = sum((t.get("fee") or 0) for t in valid)
+    sum_funding = sum((t.get("funding") or 0) for t in valid)
 
     avg_win = sum_win / len(wins) if wins else 0.0
     avg_loss = sum_loss_abs / len(losses) if losses else 0.0
@@ -135,6 +139,7 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
         "total": total, "wins": len(wins), "losses": len(losses),
         "sum_win": sum_win, "sum_loss_abs": sum_loss_abs, "net_pnl": net_pnl,
         "max_win": max_win, "max_loss": max_loss,
+        "sum_fee": sum_fee, "sum_funding": sum_funding,
         "win_rate": len(wins) / total * 100,
         "avg_win": avg_win, "avg_loss": avg_loss,
         "profit_factor": profit_factor,
@@ -343,6 +348,10 @@ class PositionMonitor:
         total_today_net = sum(a["today_net"] for a in snap)
         total_today_orphan = sum(a.get("today_orphan", 0) for a in snap)
         total_today_cancelled = sum(a.get("today_cancelled", 0) for a in snap)
+        # 累计资金费: 全账户全历史真实成交的 funding 汇总(带符号, 正=收/负=付)
+        total_lifetime_funding = sum(
+            a["lifetime"].get("sum_funding", 0.0) for a in snap
+        )
 
         # === 头部 ===
         header = Table.grid(expand=True)
@@ -357,7 +366,8 @@ class PositionMonitor:
             f"[bold]持仓[/bold] {total_positions}   "
             f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
             f"[bold]手续费[/bold] {total_today_fee:.4f}   "
-            f"[bold]资金费[/bold] {total_today_funding:+.4f}   "
+            f"[bold]今日资金费[/bold] {total_today_funding:+.4f}   "
+            f"[bold]累计资金费[/bold] {total_lifetime_funding:+.4f}   "
             f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}   "
             f"[bold]今日撤单[/bold] {total_today_cancelled}   "
             f"[bold]今日过期[/bold] {total_today_orphan}",

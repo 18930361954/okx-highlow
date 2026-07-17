@@ -318,8 +318,55 @@ class OrderManager:
         )
         return algo_id
 
+    def _cancel_triggered_residuals(self, pair: str | None = None) -> set[str]:
+        """撤「algo 触发后落地却没成交」的普通限价单, 返回被撤单据的 algoId 集合。
+
+        场景:algo trigger 触发 → 落地一张限价入场单; 若限价没成交(价格已走开),
+        这张单会一直挂在 orders-pending 里, 但它已不在 orders-algo-pending(trigger)。
+        daily_cancel 老逻辑只撤 trigger, 漏掉这张 → 价格回来就以过期信号成交
+        (2026-07-16 SOL 事故根因)。
+
+        只撤带 algoId 的残单(即本策略 algo 触发落地的), 不碰手工普通单。
+        list/cancel 失败仅告警, 不阻塞主撤单流程。
+        """
+        cancelled: set[str] = set()
+        try:
+            orders = self.okx.list_pending_orders(instId=pair)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"[cancel] list_pending_orders failed: {e}")
+            return cancelled
+        for o in orders:
+            algo_id = o.get("algoId")
+            inst = o.get("instId")
+            ord_id = o.get("ordId")
+            # 只处理由 algo 触发落地的残单(带 algoId); 手工普通单无 algoId, 不动
+            if not algo_id or algo_id == "0" or not inst or not ord_id:
+                continue
+            try:
+                self.okx.cancel_order(inst, ord_id)
+                cancelled.add(str(algo_id))
+                if self.logger:
+                    self.logger.warning(
+                        f"[cancel] 撤已触发未成交残单 {inst} ordId={ord_id} "
+                        f"algoId={algo_id}(daily_cancel 漏撤兜底)"
+                    )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        f"[cancel] 撤残单 ordId={ord_id} algoId={algo_id} failed: {e}"
+                    )
+        return cancelled
+
     def cancel_all_pending(self, pair: str | None = None) -> int:
-        """撤当前所有未触发 algo 单, 并同步标记 db 里对应的 open trade。返回撤掉的数量。
+        """撤当前所有未触发 algo 单 + 已触发未成交的普通残单, 并同步标记 db 里对应的 open trade。
+        返回撤掉的 algo 数量。
+
+        撤两类:
+          1) 未触发 trigger algo (orders-algo-pending) —— 常规日切撤单。
+          2) algo 触发后落地却没成交的普通限价单 (orders-pending, 带 algoId) ——
+             这类不在 trigger pending 里, 老逻辑漏撤, 会一直挂着以过期信号成交
+             (2026-07-16 SOL 事故根因)。
 
         db 同步:撤单成功的 algoId 对应的 open trade (未 entry_time, 即未成交入场)
         标 exit_reason='CANCELLED' 收干净, 防止 daily_cancel 后 db 里堆积僵尸 open 记录。
@@ -345,6 +392,11 @@ class OrderManager:
             except Exception as e:
                 if self.logger:
                     self.logger.warning(f"cancel {algo_id} failed: {e}")
+
+        # 已触发未成交的普通残单:algo 已触发 → 落地限价单没成交仍挂盘口。
+        # 撤掉并把其 algoId 并入 cancelled_algo_ids, 让下面 db 同步一起收干净。
+        residual = self._cancel_triggered_residuals(pair)
+        cancelled_algo_ids |= residual
 
         # 同步 db:标记对应的未入场 open trade 为 CANCELLED
         if cancelled_algo_ids:

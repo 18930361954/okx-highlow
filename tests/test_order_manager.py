@@ -131,6 +131,30 @@ def test_cancel_all_pending(tmp_path):
     assert okx.cancel_algo_order.call_count == 2
 
 
+def test_cancel_all_pending_cancels_triggered_residual(tmp_path):
+    """2026-07-16 SOL 事故防回归: algo 触发后落地的限价单未成交 → 不在 trigger
+    pending 里, daily_cancel 也必须撤掉它, 且对应 db open trade 标 CANCELLED。"""
+    db = DB(tmp_path / "t.db")
+    db.insert_trade(
+        signal_date="2026-07-16T08:00Z", pair="SOL-USDT-SWAP", side="short",
+        entry_price=76.83, margin=2.55, mode="PCT",
+        okx_order_id="ALGO_TRIGGERED", entry_time=None,
+    )
+    okx = MagicMock()
+    okx.list_pending_algos.return_value = []  # algo 已触发, 不在 trigger pending
+    okx.list_pending_orders.return_value = [
+        # 触发后落地的限价残单, 带 algoId
+        {"instId": "SOL-USDT-SWAP", "ordId": "ORD1", "algoId": "ALGO_TRIGGERED"},
+        # 手工普通单无 algoId → 不该被撤
+        {"instId": "SOL-USDT-SWAP", "ordId": "ORD_MANUAL", "algoId": ""},
+    ]
+    om = OrderManager(okx, db)
+    om.cancel_all_pending()
+    okx.cancel_order.assert_called_once_with("SOL-USDT-SWAP", "ORD1")
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "CANCELLED"
+
+
 def test_cancel_all_pending_syncs_db(tmp_path):
     """2026-07-12 daily_cancel 撤 OKX 后 db 未同步 → 僵尸堆积事故防回归。
     撤单成功后, db 里对应 open trade (无 entry_time) 应被标 CANCELLED。"""

@@ -272,6 +272,23 @@ class OKXClient:
         body = [{"algoId": algoId, "instId": instId}]
         return self._request("POST", "/api/v5/trade/cancel-algos", body=body)
 
+    def list_pending_orders(self, instType: str = "SWAP",
+                            instId: str | None = None) -> list[dict]:
+        """未成交的「普通」订单(非 algo)。
+        algo trigger 触发后落地的入场限价单若未立刻成交,就挂在这里,
+        且带 algoId 字段可反查回主 algo。daily_cancel 只撤未触发 trigger algo,
+        这类「已触发未成交」的残单不在 trigger pending 里 → 需单独撤(SOL 事故根因)。"""
+        params: dict[str, Any] = {"instType": instType}
+        if instId:
+            params["instId"] = instId
+        data = self._request("GET", "/api/v5/trade/orders-pending", params=params)
+        return data.get("data", [])
+
+    def cancel_order(self, instId: str, ordId: str) -> dict:
+        """撤单条普通订单(非 algo)。用于撤 algo 触发后落地却没成交的残留限价单。"""
+        body = {"instId": instId, "ordId": ordId}
+        return self._request("POST", "/api/v5/trade/cancel-order", body=body)
+
     def list_pending_algos(self, instType: str = "SWAP",
                            instId: str | None = None,
                            ordType: str = "trigger") -> list[dict]:

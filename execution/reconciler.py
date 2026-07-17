@@ -748,9 +748,44 @@ class Reconciler:
         window_end = sig_dt + timedelta(seconds=bucket_secs * 2)
         return datetime.now(UTC) >= window_end
 
+    def _cancel_residual_order(self, db_t: dict) -> None:
+        """标 ORPHAN 前, 撤掉该 algo 触发后落地却没成交的普通限价残单。
+
+        场景(2026-07-16 SOL 事故): algo 触发 → 落地限价入场单没成交 → algo 已不在
+        trigger pending, daily_cancel 撤不到; db 标 ORPHAN 后那张限价单仍活在盘口,
+        价格回来就会以过期信号开仓。这里按 algoId 反查 orders-pending 精确撤掉。
+        失败仅告警(daily_cancel 的残单兜底扫描还会再兜一次)。
+        """
+        pair = db_t.get("pair")
+        algo_id = str(db_t.get("okx_order_id") or "")
+        if not pair or not algo_id:
+            return
+        try:
+            for o in self.okx.list_pending_orders(instId=pair):
+                if str(o.get("algoId") or "") != algo_id:
+                    continue
+                ord_id = o.get("ordId")
+                if not ord_id:
+                    continue
+                self.okx.cancel_order(pair, ord_id)
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] trade#{db_t.get('id')} {pair} 标 ORPHAN 前撤掉"
+                        f"已触发未成交残单 ordId={ord_id} algoId={algo_id}"
+                    )
+        except Exception as e:
+            self._mark_if_net_error(e)
+            if self.logger:
+                self.logger.warning(
+                    f"[reconcile] trade#{db_t.get('id')} {pair} 撤残单失败"
+                    f"(daily_cancel 会再兜底): {e}"
+                )
+
     def _expire_as_orphan(self, db_t: dict) -> None:
         """孤儿改绑失败且信号桶已过 → 把 db trade 标 exit_reason=ORPHAN 平掉。
-        pnl=0 fee=0 不影响余额/连亏统计,只是把 open 状态收干净。"""
+        pnl=0 fee=0 不影响余额/连亏统计,只是把 open 状态收干净。
+        先撤掉可能残留的已触发未成交限价单, 防孤儿单继续挂着以过期信号成交。"""
+        self._cancel_residual_order(db_t)
         try:
             self.db.update_trade_exit(
                 trade_id=db_t["id"],
