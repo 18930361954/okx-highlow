@@ -353,7 +353,7 @@ class PositionMonitor:
             a["lifetime"].get("sum_funding", 0.0) for a in snap
         )
 
-        # === 头部 ===
+        # === 头部 (2 行: 第 1 行状态, 第 2 行盈亏/费用统计) ===
         header = Table.grid(expand=True)
         header.add_column(justify="left")
         header.add_column(justify="right")
@@ -364,15 +364,18 @@ class PositionMonitor:
             f"[bold]总余额[/bold] {total_bal:,.2f}   "
             f"[bold]挂单[/bold] {total_pending}   "
             f"[bold]持仓[/bold] {total_positions}   "
-            f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
-            f"[bold]手续费[/bold] {total_today_fee:.4f}   "
-            f"[bold]今日资金费[/bold] {total_today_funding:+.4f}   "
-            f"[bold]累计资金费[/bold] {total_lifetime_funding:+.4f}   "
-            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}   "
             f"[bold]今日撤单[/bold] {total_today_cancelled}   "
             f"[bold]今日过期[/bold] {total_today_orphan}",
             f"[bold]运行[/bold] {uptime}   "
             f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        )
+        header.add_row(
+            f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
+            f"[bold]手续费[/bold] {total_today_fee:.4f}   "
+            f"[bold]今日资金费[/bold] {total_today_funding:+.4f}   "
+            f"[bold]累计资金费[/bold] {total_lifetime_funding:+.4f}   "
+            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}",
+            "",
         )
 
         # === 账户概览 (当前状态 + 全历史业绩合并成一张) ===
