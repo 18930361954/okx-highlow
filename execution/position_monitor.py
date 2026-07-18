@@ -348,18 +348,21 @@ class PositionMonitor:
         total_today_net = sum(a["today_net"] for a in snap)
         total_today_orphan = sum(a.get("today_orphan", 0) for a in snap)
         total_today_cancelled = sum(a.get("today_cancelled", 0) for a in snap)
-        # 累计资金费: 全账户全历史真实成交的 funding 汇总(带符号, 正=收/负=付)
+        # 累计资金费/手续费: 全账户全历史真实成交汇总(资金费带符号, 正=收/负=付)
         total_lifetime_funding = sum(
             a["lifetime"].get("sum_funding", 0.0) for a in snap
         )
+        total_lifetime_fee = sum(
+            a["lifetime"].get("sum_fee", 0.0) for a in snap
+        )
 
-        # === 头部 (2 行: 第 1 行状态, 第 2 行盈亏/费用统计) ===
-        header = Table.grid(expand=True)
-        header.add_column(justify="left")
-        header.add_column(justify="right")
+        # === 头部 (2 行: 第 1 行状态[左]+运行时间[右], 第 2 行盈亏/费用统计独占整行) ===
         now = datetime.now(UTC)
         uptime = _fmt_uptime((now - self._started_at).total_seconds())
-        header.add_row(
+        header_row1 = Table.grid(expand=True)
+        header_row1.add_column(justify="left")
+        header_row1.add_column(justify="right")
+        header_row1.add_row(
             f"[bold]账户[/bold] {len(snap)}   "
             f"[bold]总余额[/bold] {total_bal:,.2f}   "
             f"[bold]挂单[/bold] {total_pending}   "
@@ -369,13 +372,14 @@ class PositionMonitor:
             f"[bold]运行[/bold] {uptime}   "
             f"[bold]now[/bold] {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         )
+        header = Table.grid(expand=True)
+        header.add_column(justify="left")
+        header.add_row(header_row1)
         header.add_row(
             f"[bold]今日名义[/bold] {_fmt2(total_today_pnl)}   "
-            f"[bold]手续费[/bold] {total_today_fee:.4f}   "
-            f"[bold]今日资金费[/bold] {total_today_funding:+.4f}   "
-            f"[bold]累计资金费[/bold] {total_lifetime_funding:+.4f}   "
-            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}",
-            "",
+            f"[bold]手续费(今/累)[/bold] {total_today_fee:.4f}/{total_lifetime_fee:.4f}   "
+            f"[bold]资金费(今/累)[/bold] {total_today_funding:+.4f}/{total_lifetime_funding:+.4f}   "
+            f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}"
         )
 
         # === 账户概览 (当前状态 + 全历史业绩合并成一张) ===
