@@ -71,8 +71,8 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _pairs_with_open_position(okx, logger) -> set[str]:
-    """查该账户 OKX 当前有真实持仓的 pair 集合(pos != 0)。异常返回空 set。"""
+def _pairs_with_open_position(okx, logger) -> set[str] | None:
+    """查该账户 OKX 当前有真实持仓的 pair 集合(pos != 0)。异常返回 None(区分"确认无持仓")。"""
     have: set[str] = set()
     try:
         for p in okx.get_positions():
@@ -83,13 +83,40 @@ def _pairs_with_open_position(okx, logger) -> set[str]:
     except Exception as e:
         if logger:
             logger.warning(f"[skip-check] get_positions 失败,本轮不按持仓跳过: {e}")
+        return None
     return have
+
+
+def _sync_balance_before_place(rt: AccountRuntime, held_pairs: set[str] | None) -> None:
+    """挂单前把本地余额对齐 OKX 真值,吸收充值/提现等人工资金变动。
+    有持仓时跳过(OKX eq 含未实现盈亏,会污染余额);持仓状态未知(None)也跳过;
+    拉取失败沿用本地累加值。复用调用方已查好的 held_pairs,不重复请求 positions。
+    """
+    if held_pairs is None or held_pairs:
+        return
+    logger = rt.logger
+    try:
+        okx_bal = float(rt.okx.get_balance("USDT"))
+    except Exception as e:
+        logger.warning(f"[balance-sync] 挂单前拉取 OKX 余额失败,沿用本地值: {e}")
+        return
+    if okx_bal <= 0:
+        return
+    local = rt.account.get_balance()
+    if abs(okx_bal - local) < 0.01:
+        return
+    rt.account.set_balance(okx_bal)
+    logger.info(
+        f"[balance-sync] 挂单前本地 {local:.2f} → OKX {okx_bal:.2f} USDT "
+        f"(差 {okx_bal - local:+.2f}, 含充值/提现等外部变动)"
+    )
 
 
 def bucket_signal_and_place(rt: AccountRuntime) -> None:
     """信号桶触发 (per-account):在每个信号桶起始时刻拉「上一桶」K,生成信号,下单。
     信号周期由 rt.strategy.signal_bar 决定 (1D/12H/6H/4H/2H/1H)。
     挂单前查 OKX 持仓,有持仓则跳过;平仓后由 Reconciler._catchup_after_exit 补挂。
+    挂单前先做一次余额对齐(无持仓时),让充值/提现立刻反映到保证金计算。
     """
     logger = rt.logger
     now = utc_now()
@@ -103,13 +130,14 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
         logger.warning(f"[skip] cannot trade: {reason}")
         return
 
+    held_pairs = _pairs_with_open_position(rt.okx, logger)
+    _sync_balance_before_place(rt, held_pairs)
     bal = rt.account.get_balance()
     place_gap_sec = float(rt.cfg.strategy_config.get("place_gap_sec", 1.0))
     placed_count = 0
-    held_pairs = _pairs_with_open_position(rt.okx, logger)
 
     for pair in rt.cfg.pairs:
-        if pair in held_pairs:
+        if held_pairs and pair in held_pairs:
             logger.info(f"[skip] {pair}: 当前有持仓,暂不挂单(平仓后由对账器补挂)")
             continue
 
