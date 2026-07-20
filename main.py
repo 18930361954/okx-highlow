@@ -89,14 +89,14 @@ def _pairs_with_open_position(okx, logger) -> set[str] | None:
 
 def _sync_balance_before_place(rt: AccountRuntime, held_pairs: set[str] | None) -> None:
     """挂单前把本地余额对齐 OKX 真值,吸收充值/提现等人工资金变动。
-    有持仓时跳过(OKX eq 含未实现盈亏,会污染余额);持仓状态未知(None)也跳过;
-    拉取失败沿用本地累加值。复用调用方已查好的 held_pairs,不重复请求 positions。
+    用 cashBal(现金余额,不含未实现盈亏),有持仓也能安全同步。
+    持仓状态未知(None, 查询失败)时跳过;拉取失败沿用本地累加值。
     """
-    if held_pairs is None or held_pairs:
+    if held_pairs is None:
         return
     logger = rt.logger
     try:
-        okx_bal = float(rt.okx.get_balance("USDT"))
+        okx_bal = float(rt.okx.get_cash_balance("USDT"))
     except Exception as e:
         logger.warning(f"[balance-sync] 挂单前拉取 OKX 余额失败,沿用本地值: {e}")
         return

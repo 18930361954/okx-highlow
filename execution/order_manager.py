@@ -229,10 +229,16 @@ class OrderManager:
                               max_contracts=max_contracts)
 
         # 触发后的限价价格：稍微放宽 SLIP_PCT 保证能成交，但仍是限价不是市价。
+        # TP/SL 同样穿价偏移: 挂在触发价上会出现"最新价碰到触发价即回落,限价单不成交,
+        # 仓位挂着裸奔"(2026-07-20 ETH 止盈触发未成交事故)。偏移后触发瞬间即 marketable。
         if direction == "long":
             order_px = round(entry_price * (1 + SLIP_PCT), 6)
+            tp_ord_px = round(tp_price * (1 - SLIP_PCT), 6)   # 卖出平多: 向下穿价
+            sl_ord_px = round(sl_price * (1 - SLIP_PCT), 6)
         else:
             order_px = round(entry_price * (1 - SLIP_PCT), 6)
+            tp_ord_px = round(tp_price * (1 + SLIP_PCT), 6)   # 买入平空: 向上穿价
+            sl_ord_px = round(sl_price * (1 + SLIP_PCT), 6)
 
         # 幂等键: pair + signal_id + direction + attempt 唯一。
         # OKX 限制 [A-Za-z0-9_-.]{1,32}。sig_id 可能是 '2026-07-08' 或 '2026-07-08T04:00Z'
@@ -264,9 +270,9 @@ class OrderManager:
                 triggerPxType="last",
                 posSide=pos_side,
                 tpTriggerPx=str(tp_price),
-                tpOrdPx=str(tp_price),            # TP 限价
+                tpOrdPx=str(tp_ord_px),           # TP 限价, 穿价偏移保成交
                 slTriggerPx=str(sl_price),
-                slOrdPx=str(sl_price),            # SL 限价
+                slOrdPx=str(sl_ord_px),           # SL 限价, 穿价偏移保成交
                 algoClOrdId=algo_cl_ord_id,
             )
         except Exception as e:
@@ -342,6 +348,10 @@ class OrderManager:
             ord_id = o.get("ordId")
             # 只处理由 algo 触发落地的残单(带 algoId); 手工普通单无 algoId, 不动
             if not algo_id or algo_id == "0" or not inst or not ord_id:
+                continue
+            # 平仓单(reduceOnly=true, TP/SL 触发落地)绝不能撤: 仓位还开着,
+            # 撤掉等于让活仓裸奔(2026-07-20 ETH 止盈单被误撤事故)。只撤入场残单。
+            if str(o.get("reduceOnly", "")).lower() == "true":
                 continue
             try:
                 self.okx.cancel_order(inst, ord_id)

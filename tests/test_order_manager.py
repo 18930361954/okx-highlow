@@ -56,13 +56,16 @@ def test_place_algo_orders_uses_limit_not_market(tmp_path):
     expected = round(105341.0 * (1 + SLIP_PCT), 6)
     assert abs(float(kwargs["orderPx"]) - expected) < 1e-3
 
-    # TP/SL 都是限价，价格 = trigger 价
+    # TP/SL 都是限价、带穿价偏移 (触发瞬间 marketable, 防"触发后不成交裸奔"):
+    # long 平仓是卖出 → 挂单价在触发价下方 SLIP_PCT
     assert kwargs["tpOrdPx"] != "-1"
     assert kwargs["slOrdPx"] != "-1"
-    assert kwargs["tpOrdPx"] == "106605.0"
     assert kwargs["tpTriggerPx"] == "106605.0"
-    assert kwargs["slOrdPx"] == "104814.0"
     assert kwargs["slTriggerPx"] == "104814.0"
+    assert abs(float(kwargs["tpOrdPx"]) - 106605.0 * (1 - SLIP_PCT)) < 1e-3
+    assert abs(float(kwargs["slOrdPx"]) - 104814.0 * (1 - SLIP_PCT)) < 1e-3
+    assert float(kwargs["tpOrdPx"]) < 106605.0
+    assert float(kwargs["slOrdPx"]) < 104814.0
 
 
 def test_short_orderPx_slips_below_entry(tmp_path):
@@ -83,6 +86,11 @@ def test_short_orderPx_slips_below_entry(tmp_path):
     assert float(kwargs["orderPx"]) < 3500.0  # short 是下方限价
     expected = round(3500.0 * (1 - SLIP_PCT), 6)
     assert abs(float(kwargs["orderPx"]) - expected) < 1e-3
+    # short 平仓是买入 → TP/SL 挂单价在触发价上方 SLIP_PCT (穿价保成交)
+    assert float(kwargs["tpOrdPx"]) > 3458.0
+    assert float(kwargs["slOrdPx"]) > 3517.5
+    assert abs(float(kwargs["tpOrdPx"]) - 3458.0 * (1 + SLIP_PCT)) < 1e-3
+    assert abs(float(kwargs["slOrdPx"]) - 3517.5 * (1 + SLIP_PCT)) < 1e-3
 
 
 def test_set_leverage_called_with_cross_mode_no_posSide(tmp_path):
@@ -153,6 +161,25 @@ def test_cancel_all_pending_cancels_triggered_residual(tmp_path):
     okx.cancel_order.assert_called_once_with("SOL-USDT-SWAP", "ORD1")
     t = db.list_trades(limit=1)[0]
     assert t["exit_reason"] == "CANCELLED"
+
+
+def test_cancel_all_pending_never_cancels_reduce_only(tmp_path):
+    """2026-07-20 ETH 事故防回归: TP/SL 触发落地的平仓限价单 (reduceOnly=true)
+    绝不能被残单兜底撤掉 —— 仓位还开着, 撤掉平仓单等于让活仓裸奔。"""
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.list_pending_algos.return_value = []
+    okx.list_pending_orders.return_value = [
+        # TP 触发后落地的平仓限价单: reduceOnly=true, 带 algoId (OCO 生成)
+        {"instId": "ETH-USDT-SWAP", "ordId": "ORD_TP", "algoId": "OCO_ALGO",
+         "reduceOnly": "true"},
+        # 入场残单: reduceOnly=false → 该撤
+        {"instId": "ETH-USDT-SWAP", "ordId": "ORD_ENTRY", "algoId": "TRIG_ALGO",
+         "reduceOnly": "false"},
+    ]
+    om = OrderManager(okx, db)
+    om.cancel_all_pending()
+    okx.cancel_order.assert_called_once_with("ETH-USDT-SWAP", "ORD_ENTRY")
 
 
 def test_cancel_all_pending_syncs_db(tmp_path):

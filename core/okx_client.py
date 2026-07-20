@@ -189,6 +189,18 @@ class OKXClient:
                 return float(d.get("eq", 0) or 0)
         return float(rows[0].get("totalEq", 0) or 0)
 
+    def get_cash_balance(self, ccy: str = "USDT") -> float:
+        """现金余额 cashBal(不含未实现盈亏)。有持仓时同步本地余额也安全 ——
+        eq 含 upl 会把浮盈亏污染进本地余额, cashBal 不会。"""
+        data = self._request("GET", "/api/v5/account/balance", params={"ccy": ccy})
+        rows = data.get("data", [])
+        if not rows:
+            return 0.0
+        for d in rows[0].get("details", []):
+            if d.get("ccy") == ccy:
+                return float(d.get("cashBal", 0) or 0)
+        return 0.0
+
     def get_positions(self, instId: str | None = None) -> list[dict]:
         params = {"instType": "SWAP"}
         if instId:

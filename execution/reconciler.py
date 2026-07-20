@@ -239,13 +239,12 @@ class Reconciler:
 
     def _sync_balance_after_exit(self) -> None:
         """平仓结算后把本地余额对齐 OKX 真值,吸收充值/提现等本地感知不到的资金变动。
-        有持仓时跳过(OKX eq 含未实现盈亏,会污染余额);拉取失败沿用本地累加值。
+        用 cashBal(现金余额,不含未实现盈亏),有持仓也能安全同步 ——
+        旧逻辑用 eq 且有持仓时跳过,导致某账户长期持仓时余额一直不更新(2026-07-20 反馈)。
+        拉取失败沿用本地累加值。
         """
         try:
-            for p in self.okx.get_positions():
-                if float(p.get("pos", 0) or 0) != 0:
-                    return
-            okx_bal = float(self.okx.get_balance("USDT"))
+            okx_bal = float(self.okx.get_cash_balance("USDT"))
         except Exception as e:
             self._mark_if_net_error(e)
             if self.logger:
@@ -763,6 +762,9 @@ class Reconciler:
         try:
             for o in self.okx.list_pending_orders(instId=pair):
                 if str(o.get("algoId") or "") != algo_id:
+                    continue
+                # 平仓单(reduceOnly)不撤: 活仓的 TP/SL 落地单, 撤了仓位裸奔
+                if str(o.get("reduceOnly", "")).lower() == "true":
                     continue
                 ord_id = o.get("ordId")
                 if not ord_id:

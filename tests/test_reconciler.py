@@ -58,6 +58,10 @@ class FakeOKX:
     def get_balance(self, ccy="USDT"):
         return float(self.balance) if self.balance is not None else 0.0
 
+    def get_cash_balance(self, ccy="USDT"):
+        # 测试里 balance 即现金余额 (fake 不区分 eq/cashBal)
+        return float(self.balance) if self.balance is not None else 0.0
+
     def list_pending_orders(self, instType="SWAP", instId=None):
         return [o for o in self.pending_orders
                 if not instId or o.get("instId") == instId]
@@ -747,15 +751,16 @@ def test_exit_syncs_balance_from_okx_when_flat(tmp_path):
     assert acc.get_balance() == pytest.approx(1600.0)
 
 
-def test_exit_skips_balance_sync_when_position_held(tmp_path):
-    """其它 pair 还有持仓 → OKX eq 含未实现盈亏,不覆盖本地累加值。"""
+def test_exit_syncs_balance_even_when_position_held(tmp_path):
+    """其它 pair 有持仓也同步: cashBal 不含未实现盈亏, 持仓不再阻塞余额更新
+    (2026-07-20 反馈: 账户长期持仓导致余额一直不同步, 看着有歧义)。"""
     db, acc = _fresh(tmp_path)
     _mk_open_trade(db, algo_id="A1", side="short", entry_price=60000.0, margin=100.0)
     okx = FakeOKX(_tp_history(), balance=1600.0,
                   positions=[{"instId": "ETH-USDT-SWAP", "pos": "3"}])
     r = Reconciler(okx, db, acc, CONFIG)
     r.run_once()
-    assert acc.get_balance() == pytest.approx(1100.0)  # 本地累加 1000+100
+    assert acc.get_balance() == pytest.approx(1600.0)  # cashBal 直接对齐
 
 
 def test_exit_keeps_local_balance_when_okx_fetch_fails(tmp_path):
@@ -765,6 +770,10 @@ def test_exit_keeps_local_balance_when_okx_fetch_fails(tmp_path):
 
     class BalanceFailOKX(FakeOKX):
         def get_balance(self, ccy="USDT"):
+            import requests
+            raise requests.ConnectionError("dns failed")
+
+        def get_cash_balance(self, ccy="USDT"):
             import requests
             raise requests.ConnectionError("dns failed")
 

@@ -55,6 +55,9 @@ class FakeOKX:
     def get_balance(self, ccy="USDT"):
         return self.balance
 
+    def get_cash_balance(self, ccy="USDT"):
+        return self.balance
+
     def get_positions(self, instId=None):
         return [p for p in self.positions if not instId or p.get("instId") == instId]
 
