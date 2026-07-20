@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS state (
 _INDEX_TRADES_DATE = "CREATE INDEX IF NOT EXISTS idx_trades_signal_date ON trades(signal_date);"
 _INDEX_TRADES_PAIR = "CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair);"
 _INDEX_TRADES_ACC = "CREATE INDEX IF NOT EXISTS idx_trades_account ON trades(account);"
+# 同账户同 algoId 只允许一条 trade: 防 clOrdId 回查兜底把已入库的 algoId 二次 insert
+# (2026-07-20 ETH 重复入库事故: catchup 补挂与整点 cron 相差 20s 竞态, 同单双录 → pnl 双记)
+_INDEX_TRADES_ACC_ALGO_UNIQUE = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_acc_algo_uniq "
+    "ON trades(account, okx_order_id) WHERE okx_order_id IS NOT NULL;"
+)
 
 
 class DB:
@@ -99,6 +105,13 @@ class DB:
             c.execute(_INDEX_TRADES_DATE)
             c.execute(_INDEX_TRADES_PAIR)
             c.execute(_INDEX_TRADES_ACC)
+            try:
+                c.execute(_INDEX_TRADES_ACC_ALGO_UNIQUE)
+            except sqlite3.IntegrityError:
+                # 老库存在历史重复 (account, okx_order_id) 时建唯一索引会失败。
+                # 不阻塞启动: 无索引时 insert_trade 退化为无幂等保护(与旧版一致),
+                # 清理重复后下次启动自动建上。清理: scripts/fix_orphan_trades.py 或手工去重。
+                pass
 
     def insert_trade(
         self,
@@ -118,15 +131,27 @@ class DB:
         account: str = DEFAULT_ACCOUNT,
     ) -> int:
         with self._conn() as c:
-            cur = c.execute(
-                """INSERT INTO trades
-                (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
-                 margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
-                 margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
-            )
-            return int(cur.lastrowid)
+            try:
+                cur = c.execute(
+                    """INSERT INTO trades
+                    (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                     margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                     margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
+                )
+                return int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                # 幂等: 同 (account, okx_order_id) 已有记录 → 返回已存在的 id, 不重复入库。
+                # 场景: place 用同 clOrdId 幂等键重挂时 OKX 返回同一 algoId
+                # (catchup 补挂 vs 整点 cron 竞态, 2026-07-20 ETH 双录事故)
+                row = c.execute(
+                    "SELECT id FROM trades WHERE account=? AND okx_order_id=?",
+                    (account, okx_order_id),
+                ).fetchone()
+                if row:
+                    return int(row["id"])
+                raise
 
     def update_trade_exit(
         self,

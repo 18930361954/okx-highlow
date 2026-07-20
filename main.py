@@ -136,7 +136,20 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
     place_gap_sec = float(rt.cfg.strategy_config.get("place_gap_sec", 1.0))
     placed_count = 0
 
+    # 本桶已有 db 记录的 pair 不再挂: catchup-exit 可能比整点 cron 早 ~20s 挂过
+    # 同信号(2026-07-20 ETH 双录竞态)。OKX clOrdId 幂等 + db 唯一索引是兜底,
+    # 这里从源头跳过重复挂单。
+    try:
+        placed_pairs = {t["pair"] for t in
+                        rt.db.list_trades_by_date(sig_id, account=rt.name)}
+    except Exception as e:
+        logger.warning(f"[skip-check] list_trades_by_date 失败,不按 db 跳过: {e}")
+        placed_pairs = set()
+
     for pair in rt.cfg.pairs:
+        if pair in placed_pairs:
+            logger.info(f"[skip] {pair}: 本桶 {sig_id} db 已有记录(catchup 已挂),跳过")
+            continue
         if held_pairs and pair in held_pairs:
             logger.info(f"[skip] {pair}: 当前有持仓,暂不挂单(平仓后由对账器补挂)")
             continue
@@ -277,7 +290,7 @@ def startup_catchup_if_needed(rt: AccountRuntime) -> None:
 def init_balance_if_needed(rt: AccountRuntime) -> None:
     if rt.account.get_balance() <= 0:
         try:
-            bal = rt.okx.get_balance("USDT")
+            bal = rt.okx.get_cash_balance("USDT")
             rt.account.set_balance(bal)
             rt.logger.info(f"[init] balance bootstrapped from OKX: {bal:.2f} USDT")
         except Exception as e:
