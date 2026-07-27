@@ -60,7 +60,7 @@ accounts:
   # ==================== 实盘账户 ====================
   # 「4H 三币组合」— 每天 6 次挂单
   - account_name: 初级炼气士-实盘
-    enabled: true                     # ← 实盘运行中
+    enabled: false                    # ← 2026-07-27 停: 三账户合计-46%, 随2/3号触硬停线一并关停
     api_key: abf7c8b5-a75d-4470-866f-52b53bb14a86
     secret_key: 0B7B65EF1A008BDD965F2C85DDA652B0
     passphrase: Zdx19971226@@
@@ -74,7 +74,7 @@ accounts:
 
   # 「6H 三币组合」— 每天 4 次挂单
   - account_name: 初级炼气士2-实盘
-    enabled: true                     # ← 实盘运行中
+    enabled: false                    # ← 2026-07-27 停: 余额11U 击穿25U硬停线(-78%)
     api_key: 7ff7534b-0975-43e7-88d1-13642a3c8391
     secret_key: ADAFDBEDAA3F4AEFDBAEFB965B75E215
     passphrase: Zdx19971226@@
@@ -88,7 +88,7 @@ accounts:
 
   # 「12H 三币组合」— 每天 2 次挂单
   - account_name: 初级炼气士3-实盘
-    enabled: true                     # ← 实盘运行中
+    enabled: false                    # ← 2026-07-27 停: 余额27.6U 距硬停线仅2.5U, 提前关停
     api_key: 8725f04a-af67-4fb8-aad2-ae62e8cf8ce7
     secret_key: 044B421FB88EBC5DDBFE291A3F6BACC9
     passphrase: Zdx19971226@@
@@ -100,43 +100,45 @@ accounts:
         ETH-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.008, sl_pct: 0.020 }
         SOL-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.010, sl_pct: 0.020 }
 
-  # ==================== 模拟盘账户 (镜像实盘参数) ====================
-  # 模拟盘 SOL 100x 会被 OKX 拒(59102),覆盖到 50x 保证 set_leverage 成功
+  # ==================== 模拟盘账户 (2026-07-27 换研究推荐参数, 见 docs/strategy_research_2026-07.md) ====================
+  # 纯 trend 过渡配置: fade/reversal/SOL 腿待开发后再加。SOL 单向策略验证全灭, 停跑。
+  # 「6H 主攻」— BTC/ETH 6H trend (34 幸存策略中 6H 最优组)
   - account_name: 初级炼气士-模拟
-    enabled: false                    # ← 已切实盘, 模拟盘禁用
+    enabled: true                     # ← 模拟盘验证新参数中
     api_key: e5b77589-31a3-456b-8900-834de01fef45
     secret_key: 10930BAADD1DFB4C324A9066A2BC4CC1
     passphrase: Zdx19971226@@
     env_adapt: demo
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
     strategy:
-      signal_bar: 4H
+      signal_bar: 6H
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020 }
-        ETH-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.006, sl_pct: 0.020 }
-        SOL-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.020, leverage: 50 }
+        BTC-USDT-SWAP: { float_pct: 0.007, tp_pct: 0.008, sl_pct: 0.030 }
+        ETH-USDT-SWAP: { float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.030 }
 
+  # 「1D 防御」— BTC/ETH 1D trend 宽 float 族 (f=1.0%, 高胜率低回撤, 30bp 滑点鲁棒性最好)
   - account_name: 初级炼气士2-模拟
-    enabled: false                    # ← 已切实盘, 模拟盘禁用
+    enabled: true                     # ← 模拟盘验证新参数中
     api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
     secret_key: 92BBD3C260D31827F0AA39BA0ABFFD56
     passphrase: Zdx19971226@@
     env_adapt: demo
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
     strategy:
-      signal_bar: 6H
+      signal_bar: 1D
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.010, sl_pct: 0.020 }
-        ETH-USDT-SWAP: { float_pct: 0.005, tp_pct: 0.010, sl_pct: 0.015 }
-        SOL-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.015, sl_pct: 0.020, leverage: 50 }
+        BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
+        ETH-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.006, sl_pct: 0.030 }
 
+  # 「12H BTC 单腿」— 12H 周期仅 BTC trend 过验证 (ETH 12H 需 reversal 模式, 待开发)
   - account_name: 初级炼气士3-模拟
-    enabled: false                    # ← 已切实盘, 模拟盘禁用
+    enabled: true                     # ← 模拟盘验证新参数中
     api_key: fbdcc756-3241-4560-9540-6476c96f2548
     secret_key: F92BE16A31E148D3D52FC9E6832A7489
     passphrase: Zdx19971226@@
     env_adapt: demo
+    pairs: [BTC-USDT-SWAP]
     strategy:
       signal_bar: 12H
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.020 }
-        ETH-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.008, sl_pct: 0.020 }
-        SOL-USDT-SWAP: { float_pct: 0.004, tp_pct: 0.010, sl_pct: 0.020, leverage: 50 }
+        BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.015 }

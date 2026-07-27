@@ -1,0 +1,44 @@
+{
+ "A: 6H trend BTC+ETH": {
+  "final": 422821.1,
+  "total_return_pct": 285589.9,
+  "trades": 1034,
+  "win_rate_pct": 82.1,
+  "max_dd_pct": 30.2,
+  "profit_factor": 2.98,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 10.62,
+  "y2024_pnl_pct": 61187.4,
+  "y2025_pnl_pct": 199.6,
+  "y2026_pnl_pct": 55.6
+ },
+ "B: 6H fade SOL+ETH": {
+  "final": 1377346.61,
+  "total_return_pct": 930539.6,
+  "trades": 2765,
+  "win_rate_pct": 80.4,
+  "max_dd_pct": 59.0,
+  "profit_factor": 2.34,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 6.35,
+  "y2024_pnl_pct": 289869.0,
+  "y2025_pnl_pct": 152.0,
+  "y2026_pnl_pct": 27.4
+ },
+ "C: 1D trend BTC+ETH (·ÀÓù)": {
+  "final": 62799.01,
+  "total_return_pct": 42331.8,
+  "trades": 272,
+  "win_rate_pct": 90.4,
+  "max_dd_pct": 49.5,
+  "profit_factor": 3.92,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 15.41,
+  "y2024_pnl_pct": 306.0,
+  "y2025_pnl_pct": 3877.6,
+  "y2026_pnl_pct": 162.7
+ }
+}

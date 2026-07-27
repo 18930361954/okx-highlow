@@ -1,0 +1,128 @@
+{
+ "A-6H主攻(trend×2+fade SOL)": {
+  "initial": 148,
+  "final": 1229093.69,
+  "net_profit": 1228945.69,
+  "total_return_pct": 830368.7,
+  "trades": 2353,
+  "win_rate_pct": 82.4,
+  "max_dd_pct": 60.4,
+  "profit_factor": 2.86,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 8.47,
+  "per_pair": {
+   "SOL-USDT-SWAP": {
+    "n": 1319,
+    "pnl": 764014.86,
+    "win_rate": 82.7,
+    "fee": 189191.62
+   },
+   "ETH-USDT-SWAP": {
+    "n": 693,
+    "pnl": 311256.9,
+    "win_rate": 82.7,
+    "fee": 98863.64
+   },
+   "BTC-USDT-SWAP": {
+    "n": 341,
+    "pnl": 153673.93,
+    "win_rate": 80.9,
+    "fee": 48765.11
+   }
+  },
+  "y2024_end": 374766.02,
+  "y2024_pnl_usdt": 374618.02,
+  "y2024_pnl_pct": 253120.3,
+  "y2025_end": 918125.97,
+  "y2025_pnl_usdt": 543359.95,
+  "y2025_pnl_pct": 145.0,
+  "y2026_end": 1229093.69,
+  "y2026_pnl_usdt": 310967.72,
+  "y2026_pnl_pct": 33.9
+ },
+ "B-混周期fade(1D BTC+4H ETH+6H SOL)": {
+  "initial": 148,
+  "final": 1383368.44,
+  "net_profit": 1383220.44,
+  "total_return_pct": 934608.4,
+  "trades": 3361,
+  "win_rate_pct": 80.3,
+  "max_dd_pct": 29.6,
+  "profit_factor": 2.25,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 4.56,
+  "per_pair": {
+   "SOL-USDT-SWAP": {
+    "n": 1886,
+    "pnl": 805357.22,
+    "win_rate": 84.5,
+    "fee": 274425.17
+   },
+   "BTC-USDT-SWAP": {
+    "n": 121,
+    "pnl": 62355.51,
+    "win_rate": 84.3,
+    "fee": 17830.4
+   },
+   "ETH-USDT-SWAP": {
+    "n": 1354,
+    "pnl": 515507.71,
+    "win_rate": 74.2,
+    "fee": 198427.06
+   }
+  },
+  "y2024_end": 391059.48,
+  "y2024_pnl_usdt": 390911.48,
+  "y2024_pnl_pct": 264129.4,
+  "y2025_end": 1067262.31,
+  "y2025_pnl_usdt": 676202.83,
+  "y2025_pnl_pct": 172.9,
+  "y2026_end": 1383368.44,
+  "y2026_pnl_usdt": 316106.13,
+  "y2026_pnl_pct": 29.6
+ },
+ "C-防御(1D BTC+12H ETH rev+6H SOL高胜率)": {
+  "initial": 148,
+  "final": 904891.54,
+  "net_profit": 904743.54,
+  "total_return_pct": 611313.2,
+  "trades": 2531,
+  "win_rate_pct": 90.7,
+  "max_dd_pct": 45.5,
+  "profit_factor": 2.64,
+  "liquidated": false,
+  "liq_time": "",
+  "min_equity_mmr_ratio": 9.03,
+  "per_pair": {
+   "SOL-USDT-SWAP": {
+    "n": 1886,
+    "pnl": 635429.85,
+    "win_rate": 91.8,
+    "fee": 269347.41
+   },
+   "ETH-USDT-SWAP": {
+    "n": 524,
+    "pnl": 208549.65,
+    "win_rate": 88.4,
+    "fee": 75280.76
+   },
+   "BTC-USDT-SWAP": {
+    "n": 121,
+    "pnl": 60764.04,
+    "win_rate": 84.3,
+    "fee": 17481.77
+   }
+  },
+  "y2024_end": 247681.79,
+  "y2024_pnl_usdt": 247533.79,
+  "y2024_pnl_pct": 167252.6,
+  "y2025_end": 674278.69,
+  "y2025_pnl_usdt": 426596.91,
+  "y2025_pnl_pct": 172.2,
+  "y2026_end": 904891.54,
+  "y2026_pnl_usdt": 230612.85,
+  "y2026_pnl_pct": 34.2
+ }
+}
