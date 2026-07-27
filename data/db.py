@@ -11,6 +11,7 @@ _SCHEMA_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account TEXT NOT NULL DEFAULT 'default',
+    strategy TEXT,               -- 策略版本名(如 v1-highlow / v2-trend),同账户换策略后数据互不混淆
     signal_date TEXT NOT NULL,
     pair TEXT NOT NULL,
     side TEXT NOT NULL,
@@ -87,6 +88,10 @@ class DB:
             # 避免本地 net + fee - funding 反推带来的浮点/舍入不一致 (与 OKX 界面对不上)。
             if "pnl_gross" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN pnl_gross REAL DEFAULT 0.0")
+            # strategy 列(策略版本名): 换策略后新旧数据按名字区分。
+            # 历史数据回填 (v1-highlow / v2-trend) 已于 2026-07-27 一次性完成, 这里只补列。
+            if "strategy" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -129,15 +134,16 @@ class DB:
         okx_order_id: str | None = None,
         attempt: int = 1,
         account: str = DEFAULT_ACCOUNT,
+        strategy: str | None = None,
     ) -> int:
         with self._conn() as c:
             try:
                 cur = c.execute(
                     """INSERT INTO trades
-                    (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    (account, strategy, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (account, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (account, strategy, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
                 )
                 return int(cur.lastrowid)
@@ -235,33 +241,35 @@ class DB:
             )
 
     def list_trades_by_date(self, signal_date: str,
-                             account: str | None = None) -> list[dict]:
-        """account=None 时全账户;否则按账户过滤。"""
+                             account: str | None = None,
+                             strategy: str | None = None) -> list[dict]:
+        """account=None 时全账户;否则按账户过滤。strategy 同理(None=不过滤)。"""
         with self._conn() as c:
-            if account is None:
-                rows = c.execute(
-                    "SELECT * FROM trades WHERE signal_date=? ORDER BY id",
-                    (signal_date,),
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT * FROM trades WHERE signal_date=? AND account=? ORDER BY id",
-                    (signal_date, account),
-                ).fetchall()
+            sql = "SELECT * FROM trades WHERE signal_date=?"
+            vals: list[Any] = [signal_date]
+            if account is not None:
+                sql += " AND account=?"; vals.append(account)
+            if strategy is not None:
+                sql += " AND strategy=?"; vals.append(strategy)
+            rows = c.execute(sql + " ORDER BY id", vals).fetchall()
             return [dict(r) for r in rows]
 
     def list_trades(self, limit: int = 100,
-                    account: str | None = None) -> list[dict]:
+                    account: str | None = None,
+                    strategy: str | None = None) -> list[dict]:
         with self._conn() as c:
-            if account is None:
-                rows = c.execute(
-                    "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT * FROM trades WHERE account=? ORDER BY id DESC LIMIT ?",
-                    (account, limit),
-                ).fetchall()
+            sql = "SELECT * FROM trades"
+            conds: list[str] = []
+            vals: list[Any] = []
+            if account is not None:
+                conds.append("account=?"); vals.append(account)
+            if strategy is not None:
+                conds.append("strategy=?"); vals.append(strategy)
+            if conds:
+                sql += " WHERE " + " AND ".join(conds)
+            sql += " ORDER BY id DESC LIMIT ?"
+            vals.append(limit)
+            rows = c.execute(sql, vals).fetchall()
             return [dict(r) for r in rows]
 
     def list_accounts(self) -> list[str]:

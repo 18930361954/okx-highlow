@@ -119,6 +119,7 @@ class AccountConfig:
     strategy_config: dict                        # 已合并到顶层 strategy 层级
     system_config: dict
     proxy_url: str | None
+    strategy_name: str | None = None             # 策略版本名(写进 trades.strategy 列)
 
     def to_legacy_config(self) -> dict:
         """AccountState/HighLowStrategy 仍吃老结构 {'strategy':..., 'system':..., 'account':...}。"""
@@ -168,13 +169,17 @@ def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
     td_mode = str(raw.get("td_mode") or top_cfg.get("account", {}).get("td_mode") or "cross")
     system_cfg = dict(top_cfg.get("system") or {})
     proxy_url = _resolve_proxy_url(top_cfg)
+    # 策略版本名: 账户级 strategy_name 优先,缺省用顶层 strategy.strategy_name
+    strategy_name = raw.get("strategy_name") or merged_strategy.get("strategy_name") or None
+    if strategy_name is not None:
+        strategy_name = str(strategy_name)
 
     return AccountConfig(
         name=name, enabled=enabled, env=env,
         api_key=api_key, secret_key=secret_key, passphrase=passphrase,
         pairs=pairs, td_mode=td_mode,
         strategy_config=merged_strategy, system_config=system_cfg,
-        proxy_url=proxy_url,
+        proxy_url=proxy_url, strategy_name=strategy_name,
     )
 
 
@@ -264,7 +269,8 @@ def build_runtime(cfg: AccountConfig, db: DB, base_logger) -> AccountRuntime:
     legacy_cfg = cfg.to_legacy_config()
     account = AccountState(db, legacy_cfg, logger=logger, account=cfg.name)
     strategy = HighLowStrategy(legacy_cfg, logger=logger)
-    order_mgr = OrderManager(okx, db, logger=logger, td_mode=cfg.td_mode, account=cfg.name)
+    order_mgr = OrderManager(okx, db, logger=logger, td_mode=cfg.td_mode, account=cfg.name,
+                             strategy=cfg.strategy_name)
     reconciler = Reconciler(
         okx, db, account, legacy_cfg, logger=logger,
         strategy=strategy, order_manager=order_mgr,

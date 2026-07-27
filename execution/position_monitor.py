@@ -244,13 +244,15 @@ class PositionMonitor:
     # ---------- 累计业绩: 缓存 30s 防止每 5s 全表扫 ----------
 
     def _valid_trades_for(self, rt) -> list[dict]:
-        """拿该账户全历史"真实成交" trades (TP/SL/EXIT)。30s 缓存。"""
+        """拿该账户当前策略的全历史"真实成交" trades (TP/SL/EXIT)。30s 缓存。
+        配置了 strategy_name 时只看该策略的数据, 换策略后旧策略盈亏不混入。"""
         now_ms = int(time.time() * 1000)
         cached = self._lifetime_cache.get(rt.name)
         if cached and cached[0] > now_ms:
             return cached[1]
+        strat = getattr(getattr(rt, "cfg", None), "strategy_name", None)
         try:
-            rows = rt.db.list_trades(limit=100_000, account=rt.name)
+            rows = rt.db.list_trades(limit=100_000, account=rt.name, strategy=strat)
         except Exception:
             rows = []
         valid = [r for r in rows
@@ -288,7 +290,8 @@ class PositionMonitor:
             # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
             # 但 ORPHAN / CANCELLED 计数单独统计, 供面板做"对账器 housekeeping"可视化
             try:
-                all_rows = rt.db.list_trades(limit=500, account=rt.name)
+                strat = getattr(getattr(rt, "cfg", None), "strategy_name", None)
+                all_rows = rt.db.list_trades(limit=500, account=rt.name, strategy=strat)
                 today_all = [r for r in all_rows
                              if (r.get("exit_time") or "")[:10] == today_iso]
                 today_filled = [r for r in today_all

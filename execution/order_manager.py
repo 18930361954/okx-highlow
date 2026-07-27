@@ -38,7 +38,8 @@ class OrderManager:
     """
 
     def __init__(self, okx_client, db, logger=None, ct_val: dict | None = None,
-                 td_mode: str = "cross", account: str = DEFAULT_ACCOUNT):
+                 td_mode: str = "cross", account: str = DEFAULT_ACCOUNT,
+                 strategy: str | None = None):
         self.okx = okx_client
         self.db = db
         self.logger = logger
@@ -53,6 +54,7 @@ class OrderManager:
                 self._meta[p] = base
         self.td_mode = td_mode
         self.account = account
+        self.strategy = strategy
         # 缓存 pair → 已确认设置成功的 leverage,避免每次挂单都调 set_leverage。
         # main.py 启动时会预设一次,同 leverage 时 place 就跳过 set。
         self._lev_confirmed: dict[str, int] = {}
@@ -321,6 +323,7 @@ class OrderManager:
             entry_time=None,
             attempt=attempt,
             account=self.account,
+            strategy=self.strategy,
         )
         return algo_id
 

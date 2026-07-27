@@ -40,11 +40,13 @@ def _dd_flag(dd_pct: float) -> str:
 
 
 def _build_balance_series(db, up_to_today: str,
-                           account: str = "default") -> list[tuple[str, float]]:
+                           account: str = "default",
+                           strategy: str | None = None) -> list[tuple[str, float]]:
     """从全部 trade 记录重建"每日结束时 balance"序列。
-    只用 exit_time 有值的（已结算）trade。多账户下按账户过滤。
+    只用 exit_time 有值的（已结算）trade。多账户下按账户过滤;
+    strategy 非 None 时只统计该策略的数据(换策略后旧策略盈亏不混入)。
     """
-    all_trades = db.list_trades(limit=10000, account=account)
+    all_trades = db.list_trades(limit=10000, account=account, strategy=strategy)
     filled = [t for t in all_trades if t.get("pnl") is not None]
     filled.sort(key=lambda t: (t.get("exit_time") or "", t.get("id", 0)))
 
@@ -284,12 +286,14 @@ def generate_report(db, account, config, target_date: str | None = None,
 
 def _summarize_account(db, rt_like, today: str) -> dict:
     """rt_like 需暴露 .name / .account (AccountState) / .cfg (提供 pairs 等)。
-    这里不 import AccountRuntime 以避免循环依赖。"""
+    这里不 import AccountRuntime 以避免循环依赖。
+    cfg.strategy_name 配置时只统计该策略的数据。"""
     name = rt_like.name
     account_state = rt_like.account
+    strat = getattr(rt_like.cfg, "strategy_name", None)
     sig_date = (datetime.fromisoformat(today).date() - timedelta(days=1)).isoformat()
 
-    all_trades = db.list_trades(limit=10000, account=name)
+    all_trades = db.list_trades(limit=10000, account=name, strategy=strat)
     # 排除从未入场的挂单清扫记录(exit_price=0 说明未成交,只是 reconciler 撤单登记)
     today_filled = [t for t in all_trades
                     if (t.get("exit_price") or 0) > 0
@@ -314,7 +318,7 @@ def _summarize_account(db, rt_like, today: str) -> dict:
     start_bal = end_bal - total_net
 
     # 回撤(带 end_bal 兜底防负)
-    series = _build_balance_series(db, today, account=name)
+    series = _build_balance_series(db, today, account=name, strategy=strat)
     if series:
         vals = [v for _, v in series]
         peak = max(max(vals), end_bal)
@@ -323,7 +327,7 @@ def _summarize_account(db, rt_like, today: str) -> dict:
         peak = end_bal
         cur_dd = 0.0
 
-    pending = [t for t in db.list_trades_by_date(sig_date, account=name)
+    pending = [t for t in db.list_trades_by_date(sig_date, account=name, strategy=strat)
                if t.get("exit_price") is None]
 
     return {
