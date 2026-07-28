@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account TEXT NOT NULL DEFAULT 'default',
     strategy TEXT,               -- 策略版本名(如 v1-highlow / v2-trend),同账户换策略后数据互不混淆
+    signal_bar TEXT,             -- 该笔信号周期(1D/12H/6H/4H)。混周期下同账户不同 pair 周期不同,统计按此分组
     leg_group TEXT,              -- fade 双向挂单的分组键(同 leg_group 的两行=同桶一多一空,OCO 关联)
     signal_date TEXT NOT NULL,
     pair TEXT NOT NULL,
@@ -97,6 +98,10 @@ class DB:
             # 一腿成交后 reconciler 据此撤另一腿(OCO)。旧数据留空,不影响单向策略。
             if "leg_group" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN leg_group TEXT")
+            # signal_bar 列(信号周期): 混周期(v3-mixed)下同账户不同 pair 周期不同,
+            # 监控/报表按周期分组统计需要行级周期。旧数据留空,报表侧回退账户级周期。
+            if "signal_bar" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN signal_bar TEXT")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -141,15 +146,16 @@ class DB:
         account: str = DEFAULT_ACCOUNT,
         strategy: str | None = None,
         leg_group: str | None = None,
+        signal_bar: str | None = None,
     ) -> int:
         with self._conn() as c:
             try:
                 cur = c.execute(
                     """INSERT INTO trades
-                    (account, strategy, leg_group, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    (account, strategy, leg_group, signal_bar, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (account, strategy, leg_group, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (account, strategy, leg_group, signal_bar, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
                 )
                 return int(cur.lastrowid)

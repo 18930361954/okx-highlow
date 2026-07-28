@@ -161,6 +161,7 @@ class HighLowStrategy:
             "day_high": day_high,
             "day_low": day_low,
             "signal_date": sd,
+            "signal_bar": self.signal_bar_for(pair),
             "reason": reason,
             "attempt": attempt,
         }
@@ -230,6 +231,7 @@ class HighLowStrategy:
                 "pair": pair,
                 "mode": "fade",
                 "signal_date": sd,
+                "signal_bar": self.signal_bar_for(pair),
                 "leg_group": leg_group,
                 "legs": [leg_long, leg_short],
                 "reason": (f"[fade] {coin} 双向挂单 多@{leg_long['entry_price']} "
@@ -268,6 +270,7 @@ class HighLowStrategy:
             "tp_price": tp_price,
             "sl_price": sl_price,
             "signal_date": sd,
+            "signal_bar": self.signal_bar_for(pair),
             "mode": mode,
             "leg_group": leg_group,
             "reason": reason,

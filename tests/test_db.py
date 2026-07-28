@@ -105,3 +105,29 @@ def test_insert_trade_leg_group_default_none(tmp_path):
                     side="long", okx_order_id="B1", account="acc")
     t = db.list_trades(limit=1, account="acc")[0]
     assert t["leg_group"] is None
+
+
+# ---------------- signal_bar (混周期行级周期, 2026-07-28 新增) ----------------
+
+def test_signal_bar_migration_idempotent(tmp_path):
+    """signal_bar 列迁移幂等: 二次 init 不炸, 列存在。"""
+    import sqlite3
+    p = tmp_path / "sb.db"
+    DB(p)
+    DB(p)
+    con = sqlite3.connect(str(p))
+    cols = {r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()}
+    con.close()
+    assert "signal_bar" in cols
+
+
+def test_insert_trade_signal_bar_roundtrip(tmp_path):
+    """signal_bar 写入后可读回; 不传默认 NULL(旧数据/旧调用兼容)。"""
+    db = DB(tmp_path / "sb2.db")
+    db.insert_trade(signal_date="2026-07-28T06:00Z", pair="SOL-USDT-SWAP",
+                    side="long", okx_order_id="S1", account="acc", signal_bar="6H")
+    db.insert_trade(signal_date="2026-07-28", pair="BTC-USDT-SWAP",
+                    side="long", okx_order_id="B1", account="acc")
+    rows = {r["pair"]: r for r in db.list_trades(limit=10, account="acc")}
+    assert rows["SOL-USDT-SWAP"]["signal_bar"] == "6H"
+    assert rows["BTC-USDT-SWAP"]["signal_bar"] is None

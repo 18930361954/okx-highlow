@@ -126,6 +126,25 @@ def test_eth_leverage_100_passes_through(tmp_path):
     assert kwargs["tdMode"] == "cross"
 
 
+def test_place_persists_signal_bar_from_signal(tmp_path):
+    """signal dict 带 signal_bar 时必须落库; 不带(旧路径/reentry 旧数据)落 NULL 不炸。"""
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.return_value = {"code": "0", "data": [{"algoId": "SB1"}]}
+    om = OrderManager(okx, db)
+    sig = _mk_signal()
+    sig["signal_bar"] = "12H"
+    om.place_algo_orders(sig, margin=7.5, leverage=100)
+    assert db.list_trades(limit=1)[0]["signal_bar"] == "12H"
+
+    okx.place_algo_order.return_value = {"code": "0", "data": [{"algoId": "SB2"}]}
+    sig2 = _mk_signal()
+    sig2["signal_date"] = "2026-06-30"
+    om.place_algo_orders(sig2, margin=7.5, leverage=100)
+    assert db.list_trades(limit=1)[0]["signal_bar"] is None
+
+
 def test_cancel_all_pending(tmp_path):
     db = DB(tmp_path / "t.db")
     okx = MagicMock()

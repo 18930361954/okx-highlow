@@ -72,6 +72,25 @@ def _exit_reason_zh(raw: str) -> str:
     return _EXIT_REASON_ZH.get(str(raw).upper(), str(raw))
 
 
+def _bars_summary(pair_bars: dict) -> str:
+    """账户级周期概览: 全 pair 同周期 → '6H'; 混周期 → '1D/4H/6H' (去重保序)。"""
+    if not pair_bars:
+        return ""
+    seen: list[str] = []
+    for b in pair_bars.values():
+        if b and b not in seen:
+            seen.append(b)
+    return "/".join(seen)
+
+
+def _bar_of(row: dict, pair_bars: dict) -> str:
+    """单条记录的周期: 行级 signal_bar 优先(新数据), 缺失回退账户 pair→bar 映射(旧数据)。"""
+    bar = row.get("signal_bar")
+    if bar:
+        return str(bar)
+    return str(pair_bars.get(row.get("pair") or row.get("instId") or "", "") or "-")
+
+
 def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) -> dict:
     """按传入的 trades 集合聚合业绩指标, 只统计真实成交(TP/SL/EXIT)。
 
@@ -271,6 +290,12 @@ class PositionMonitor:
                 bal = rt.account.get_balance()
             except Exception:
                 bal = 0.0
+            # pair→周期映射(混周期下各 pair 不同)。旧 strategy 无 signal_bar_for 时回退账户级
+            try:
+                pair_bars = {p: rt.strategy.signal_bar_for(p)
+                             for p in getattr(rt.cfg, "pairs", [])}
+            except Exception:
+                pair_bars = {}
             try:
                 in_cd = rt.account.is_in_cooldown()
                 losses = rt.account.get_consecutive_losses()
@@ -319,7 +344,8 @@ class PositionMonitor:
                 "rt": rt,
                 "name": rt.name,
                 "env": getattr(rt.cfg, "env", ""),
-                "signal_bar": getattr(rt.strategy, "signal_bar", "1D"),
+                "signal_bar": _bars_summary(pair_bars) or getattr(rt.strategy, "signal_bar", "1D"),
+                "pair_bars": pair_bars,
                 "balance": bal,
                 "in_cd": in_cd,
                 "losses": losses,
@@ -464,7 +490,7 @@ class PositionMonitor:
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
                              header_style="cyan", expand=True)
-        for c in ("账户", "品种", "方向", "触发价", "TP", "SL", "AlgoID"):
+        for c in ("账户", "品种", "周期", "方向", "触发价", "TP", "SL", "AlgoID"):
             pending_tbl.add_column(c, no_wrap=True)
         any_p = False
         for a in snap:
@@ -472,12 +498,14 @@ class PositionMonitor:
                 any_p = True
                 tp, sl = _pending_tp_sl(o)
                 pending_tbl.add_row(
-                    a["name"], str(o.get("instId", "")), _dir_zh(o.get("side", "")),
+                    a["name"], str(o.get("instId", "")),
+                    _bar_of(o, a.get("pair_bars") or {}),
+                    _dir_zh(o.get("side", "")),
                     str(o.get("triggerPx", "")), tp, sl,
                     str(o.get("algoId", ""))[:18],
                 )
         if not any_p:
-            pending_tbl.add_row("(无)", "", "", "", "", "", "")
+            pending_tbl.add_row("(无)", "", "", "", "", "", "", "")
 
         # === 当前持仓表 ===
         pos_tbl = Table(title="当前持仓 (全账户)", show_header=True,
@@ -504,21 +532,21 @@ class PositionMonitor:
 
         # === 最近成交表 ===
         # 全账户 · 全历史真实成交(TP/SL/EXIT), 按 exit_time 倒序, 取最近 N 条
-        all_recent: list[tuple[str, dict]] = []
+        all_recent: list[tuple[str, dict, dict]] = []
         for a in snap:
             for r in a["valid_trades"]:
-                all_recent.append((a["name"], r))
+                all_recent.append((a["name"], r, a.get("pair_bars") or {}))
         all_recent.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
         total = len(all_recent)
         shown = all_recent[:self.recent_trades_limit]
         title = f"最近成交 (全账户) · 显示 {len(shown)}/{total} 条"
         trade_tbl = Table(title=title,
                           show_header=True, header_style="green", expand=True)
-        for c in ("时间", "账户", "品种", "方向", "入场", "出场", "原因",
+        for c in ("时间", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
                   "名义 PnL", "手续费", "资金费", "净 PnL"):
             trade_tbl.add_column(c, no_wrap=True)
         any_t = False
-        for aname, r in shown:
+        for aname, r, pbars in shown:
             any_t = True
             # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
             net = r.get("pnl") or 0
@@ -532,13 +560,13 @@ class PositionMonitor:
             net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str
             trade_tbl.add_row(
                 (r.get("exit_time") or "")[:19], aname,
-                r.get("pair", ""), _dir_zh(r.get("side", "")),
+                r.get("pair", ""), _bar_of(r, pbars), _dir_zh(r.get("side", "")),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
                 _exit_reason_zh(r.get("exit_reason", "")),
                 _fmt2(pnl), f"{fee:.4f}", f"{funding:+.4f}", net_cell,
             )
         if not any_t:
-            trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "", "")
+            trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "", "", "")
 
         # === 组装 (空表隐藏, 省行给非空表) ===
         outer = Table.grid(expand=True)

@@ -66,6 +66,32 @@ def test_insufficient_data_returns_none():
     assert s.compute_signal("BTC-USDT-SWAP", [_mk_candles([1],[2],[0],[1])[0]]) is None
 
 
+def test_signal_carries_pair_level_signal_bar():
+    """混周期: signal dict 必须带该 pair 自己的 signal_bar (pair_overrides 覆盖账户级),
+    order_manager 据此落库, 监控/报表按行级周期统计。fade 双腿同样携带。"""
+    cfg = {"strategy": {
+        "float_pct": 0.0015, "tp_pct": 0.012, "sl_pct": 0.005,
+        "trend_filter": True, "signal_bar": "6H",
+        "pair_overrides": {
+            "BTC-USDT-SWAP": {"signal_bar": "1D"},
+            "SOL-USDT-SWAP": {"mode": "fade"},
+        },
+    }}
+    c = _mk_candles(
+        opens=[100, 102, 105, 108],
+        highs=[103, 106, 109, 112],
+        lows=[99, 100, 103, 107],
+        closes=[102, 105, 108, 110],
+    )
+    s = HighLowStrategy(cfg)
+    assert s.compute_signal("BTC-USDT-SWAP", c)["signal_bar"] == "1D"   # override
+    assert s.compute_signal("ETH-USDT-SWAP", c)["signal_bar"] == "6H"   # 账户级默认
+    fade_sig = s.compute_signal("SOL-USDT-SWAP", c)
+    assert fade_sig["signal_bar"] == "6H"
+    for leg in fade_sig["legs"]:
+        assert leg["signal_bar"] == "6H"
+
+
 def test_pair_override_float_pct():
     """pair_overrides 里的 float_pct 应覆盖默认值。"""
     cfg = {"strategy": {
