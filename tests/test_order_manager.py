@@ -145,6 +145,19 @@ def test_place_persists_signal_bar_from_signal(tmp_path):
     assert db.list_trades(limit=1)[0]["signal_bar"] is None
 
 
+def test_place_persists_trigger_price(tmp_path):
+    """落库时 trigger_price=entry_price(触发价), 供成交价覆盖 entry_price 后算滑点。"""
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.return_value = {"code": "0", "data": [{"algoId": "TP1"}]}
+    om = OrderManager(okx, db)
+    om.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    t = db.list_trades(limit=1)[0]
+    assert t["trigger_price"] == t["entry_price"]
+    assert t["trigger_price"] is not None
+
+
 def test_cancel_all_pending(tmp_path):
     db = DB(tmp_path / "t.db")
     okx = MagicMock()

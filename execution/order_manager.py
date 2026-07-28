@@ -318,6 +318,9 @@ class OrderManager:
             pair=pair,
             side=direction,
             entry_price=entry_price,
+            # 下单时 entry_price=策略触发价; 成交后 reconciler 用实际成交价覆盖 entry_price,
+            # trigger_price 保留原值用于算滑点
+            trigger_price=entry_price,
             margin=margin,
             mode="FIXED" if margin >= 1000 else "PCT",
             okx_order_id=algo_id,

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS trades (
     signal_date TEXT NOT NULL,
     pair TEXT NOT NULL,
     side TEXT NOT NULL,
+    trigger_price REAL,          -- 下单时触发价(策略计算值)。entry_price 成交后被实际成交价覆盖,两者差=滑点
     entry_price REAL,
     exit_price REAL,
     exit_reason TEXT,
@@ -102,6 +103,10 @@ class DB:
             # 监控/报表按周期分组统计需要行级周期。旧数据留空,报表侧回退账户级周期。
             if "signal_bar" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN signal_bar TEXT")
+            # trigger_price 列: reconciler 回填实际成交价会覆盖 entry_price,
+            # 触发价单独存一列才能算滑点(验收软性项: 成交价 vs 触发价均值 <15bp)。
+            if "trigger_price" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN trigger_price REAL")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -147,15 +152,16 @@ class DB:
         strategy: str | None = None,
         leg_group: str | None = None,
         signal_bar: str | None = None,
+        trigger_price: float | None = None,
     ) -> int:
         with self._conn() as c:
             try:
                 cur = c.execute(
                     """INSERT INTO trades
-                    (account, strategy, leg_group, signal_bar, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    (account, strategy, leg_group, signal_bar, trigger_price, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (account, strategy, leg_group, signal_bar, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (account, strategy, leg_group, signal_bar, trigger_price, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
                 )
                 return int(cur.lastrowid)

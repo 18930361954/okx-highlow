@@ -131,3 +131,18 @@ def test_insert_trade_signal_bar_roundtrip(tmp_path):
     rows = {r["pair"]: r for r in db.list_trades(limit=10, account="acc")}
     assert rows["SOL-USDT-SWAP"]["signal_bar"] == "6H"
     assert rows["BTC-USDT-SWAP"]["signal_bar"] is None
+
+
+# ---------------- trigger_price (滑点统计, 2026-07-28 新增) ----------------
+
+def test_trigger_price_survives_entry_fill_update(tmp_path):
+    """trigger_price 保留下单触发价; update_trade_entry 覆盖 entry_price 后仍可算滑点。"""
+    db = DB(tmp_path / "tp.db")
+    tid = db.insert_trade(signal_date="2026-07-28", pair="SOL-USDT-SWAP",
+                          side="long", entry_price=72.4161, trigger_price=72.4161,
+                          okx_order_id="T1", account="acc")
+    db.update_trade_entry(tid, entry_time="2026-07-28T08:00:00+00:00",
+                          entry_price=72.4302)
+    t = db.list_trades(limit=1, account="acc")[0]
+    assert t["trigger_price"] == 72.4161
+    assert t["entry_price"] == 72.4302
