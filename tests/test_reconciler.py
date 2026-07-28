@@ -30,12 +30,14 @@ class FakeOKX:
                  pending: list[dict] | None = None,
                  balance: float | None = None,
                  positions: list[dict] | None = None,
-                 pending_orders: list[dict] | None = None):
+                 pending_orders: list[dict] | None = None,
+                 algo_orders: dict | None = None):
         self.history_by_pair = history_by_pair or {}
         self.pending = list(pending or [])
         self.balance = balance  # None → get_balance 返 0,余额同步跳过
         self.positions = list(positions or [])
         self.pending_orders = list(pending_orders or [])  # 普通挂单 (algo 触发后的残单)
+        self.algo_orders = dict(algo_orders or {})  # algoId → 终态单据 (get_algo_order)
         self.cancelled: list[tuple[str, str]] = []
         self.cancelled_orders: list[tuple[str, str]] = []  # (instId, ordId)
         self.calls = 0
@@ -71,6 +73,9 @@ class FakeOKX:
         self.pending_orders = [o for o in self.pending_orders
                                if o.get("ordId") != ordId]
         return {"code": "0"}
+
+    def get_algo_order(self, algoClOrdId=None, algoId=None):
+        return self.algo_orders.get(algoId)
 
 
 def _fresh(tmp_path):
@@ -1020,3 +1025,56 @@ class FakeOKXWithCandles(FakeOKX):
     def get_candles(self, instId, bar="1H", limit=24):
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         return [[str(now_ms), "74", "75", "71", "72", "0", "0", "0", "1"]]
+
+
+# ---------------- 漏单检测 (验收硬性第三关, 2026-07-28 新增) ----------------
+
+def test_expire_orphan_logs_order_failed_as_missed_fill(tmp_path, caplog):
+    """ORPHAN 标记前回查 OKX 终态: order_failed(触发后下单被拒=漏单)必须 ERROR
+    记「漏单」+ failCode, 与普通孤儿区分; 其它终态照旧只记 ORPHAN。"""
+    import logging
+    db, acc = _fresh(tmp_path)
+    tid = _mk_open_trade(db, algo_id="MISS1")
+    okx = FakeOKX(algo_orders={
+        "MISS1": {"algoId": "MISS1", "state": "order_failed", "failCode": "51008"},
+    })
+    logger = logging.getLogger("t_missfill")
+    r = Reconciler(okx, db, acc, CONFIG, logger=logger)
+    row = db.list_trades(limit=1)[0]
+    with caplog.at_level(logging.ERROR, logger="t_missfill"):
+        r._expire_as_orphan(row)
+
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "ORPHAN"
+    text = caplog.text
+    assert "漏单" in text
+    assert "51008" in text
+    assert "order_failed" in text  # ORPHAN 行附带终态
+
+
+def test_expire_orphan_normal_state_no_missed_fill_log(tmp_path, caplog):
+    """终态 canceled(daily_cancel 撤的)不产生「漏单」告警; 回查失败也不阻塞清理。"""
+    import logging
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="C1")
+    okx = FakeOKX(algo_orders={"C1": {"algoId": "C1", "state": "canceled"}})
+    logger = logging.getLogger("t_missfill2")
+    r = Reconciler(okx, db, acc, CONFIG, logger=logger)
+    row = db.list_trades(limit=1)[0]
+    with caplog.at_level(logging.ERROR, logger="t_missfill2"):
+        r._expire_as_orphan(row)
+    assert db.list_trades(limit=1)[0]["exit_reason"] == "ORPHAN"
+    assert "漏单" not in caplog.text
+
+    # get_algo_order 抛异常 → 不阻塞
+    _mk_open_trade(db, algo_id="E1", pair="BTC-USDT-SWAP")
+
+    class BoomOKX(FakeOKX):
+        def get_algo_order(self, algoClOrdId=None, algoId=None):
+            raise RuntimeError("api down")
+
+    r2 = Reconciler(BoomOKX(), db, acc, CONFIG, logger=logger)
+    row2 = [t for t in db.list_trades(limit=5) if t["okx_order_id"] == "E1"][0]
+    r2._expire_as_orphan(row2)
+    assert [t for t in db.list_trades(limit=5)
+            if t["okx_order_id"] == "E1"][0]["exit_reason"] == "ORPHAN"

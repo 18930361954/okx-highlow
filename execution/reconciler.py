@@ -829,6 +829,24 @@ class Reconciler:
         pnl=0 fee=0 不影响余额/连亏统计,只是把 open 状态收干净。
         先撤掉可能残留的已触发未成交限价单, 防孤儿单继续挂着以过期信号成交。"""
         self._cancel_residual_order(db_t)
+        # 标记前回查 algo 终态: order_failed = trigger 触发后下单被拒(典型: 保证金不足)
+        # = 漏单,验收硬性第三关的统计落点,必须与普通孤儿(canceled 等)区分。
+        okx_state = ""
+        try:
+            od = self.okx.get_algo_order(algoId=db_t.get("okx_order_id"))
+            if od:
+                okx_state = str(od.get("state") or "")
+                if okx_state == "order_failed":
+                    fail_code = od.get("failCode") or od.get("code") or "?"
+                    if self.logger:
+                        self.logger.error(
+                            f"[reconcile] [漏单] trade#{db_t.get('id')} {db_t.get('pair')} "
+                            f"trigger 触发失败(下单被拒) failCode={fail_code} "
+                            f"algoId={db_t.get('okx_order_id')} "
+                            f"signal_date={db_t.get('signal_date')} —— 核对当时保证金占用"
+                        )
+        except Exception:
+            pass  # 回查失败不阻塞 ORPHAN 清理
         try:
             self.db.update_trade_exit(
                 trade_id=db_t["id"],
@@ -843,6 +861,7 @@ class Reconciler:
                     f"[reconcile] trade#{db_t.get('id')} {db_t.get('pair')} "
                     f"signal_date={db_t.get('signal_date')} algoId={db_t.get('okx_order_id')} "
                     f"已过桶且 OKX 无安全匹配孤儿 → 标记 ORPHAN 平"
+                    f"{f' (OKX 终态={okx_state})' if okx_state else ''}"
                 )
         except Exception as e:
             if self.logger:
