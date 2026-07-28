@@ -44,7 +44,7 @@ docs/
   backtest_validated.md# 三层验证报告(walk-forward + 滑点 + 张数封顶)
   daily_reports/       # 自动生成的每日 md 报告
 csv_data/              # 730 天历史 K(3 pair × 9 周期 = 27 份)
-reports/               # 回测结果 CSV(grid/walk_forward/slippage_sweep)
+reports/               # 回测结果 CSV(grid_148 网格 / lab_* 分层验证 / portfolio_* 组合结论)
 ```
 
 ---

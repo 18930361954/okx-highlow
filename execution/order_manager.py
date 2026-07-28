@@ -214,6 +214,7 @@ class OrderManager:
         td_mode: str | None = None,
         attempt: int = 1,
         max_contracts: float | None = None,
+        leg_group: str | None = None,
     ) -> str | None:
         pair = signal["pair"]
         direction = signal["direction"]
@@ -324,6 +325,8 @@ class OrderManager:
             attempt=attempt,
             account=self.account,
             strategy=self.strategy,
+            # leg_group: 显式参数优先,否则用 signal dict 自带(fade 双腿共享同一 leg_group)
+            leg_group=leg_group if leg_group is not None else signal.get("leg_group"),
         )
         return algo_id
 

@@ -112,18 +112,30 @@ def _sync_balance_before_place(rt: AccountRuntime, held_pairs: set[str] | None) 
     )
 
 
-def bucket_signal_and_place(rt: AccountRuntime) -> None:
+def _pairs_for_fire_hour(rt: AccountRuntime, fire_hour: int | None) -> list[str]:
+    """混周期过滤: fire_hour=None → 全部 pair(单周期旧行为);
+    否则只留 signal_bar_for(pair) 的 cron hours 含 fire_hour 的 pair。"""
+    if fire_hour is None:
+        return list(rt.cfg.pairs)
+    return [p for p in rt.cfg.pairs
+            if fire_hour in signal_hours_for(rt.strategy.signal_bar_for(p))]
+
+
+def bucket_signal_and_place(rt: AccountRuntime, fire_hour: int | None = None) -> None:
     """信号桶触发 (per-account):在每个信号桶起始时刻拉「上一桶」K,生成信号,下单。
-    信号周期由 rt.strategy.signal_bar 决定 (1D/12H/6H/4H/2H/1H)。
+    信号周期由 rt.strategy.signal_bar_for(pair) 决定 (1D/12H/6H/4H/2H/1H),
+    支持混周期(pair_overrides.signal_bar 各 pair 不同)。
+    fire_hour: 混周期时由 scheduler 传入本次 cron 的 hour,只处理轮到的 pair。
     挂单前查 OKX 持仓,有持仓则跳过;平仓后由 Reconciler._catchup_after_exit 补挂。
     挂单前先做一次余额对齐(无持仓时),让充值/提现立刻反映到保证金计算。
     """
     logger = rt.logger
     now = utc_now()
-    signal_bar = rt.strategy.signal_bar
-    prev_bkt = previous_bucket_start(now, signal_bar)
-    sig_id = bucket_id(prev_bkt)
-    logger.info(f"[scheduler] bucket_signal fired signal_bar={signal_bar} prev_bucket={sig_id}")
+    due_pairs = _pairs_for_fire_hour(rt, fire_hour)
+    if not due_pairs:
+        return
+    logger.info(f"[scheduler] bucket_signal fired fire_hour={fire_hour} "
+                f"pairs={[p.split('-')[0] for p in due_pairs]}")
 
     ok, reason = rt.account.can_trade(now)
     if not ok:
@@ -136,17 +148,22 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
     place_gap_sec = float(rt.cfg.strategy_config.get("place_gap_sec", 1.0))
     placed_count = 0
 
-    # 本桶已有 db 记录的 pair 不再挂: catchup-exit 可能比整点 cron 早 ~20s 挂过
-    # 同信号(2026-07-20 ETH 双录竞态)。OKX clOrdId 幂等 + db 唯一索引是兜底,
-    # 这里从源头跳过重复挂单。
-    try:
-        placed_pairs = {t["pair"] for t in
-                        rt.db.list_trades_by_date(sig_id, account=rt.name)}
-    except Exception as e:
-        logger.warning(f"[skip-check] list_trades_by_date 失败,不按 db 跳过: {e}")
-        placed_pairs = set()
+    for pair in due_pairs:
+        # prev_bucket 按该 pair 自己的周期算(混周期下各 pair 桶长不同)
+        signal_bar = rt.strategy.signal_bar_for(pair)
+        prev_bkt = previous_bucket_start(now, signal_bar)
+        sig_id = bucket_id(prev_bkt)
 
-    for pair in rt.cfg.pairs:
+        # 本桶已有 db 记录的 pair 不再挂: catchup-exit 可能比整点 cron 早 ~20s 挂过
+        # 同信号(2026-07-20 ETH 双录竞态)。OKX clOrdId 幂等 + db 唯一索引是兜底,
+        # 这里从源头跳过重复挂单。
+        try:
+            placed_pairs = {t["pair"] for t in
+                            rt.db.list_trades_by_date(sig_id, account=rt.name)}
+        except Exception as e:
+            logger.warning(f"[skip-check] list_trades_by_date 失败,不按 db 跳过: {e}")
+            placed_pairs = set()
+
         if pair in placed_pairs:
             logger.info(f"[skip] {pair}: 本桶 {sig_id} db 已有记录(catchup 已挂),跳过")
             continue
@@ -186,16 +203,21 @@ def bucket_signal_and_place(rt: AccountRuntime) -> None:
         max_ct = rt.strategy.max_contracts_for(pair)
         logger.info(f"[signal] {signal_dict['reason']} margin={margin:.2f} ({mode}) lev={leverage}x max_ct={max_ct}")
 
-        if placed_count > 0 and place_gap_sec > 0:
-            time.sleep(place_gap_sec)
-
-        algo_id = rt.order_manager.place_algo_orders(signal_dict, margin=margin, leverage=leverage,
-                                                     max_contracts=max_ct)
-        placed_count += 1
-        if algo_id:
-            logger.info(f"[order] {pair} algoId={algo_id}")
-        else:
-            logger.error(f"[order] {pair} place_algo_orders returned no id")
+        # fade 返回 {'legs':[多腿, 空腿]} 双向挂单;trend/reversal 返回单腿 dict。
+        # 统一成列表迭代:每腿各挂一张(共享 leg_group),先触发者成交、另一腿由 reconciler 撤。
+        # 每腿都用完整 margin(只有一腿预期成交,与回测 per-trade 10% 口径一致)。
+        legs = signal_dict.get("legs") or [signal_dict]
+        for leg in legs:
+            if placed_count > 0 and place_gap_sec > 0:
+                time.sleep(place_gap_sec)
+            algo_id = rt.order_manager.place_algo_orders(
+                leg, margin=margin, leverage=leverage, max_contracts=max_ct,
+                leg_group=leg.get("leg_group"))
+            placed_count += 1
+            if algo_id:
+                logger.info(f"[order] {pair} {leg['direction']} algoId={algo_id}")
+            else:
+                logger.error(f"[order] {pair} {leg['direction']} place_algo_orders returned no id")
 
 
 # 向后兼容名 (旧引用/测试用)
@@ -213,40 +235,31 @@ def daily_report_all(runtimes: list[AccountRuntime], config: dict, base_logger) 
         base_logger.error(f"daily_report failed: {e}")
 
 
-def daily_cancel(rt: AccountRuntime) -> None:
-    rt.logger.info("[scheduler] daily_cancel fired")
-    rt.order_manager.cancel_all_pending()
+def daily_cancel(rt: AccountRuntime, fire_hour: int | None = None) -> None:
+    """桶末撤单。混周期(fire_hour 给定)时只撤轮到该 hour 的 pair ——
+    否则 12H 桶末会误撤 1D pair 还没到期的挂单。单周期(None)保持撤全部。"""
+    due = _pairs_for_fire_hour(rt, fire_hour)
+    if not due:
+        return
+    rt.logger.info(f"[scheduler] daily_cancel fired fire_hour={fire_hour} "
+                   f"pairs={[p.split('-')[0] for p in due]}")
+    if fire_hour is None:
+        rt.order_manager.cancel_all_pending()
+    else:
+        for p in due:
+            rt.order_manager.cancel_all_pending(pair=p)
 
 
 def startup_catchup_if_needed(rt: AccountRuntime) -> None:
     """启动时判断当前信号桶该 pair 是否已挂单,未挂则补跑。
     多信号周期下无"是否已过 00:00"的固定判断,直接按当前桶来。
+    混周期: 每个 pair 按自己的 signal_bar 判桶/判 50% 窗口。
 
     保护:若当前桶已过半(> 50% 时间),跳过本桶补挂 —— 现价可能已远离信号触发价,
     挂着大概率不成交。等下桶自然 cron。
     """
     logger = rt.logger
     now = utc_now()
-    signal_bar = rt.strategy.signal_bar
-    cur_bkt = current_bucket_start(now, signal_bar)
-    sig_id = bucket_id(previous_bucket_start(now, signal_bar))
-
-    # 判断当前桶经过时长
-    from core.scheduler import SIGNAL_BAR_HOURS
-    hours = SIGNAL_BAR_HOURS.get(signal_bar, [0])
-    bucket_hours = 24 // len(hours) if len(hours) >= 1 else 24
-    bucket_secs = bucket_hours * 3600
-    elapsed = (now - cur_bkt).total_seconds()
-    if elapsed > bucket_secs * 0.5:
-        logger.info(
-            f"[catchup] 当前桶 {cur_bkt.strftime('%H:%M')} 已过 "
-            f"{elapsed/60:.0f}/{bucket_secs/60:.0f} 分钟(>50%),跳过补挂,等下桶"
-        )
-        return
-
-    existing_db = {
-        r["pair"] for r in rt.db.list_trades_by_date(sig_id, account=rt.name)
-    }
 
     existing_okx: set[str] = set()
     try:
@@ -265,8 +278,31 @@ def startup_catchup_if_needed(rt: AccountRuntime) -> None:
     except Exception as e:
         logger.warning(f"[catchup] get_positions 失败,仅按 db 判定: {e}")
 
+    from core.scheduler import SIGNAL_BAR_HOURS
     pending: list[str] = []
     for pair in rt.cfg.pairs:
+        signal_bar = rt.strategy.signal_bar_for(pair)
+        cur_bkt = current_bucket_start(now, signal_bar)
+        sig_id = bucket_id(previous_bucket_start(now, signal_bar))
+
+        hours = SIGNAL_BAR_HOURS.get(signal_bar, [0])
+        bucket_hours = 24 // len(hours) if len(hours) >= 1 else 24
+        bucket_secs = bucket_hours * 3600
+        elapsed = (now - cur_bkt).total_seconds()
+        if elapsed > bucket_secs * 0.5:
+            logger.info(
+                f"[catchup] {pair} 当前桶 {cur_bkt.strftime('%H:%M')} 已过 "
+                f"{elapsed/60:.0f}/{bucket_secs/60:.0f} 分钟(>50%),跳过补挂,等下桶"
+            )
+            continue
+
+        try:
+            existing_db = {r["pair"] for r in
+                           rt.db.list_trades_by_date(sig_id, account=rt.name)}
+        except Exception as e:
+            logger.warning(f"[catchup] {pair} list_trades_by_date 失败,跳过: {e}")
+            continue
+
         if pair in existing_db:
             logger.info(f"[catchup] {pair} 桶 {sig_id} 已处理(db 有记录),跳过")
         elif pair in existing_okx:
@@ -275,10 +311,10 @@ def startup_catchup_if_needed(rt: AccountRuntime) -> None:
             pending.append(pair)
 
     if not pending:
-        logger.info(f"[catchup] 桶 {sig_id} 所有 pair 均已处理,跳过补挂")
+        logger.info("[catchup] 所有 pair 均已处理,跳过补挂")
         return
 
-    logger.info(f"[catchup] 补挂 pairs: {pending} (当前桶起始 {cur_bkt.isoformat()})")
+    logger.info(f"[catchup] 补挂 pairs: {pending}")
     original = list(rt.cfg.pairs)
     try:
         rt.cfg.pairs = pending
@@ -367,20 +403,22 @@ def main():
     rep_h, rep_m = map(int, str(config["system"]["daily_report_time_utc"]).split(":"))
 
     for idx, rt in enumerate(ok_runtimes):
-        signal_bar = rt.strategy.signal_bar
+        # 混周期: 每 pair 各自的 signal_bar (pair_overrides.signal_bar 可覆盖账户级)
+        pair_bars = {p: rt.strategy.signal_bar_for(p) for p in rt.cfg.pairs}
         # 账户级秒偏移:防多账户同秒触发导致 OKX 51149 并发超时
         sec_offset = idx * 3
-        base_logger.info(f"[{rt.name}] signal_bar={signal_bar}, "
-                          f"每天 {len(signal_hours_for(signal_bar))} 次挂单,秒偏移 +{sec_offset}s")
+        base_logger.info(f"[{rt.name}] pair_signal_bars="
+                          f"{ {p.split('-')[0]: b for p, b in pair_bars.items()} },"
+                          f"秒偏移 +{sec_offset}s")
         add_account_jobs(
             sched,
             account_name=rt.name,
-            daily_signal_fn=lambda rt=rt: bucket_signal_and_place(rt),
+            daily_signal_fn=lambda fire_hour=None, rt=rt: bucket_signal_and_place(rt, fire_hour=fire_hour),
             daily_report_fn=lambda: None,   # 各账户不各自出报告,统一由 daily_report_all 出总报告
-            daily_cancel_fn=lambda rt=rt: daily_cancel(rt),
+            daily_cancel_fn=lambda fire_hour=None, rt=rt: daily_cancel(rt, fire_hour=fire_hour),
             reconcile_fn=rt.reconcile_tick,
             reconcile_interval_seconds=20,
-            signal_bar=signal_bar,
+            pair_signal_bars=pair_bars,
             report_hour=rep_h, report_minute=rep_m,
             signal_second_offset=sec_offset,
         )

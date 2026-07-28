@@ -107,31 +107,50 @@ def add_account_jobs(
     report_hour: int = 23,
     report_minute: int = 55,
     signal_second_offset: int = 0,
+    pair_signal_bars: dict[str, str] | None = None,
 ) -> None:
     """把一个账户的所有 job 注册进已有 scheduler。
-    signal_bar → 每天 N 次 signal / N 次 cancel cron。
+    - 单周期(旧行为): signal_bar → 每天 N 次 signal / N 次 cancel cron。
+    - 混周期: pair_signal_bars={pair: bar} → hours 取所有 pair 的并集,每个 hour
+      一个 job;signal/cancel fn 接收 fire_hour 参数,由 main 按 pair 周期过滤
+      「这个 hour 轮到哪些 pair」。pair_signal_bars 给定时忽略 signal_bar。
     report 每日 1 次(账户级报告在 main 里全局出一份)。
     signal_second_offset: 秒偏移,不同账户错开(避免 OKX 51149 并发超时)。
     """
     prefix = account_name
-    hours = signal_hours_for(signal_bar)
+    if pair_signal_bars:
+        hours = sorted({h for bar in pair_signal_bars.values()
+                        for h in signal_hours_for(bar)})
+        # 混周期: fn 需要知道本次 cron 是哪个 hour 触发,才能过滤 pair
+        def _mk_signal(h: int):
+            return lambda: daily_signal_fn(fire_hour=h)
+        def _mk_cancel(h: int):
+            return lambda: daily_cancel_fn(fire_hour=h)
+    else:
+        hours = signal_hours_for(signal_bar)
+        def _mk_signal(h: int):
+            return lambda: daily_signal_fn()
+        def _mk_cancel(h: int):
+            return lambda: daily_cancel_fn()
 
     # signal: 每个 hour 挂一个;job id 带 hour 区分。加秒偏移防多账户并发
     # minute=2:整点触发时 OKX 侧新桶可能还没落盘,顺延 2 分钟等上一桶完全收盘,
     # 与后面按 ts 精挑 K 线双重保险,防挂单价错配到上上一桶(曾致 4H BTC 空单挂错 8h 前的高点)
     for h in hours:
         sched.add_job(
-            daily_signal_fn,
+            _mk_signal(h),
             trigger=CronTrigger(hour=h, minute=2, second=signal_second_offset, timezone=UTC),
             id=f"{prefix}.signal_{h:02d}",
             misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
         )
 
-    # cancel: 每个桶末尾撤单 (下一次 signal 前 1 分钟)
+    # cancel: 每个桶末尾撤单 (下一次 signal 前 1 分钟)。
+    # 混周期下 cancel_{h} 对应的是"下一个 signal hour = h"的桶末尾,
+    # fire_hour 传 h 本身(即将开始的桶的 hour),main 按此过滤该撤哪些 pair。
     for h in hours:
         ch, cm = _cancel_hour_minute(h)
         sched.add_job(
-            daily_cancel_fn,
+            _mk_cancel(h),
             trigger=CronTrigger(hour=ch, minute=cm, timezone=UTC),
             id=f"{prefix}.cancel_{ch:02d}{cm:02d}",
             misfire_grace_time=180, coalesce=True, max_instances=1, replace_existing=True,

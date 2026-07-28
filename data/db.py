@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account TEXT NOT NULL DEFAULT 'default',
     strategy TEXT,               -- 策略版本名(如 v1-highlow / v2-trend),同账户换策略后数据互不混淆
+    leg_group TEXT,              -- fade 双向挂单的分组键(同 leg_group 的两行=同桶一多一空,OCO 关联)
     signal_date TEXT NOT NULL,
     pair TEXT NOT NULL,
     side TEXT NOT NULL,
@@ -92,6 +93,10 @@ class DB:
             # 历史数据回填 (v1-highlow / v2-trend) 已于 2026-07-27 一次性完成, 这里只补列。
             if "strategy" not in cols:
                 c.execute("ALTER TABLE trades ADD COLUMN strategy TEXT")
+            # leg_group 列(fade 双向挂单分组键): 同 leg_group 的两行是同桶一多一空,
+            # 一腿成交后 reconciler 据此撤另一腿(OCO)。旧数据留空,不影响单向策略。
+            if "leg_group" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN leg_group TEXT")
 
             # state 迁移：老表主键是 key,单账户;新表主键 (account, key)。
             # 检测老 schema 直接改建新表迁数据。
@@ -135,15 +140,16 @@ class DB:
         attempt: int = 1,
         account: str = DEFAULT_ACCOUNT,
         strategy: str | None = None,
+        leg_group: str | None = None,
     ) -> int:
         with self._conn() as c:
             try:
                 cur = c.execute(
                     """INSERT INTO trades
-                    (account, strategy, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    (account, strategy, leg_group, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (account, strategy, signal_date, pair, side, entry_price, exit_price, exit_reason,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (account, strategy, leg_group, signal_date, pair, side, entry_price, exit_price, exit_reason,
                      margin, mode, pnl, entry_time, exit_time, okx_order_id, attempt),
                 )
                 return int(cur.lastrowid)
@@ -213,6 +219,35 @@ class DB:
                     (account,),
                 ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_open_sibling_leg(self, account: str, leg_group: str,
+                             exclude_trade_id: int) -> dict | None:
+        """fade OCO 用: 返回同 leg_group、非本行、尚未闭合(exit_price IS NULL)的另一腿。
+        一腿成交后 reconciler 据此找到待撤的对向腿。找不到返回 None(可能已成交/已撤)。"""
+        if not leg_group:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM trades WHERE account=? AND leg_group=? AND id!=? "
+                "AND exit_price IS NULL ORDER BY id LIMIT 1",
+                (account, leg_group, exclude_trade_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_any_filled_sibling(self, account: str, leg_group: str,
+                               exclude_trade_id: int) -> dict | None:
+        """fade OCO 用: 返回同 leg_group、非本行、已真实入场(entry_time 非空)的另一腿,
+        **不论是否已闭合** —— A 腿可能在同一轮对账里入场+平仓直接闭合,
+        只查 open 会漏判"对向已成交",导致本腿漏撤继续裸挂(过期信号风险)。"""
+        if not leg_group:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM trades WHERE account=? AND leg_group=? AND id!=? "
+                "AND entry_time IS NOT NULL ORDER BY id LIMIT 1",
+                (account, leg_group, exclude_trade_id),
+            ).fetchone()
+            return dict(row) if row else None
 
     def update_trade_algo_id(self, trade_id: int, new_algo_id: str) -> None:
         """孤儿修复：db 里 algoId 在 OKX 找不到、但 pair 有其它 pending 时改绑。"""

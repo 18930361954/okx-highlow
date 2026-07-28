@@ -57,12 +57,12 @@ accounts:
   # 参数已过 10bp 滑点敏感性 (OKX 主流币日常滑点 5-15bp 是稳健区间)
   # 参数详情见 docs/backtest_validated.md
   #
-  # ==================== 实盘账户 (2026-07-27 换 v2-trend 研究参数, 见 docs/strategy_research_2026-07.md) ====================
-  # v1-highlow 旧策略 07-13~07-26 净 -68.28U 已停; v2-trend 以 44.5U (三账户各 ~14.8U) 实盘验证半个月。
+  # ==================== 实盘账户 (2026-07-28 全停: 先回模拟盘跑半个月, 稳健优先) ====================
+  # v1-highlow 旧策略 07-13~07-26 净 -68.28U 已停; v2-trend 07-27 短暂上实盘, 07-28 撤回模拟盘验证。
   # SOL 停跑(单向策略验证全灭); fade/reversal 腿待开发。
   # 「6H 主攻」— BTC/ETH 6H trend (34 幸存策略中 6H 最优组)
   - account_name: 初级炼气士-实盘
-    enabled: true                     # ← 2026-07-27 启: v2-trend 实盘验证
+    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
     strategy_name: v2-trend
     api_key: abf7c8b5-a75d-4470-866f-52b53bb14a86
     secret_key: 0B7B65EF1A008BDD965F2C85DDA652B0
@@ -77,7 +77,7 @@ accounts:
 
   # 「1D 防御」— BTC/ETH 1D trend 宽 float 族 (f=1.0%, 高胜率低回撤, 30bp 滑点鲁棒性最好)
   - account_name: 初级炼气士2-实盘
-    enabled: true                     # ← 2026-07-27 启: v2-trend 实盘验证
+    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
     strategy_name: v2-trend
     api_key: 7ff7534b-0975-43e7-88d1-13642a3c8391
     secret_key: ADAFDBEDAA3F4AEFDBAEFB965B75E215
@@ -92,7 +92,7 @@ accounts:
 
   # 「12H BTC 单腿」— 12H 周期仅 BTC trend 过验证 (ETH 12H 需 reversal 模式, 待开发)
   - account_name: 初级炼气士3-实盘
-    enabled: true                     # ← 2026-07-27 启: v2-trend 实盘验证
+    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
     strategy_name: v2-trend
     api_key: 8725f04a-af67-4fb8-aad2-ae62e8cf8ce7
     secret_key: 044B421FB88EBC5DDBFE291A3F6BACC9
@@ -104,10 +104,10 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.015 }
 
-  # ==================== 模拟盘账户 (2026-07-27 停: v2-trend 已转实盘验证) ====================
+  # ==================== 模拟盘账户 (2026-07-28 启: v2-trend 模拟验证半个月, 至 08-11) ====================
   # 「6H 主攻」— BTC/ETH 6H trend (34 幸存策略中 6H 最优组)
   - account_name: 初级炼气士-模拟
-    enabled: false                    # ← 2026-07-27 停: v2-trend 转实盘
+    enabled: true                     # ← 2026-07-28 启: v2-trend 模拟验证
     strategy_name: v2-trend
     api_key: e5b77589-31a3-456b-8900-834de01fef45
     secret_key: 10930BAADD1DFB4C324A9066A2BC4CC1
@@ -122,7 +122,7 @@ accounts:
 
   # 「1D 防御」— BTC/ETH 1D trend 宽 float 族 (f=1.0%, 高胜率低回撤, 30bp 滑点鲁棒性最好)
   - account_name: 初级炼气士2-模拟
-    enabled: false                    # ← 2026-07-27 停: v2-trend 转实盘
+    enabled: true                     # ← 2026-07-28 启: v2-trend 模拟验证
     strategy_name: v2-trend
     api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
     secret_key: 92BBD3C260D31827F0AA39BA0ABFFD56
@@ -137,7 +137,7 @@ accounts:
 
   # 「12H BTC 单腿」— 12H 周期仅 BTC trend 过验证 (ETH 12H 需 reversal 模式, 待开发)
   - account_name: 初级炼气士3-模拟
-    enabled: false                    # ← 2026-07-27 停: v2-trend 转实盘
+    enabled: true                     # ← 2026-07-28 启: v2-trend 模拟验证
     strategy_name: v2-trend
     api_key: fbdcc756-3241-4560-9540-6476c96f2548
     secret_key: F92BE16A31E148D3D52FC9E6832A7489

@@ -166,3 +166,124 @@ def test_okx_list_format_accepted():
     # 升序后 first.open=100 last.close=110 → 阳
     assert sig["direction"] == "long"
     assert sig["day_low"] == 99
+
+
+# ---------------- mode: reversal / fade (2026-07 新结构) ----------------
+
+def _bull_candles():
+    # day_open=100 day_close=110 high=112 low=99 → 阳
+    return _mk_candles(
+        opens=[100, 102, 105, 108],
+        highs=[103, 106, 109, 112],
+        lows=[99, 100, 103, 107],
+        closes=[102, 105, 108, 110],
+    )
+
+
+def _bear_candles():
+    # day_open=110 day_close=100 high=112 low=98 → 阴
+    return _mk_candles(
+        opens=[110, 108, 105, 102],
+        highs=[112, 110, 107, 104],
+        lows=[107, 104, 101, 98],
+        closes=[108, 105, 102, 100],
+    )
+
+
+def _cfg_mode(mode, **kw):
+    s = {"float_pct": 0.0015, "tp_pct": 0.012, "sl_pct": 0.005,
+         "trend_filter": True, "mode": mode}
+    s.update(kw)
+    return {"strategy": s}
+
+
+def test_reversal_bull_emits_short_at_high_plus_float():
+    """reversal: 阳 → 挂空 @ high*(1+f) (对齐 strategy_lab.py:129)。"""
+    s = HighLowStrategy(_cfg_mode("reversal"))
+    sig = s.compute_signal("ETH-USDT-SWAP", _bull_candles())
+    assert sig["direction"] == "short"
+    assert sig["entry_price"] == round(112 * (1 + 0.0015), 6)
+    assert sig["mode"] == "reversal"
+    assert sig["tp_price"] < sig["entry_price"] < sig["sl_price"]
+
+
+def test_reversal_bear_emits_long_at_low_minus_float():
+    """reversal: 阴 → 挂多 @ low*(1-f)。"""
+    s = HighLowStrategy(_cfg_mode("reversal"))
+    sig = s.compute_signal("ETH-USDT-SWAP", _bear_candles())
+    assert sig["direction"] == "long"
+    assert sig["entry_price"] == round(98 * (1 - 0.0015), 6)
+
+
+def test_fade_returns_two_legs_sharing_leg_group():
+    """fade: 双向挂单。多腿@low*(1-f) + 空腿@high*(1+f), 共享 leg_group。"""
+    s = HighLowStrategy(_cfg_mode("fade"))
+    sig = s.compute_signal("SOL-USDT-SWAP", _bull_candles(), signal_date="2026-07-28T06:00Z")
+    assert sig["mode"] == "fade"
+    legs = sig["legs"]
+    assert len(legs) == 2
+    by_dir = {l["direction"]: l for l in legs}
+    assert set(by_dir) == {"long", "short"}
+    assert by_dir["long"]["entry_price"] == round(99 * (1 - 0.0015), 6)
+    assert by_dir["short"]["entry_price"] == round(112 * (1 + 0.0015), 6)
+    # 两腿共享 leg_group, 且含 coin+sig_id
+    lg = sig["leg_group"]
+    assert lg == "fSOL2026-07-28T06:00Z"
+    assert by_dir["long"]["leg_group"] == by_dir["short"]["leg_group"] == lg
+    # 每腿都是完整可下单 signal
+    for l in legs:
+        assert l["tp_price"] and l["sl_price"] and l["signal_date"] == "2026-07-28T06:00Z"
+
+
+def test_fade_bear_day_same_two_legs():
+    """fade 阴天同样双向: 方向组合不变(fade 不看前桶方向选边)。"""
+    s = HighLowStrategy(_cfg_mode("fade"))
+    sig = s.compute_signal("SOL-USDT-SWAP", _bear_candles(), signal_date="x")
+    by_dir = {l["direction"]: l for l in sig["legs"]}
+    assert by_dir["long"]["entry_price"] == round(98 * (1 - 0.0015), 6)
+    assert by_dir["short"]["entry_price"] == round(112 * (1 + 0.0015), 6)
+
+
+def test_fade_flat_day_returns_none():
+    """fade 在 flat 桶(close==open)也返回 None —— 与回测 bar_dir=0 跳过一致。"""
+    s = HighLowStrategy(_cfg_mode("fade"))
+    c = _mk_candles(opens=[100, 101, 99], highs=[102, 102, 100],
+                    lows=[99, 99, 98], closes=[101, 99, 100])
+    assert s.compute_signal("SOL-USDT-SWAP", c) is None
+
+
+def test_mode_from_pair_overrides():
+    """pair_overrides.mode 覆盖顶层: SOL fade, ETH reversal, BTC 默认 trend。"""
+    cfg = _cfg_mode("trend", pair_overrides={
+        "SOL-USDT-SWAP": {"mode": "fade"},
+        "ETH-USDT-SWAP": {"mode": "reversal"},
+    })
+    s = HighLowStrategy(cfg)
+    assert s.mode_for("SOL-USDT-SWAP") == "fade"
+    assert s.mode_for("ETH-USDT-SWAP") == "reversal"
+    assert s.mode_for("BTC-USDT-SWAP") == "trend"
+    # 同一根 K, 三 pair 三种行为
+    bull = _bull_candles()
+    assert "legs" in s.compute_signal("SOL-USDT-SWAP", bull)
+    assert s.compute_signal("ETH-USDT-SWAP", bull)["direction"] == "short"
+    assert s.compute_signal("BTC-USDT-SWAP", bull)["direction"] == "long"
+
+
+def test_trend_signal_has_no_leg_group():
+    """trend 单腿信号 leg_group 为 None —— 不触发 reconciler OCO 路径。"""
+    s = HighLowStrategy(_cfg_mode("trend"))
+    sig = s.compute_signal("BTC-USDT-SWAP", _bull_candles())
+    assert sig["leg_group"] is None
+    assert "legs" not in sig
+
+
+def test_signal_bar_for_pair_override():
+    """pair_overrides.signal_bar 覆盖账户级 (混周期核心 plumbing)。"""
+    cfg = _cfg_mode("trend", signal_bar="6H", pair_overrides={
+        "BTC-USDT-SWAP": {"signal_bar": "1D"},
+        "ETH-USDT-SWAP": {"signal_bar": "12H"},
+    })
+    s = HighLowStrategy(cfg)
+    assert s.signal_bar_for("BTC-USDT-SWAP") == "1D"
+    assert s.signal_bar_for("ETH-USDT-SWAP") == "12H"
+    assert s.signal_bar_for("SOL-USDT-SWAP") == "6H"

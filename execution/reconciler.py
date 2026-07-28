@@ -347,11 +347,19 @@ class Reconciler:
                 except (ValueError, TypeError):
                     entry_ms = 0
                 # 找同 pair、fillTime > entry_time、reduceOnly=true、未被其它 trade 匹配的最早一条
+                # fade 两腿都入场(OCO 撤单失败)时同 pair 会有一多一空两个平仓单,
+                # 必须按 posSide 方向绑对腿, 否则平仓单绑错腿(pnl 记到反方向)。
+                t_side = str(t.get("side") or "").lower()  # long / short
                 for cand in orders_by_pair.get(pair, []):
                     ord_id = cand.get("ordId") or cand.get("algoId") or ""
                     if ord_id in matched_ord_ids:
                         continue
                     if str(cand.get("reduceOnly", "")).lower() != "true":
+                        continue
+                    # posSide 校验: 平多单 posSide=long, 平空单 posSide=short。
+                    # OKX 有返 posSide 才校验(net 模式可能为空则跳过校验,保持旧行为)。
+                    cand_pos = str(cand.get("posSide") or "").lower()
+                    if cand_pos and t_side and cand_pos != t_side:
                         continue
                     try:
                         ft = int(cand.get("fillTime") or cand.get("uTime") or 0)
@@ -391,6 +399,10 @@ class Reconciler:
                             f"@ {entry_px_arg or t['entry_price']} time={fill_time}"
                         )
                     processed += 1
+                    # fade OCO 撤对向腿不在这里做 —— 统一由 run_once 尾部的
+                    # _sweep_fade_oco 幂等扫描处理(本轮立即生效, 失败下轮自动重试)。
+                    # 在这里撤会有竞态: 对向腿排在本循环后面时 entry_time 尚未回填,
+                    # 若它其实也成交了会被误撤成 CANCELLED → 活仓裸奔。
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"[reconcile] update_trade_entry failed: {e}")
@@ -521,6 +533,10 @@ class Reconciler:
                     if self.logger:
                         self.logger.error(f"[reconcile] settle trade#{t.get('id')} failed: {e}")
 
+        # fade OCO: 主 entry/exit 匹配之后统一撤"一腿已成交"组的未成交对向腿。
+        # 必须在主循环之后 —— 循环中途 entry_time 未落库会误判对向腿未成交而错撤。
+        self._sweep_fade_oco()
+
         # 尾部僵尸兜底: 主匹配跑完后,algoId 仍死、bucket 已过、未 entry filled 的 → ORPHAN
         self._sweep_zombie_open()
         return processed
@@ -550,7 +566,14 @@ class Reconciler:
         sig_date = sl_trade.get("signal_date")
         if not sig_date:
             return
-        same_day = [x for x in self.db.list_trades_by_date(sig_date, account=self.account_name) if x.get("pair") == pair]
+        # reentry 是"SL 后同向重挂": 只数同 pair + 同方向 + 未被 OCO 撤销的腿。
+        # fade 会在同桶产生一多一空两行,若把对向腿也计入 already 会翻倍误触上限、抑制重挂;
+        # CANCELLED(被 OCO 撤的对向腿)同理不算一次真实入场。
+        sl_side = str(sl_trade.get("side") or "").lower()
+        same_day = [x for x in self.db.list_trades_by_date(sig_date, account=self.account_name)
+                    if x.get("pair") == pair
+                    and str(x.get("side") or "").lower() == sl_side
+                    and str(x.get("exit_reason") or "").upper() != "CANCELLED"]
         already = len(same_day)
         if already >= len(reentry_floats):
             if self.logger:
@@ -561,7 +584,7 @@ class Reconciler:
 
         # 确保还在"挂单桶"内。挂单桶 = signal 桶后一桶。
         now = (sl_time or datetime.now(UTC)).astimezone(UTC)
-        signal_bar = getattr(self.strategy, "signal_bar", "1D")
+        signal_bar = self._signal_bar_for(pair)
         bucket_secs = _BUCKET_SECS.get(signal_bar, 86400)
         sig_dt = _parse_sig_id(sig_date)
         if sig_dt is None:
@@ -643,7 +666,7 @@ class Reconciler:
         if not pair or not self.strategy or not self.order_manager:
             return
         now = (exit_dt or datetime.now(UTC)).astimezone(UTC)
-        signal_bar = getattr(self.strategy, "signal_bar", "1D")
+        signal_bar = self._signal_bar_for(pair)
         # 上一桶 (即 signal 依据的那一桶) 起始时间 → 用它作 sig_id
         try:
             from main import previous_bucket_start, bucket_id
@@ -721,27 +744,45 @@ class Reconciler:
         bal = self.account.get_balance()
         margin, mode = self.account.compute_margin(bal, pair=pair)
         lev = self.account.leverage_for(pair)
-
-        if self.logger:
-            self.logger.info(
-                f"[catchup-exit] {pair} 平仓后补挂 attempt=1 "
-                f"entry={signal['entry_price']} tp={signal['tp_price']} sl={signal['sl_price']} "
-                f"margin={margin:.2f} ({mode}) lev={lev}x"
-            )
-
         max_ct = getattr(self.strategy, "max_contracts_for", lambda p: None)(pair)
-        algo_id = self.order_manager.place_algo_orders(signal, margin=margin, leverage=lev,
-                                                       max_contracts=max_ct)
-        if not algo_id and self.logger:
-            self.logger.error(f"[catchup-exit] {pair} place_algo_orders 未拿到 algoId")
 
-    def _is_past_bucket(self, sig_id: str) -> bool:
+        # fade 返回 {'legs':[...]} 双腿;trend/reversal 单腿。与 main.bucket_signal_and_place 一致。
+        legs = signal.get("legs") or [signal]
+        for leg in legs:
+            if self.logger:
+                self.logger.info(
+                    f"[catchup-exit] {pair} 平仓后补挂 attempt=1 dir={leg['direction']} "
+                    f"entry={leg['entry_price']} tp={leg['tp_price']} sl={leg['sl_price']} "
+                    f"margin={margin:.2f} ({mode}) lev={lev}x"
+                )
+            algo_id = self.order_manager.place_algo_orders(
+                leg, margin=margin, leverage=lev, max_contracts=max_ct,
+                leg_group=leg.get("leg_group"))
+            if not algo_id and self.logger:
+                self.logger.error(f"[catchup-exit] {pair} {leg['direction']} place_algo_orders 未拿到 algoId")
+
+    def _signal_bar_for(self, pair: str | None) -> str:
+        """per-pair 信号周期(混周期支持)。strategy 有 signal_bar_for 就用 pair 级,
+        否则回退到账户级 signal_bar,再回退 1D。"""
+        strat = getattr(self, "strategy", None)
+        if strat is None:
+            return "1D"
+        fn = getattr(strat, "signal_bar_for", None)
+        if callable(fn) and pair:
+            try:
+                return fn(pair)
+            except Exception:
+                pass
+        return getattr(strat, "signal_bar", "1D")
+
+    def _is_past_bucket(self, sig_id: str, pair: str | None = None) -> bool:
         """sig_id 对应桶的"挂单窗口"(sig_bucket + bucket_secs)已完全过完 → True。
-        用于孤儿改绑失败时判断是否要把 db trade 标 ORPHAN 平掉,防止脏数据长期挂着。"""
+        用于孤儿改绑失败时判断是否要把 db trade 标 ORPHAN 平掉,防止脏数据长期挂着。
+        pair 给定时按该 pair 的周期算(混周期账户不同 pair 桶长不同)。"""
         sig_dt = _parse_sig_id(sig_id)
         if sig_dt is None:
             return False
-        signal_bar = getattr(getattr(self, "strategy", None), "signal_bar", "1D")
+        signal_bar = self._signal_bar_for(pair)
         bucket_secs = _BUCKET_SECS.get(signal_bar, 86400)
         # 挂单窗口 = signal 桶后一桶结束时刻
         window_end = sig_dt + timedelta(seconds=bucket_secs * 2)
@@ -808,6 +849,84 @@ class Reconciler:
                 self.logger.error(
                     f"[reconcile] _expire_as_orphan trade#{db_t.get('id')} failed: {e}"
                 )
+
+    def _sweep_fade_oco(self) -> None:
+        """fade OCO 幂等扫描(run_once 尾部, 主 entry/exit 匹配之后):
+        对每个 leg_group 的 open 腿分组 —
+        - 恰好一腿已入场(entry_time 有值) → 撤未入场的对向腿(OKX algo + 残单),
+          db 标 CANCELLED。本轮撤失败下轮自动重试(幂等)。
+        - 两腿都已入场(20s 竞态窗口内行情双向扫过) → 谁也不撤(撤了就是裸奔活仓),
+          ERROR 告警: fade 主动多空双持 = whipsaw 执行版(2026-07-23~26 事故类型),
+          各自 TP/SL 结算。
+        必须在主循环 entry 回填之后跑 —— 循环中途 db 的 entry_time 还没落, 会把
+        实际已成交的对向腿误判成未成交而错撤。"""
+        try:
+            current_open = self.db.list_open_trades(account=self.account_name)
+        except Exception:
+            return
+        by_group: dict[str, list[dict]] = {}
+        for t in current_open:
+            lg = t.get("leg_group")
+            if lg:
+                by_group.setdefault(lg, []).append(t)
+
+        for lg, legs in by_group.items():
+            filled = [t for t in legs if t.get("entry_time")]
+            unfilled = [t for t in legs if not t.get("entry_time")]
+            if len(filled) >= 2:
+                if self.logger:
+                    ids = ", ".join(f"#{t['id']}({t.get('side')})" for t in filled)
+                    self.logger.error(
+                        f"[reconcile][fade] leg_group={lg} 两腿都已成交! {ids} "
+                        f"同时多空持仓 —— OCO 撤单窗口内行情双向扫过, 各自 TP/SL 结算"
+                    )
+                continue
+            if not unfilled:
+                continue  # 没有待撤腿
+            if not filled:
+                # open 里没有已成交腿 ≠ 对向没成交 —— 对向可能同轮入场+平仓已闭合
+                # (TP 秒达)。查全表(含已闭合)兜底, 否则未成交腿漏撤继续裸挂过期信号。
+                any_filled = self.db.get_any_filled_sibling(
+                    self.account_name, lg, int(unfilled[0]["id"]))
+                if not any_filled:
+                    continue  # 两腿都没成交, 挂着等
+                filled = [any_filled]
+            for sib in unfilled:
+                self._cancel_fade_leg(filled[0], sib)
+
+    def _cancel_fade_leg(self, filled_trade: dict, sib: dict) -> None:
+        """撤 fade 的未成交对向腿: OKX trigger algo + 已触发未成交残单, db 标 CANCELLED。
+        pnl=0 fee=0 不影响余额/连亏统计。仿 _expire_as_orphan 收干净。"""
+        self._cancel_residual_order(sib)
+        aid = str(sib.get("okx_order_id") or "")
+        pair = sib.get("pair")
+        if aid and pair:
+            try:
+                self.okx.cancel_algo_order(aid, pair)
+            except Exception as e:
+                self._mark_if_net_error(e)
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile][fade] 撤 sibling algo {aid} 失败(下轮兜底再撤): {e}")
+        try:
+            self.db.update_trade_exit(
+                trade_id=sib["id"],
+                exit_price=0.0,
+                exit_reason="CANCELLED",
+                pnl=0.0,
+                exit_time=datetime.now(UTC).isoformat(),
+                fee=0.0,
+            )
+            if self.logger:
+                self.logger.info(
+                    f"[reconcile][fade] leg_group={sib.get('leg_group')} "
+                    f"trade#{filled_trade['id']}({filled_trade.get('side')}) 成交 → "
+                    f"撤对向腿 trade#{sib['id']}({sib.get('side')}) algoId={aid} 标 CANCELLED"
+                )
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"[reconcile][fade] _cancel_fade_leg trade#{sib.get('id')} failed: {e}")
 
     def _cleanup_duplicate_pending(self, open_trades: list[dict]) -> None:
         """扫每个策略 pair 的 pending algo,撤"重复"/无归属的。
@@ -923,7 +1042,7 @@ class Reconciler:
                             f"且无匹配孤儿(需 posSide={expected_dir}, clOrdId 前缀 "
                             f"{expected_prefix}) → 不改绑"
                         )
-                    if self._is_past_bucket(expected_sig):
+                    if self._is_past_bucket(expected_sig, pair):
                         self._expire_as_orphan(db_t)
 
             # 步骤 3: 剩余未被消化的 survivor 全撤(真正的重复/外部单)
@@ -958,7 +1077,7 @@ class Reconciler:
             if t.get("entry_time"):
                 continue  # 已入场是活持仓, 由 exit 匹配流程处理
             sig = t.get("signal_date") or ""
-            if not self._is_past_bucket(sig):
+            if not self._is_past_bucket(sig, t.get("pair")):
                 continue
             self._expire_as_orphan(t)
 

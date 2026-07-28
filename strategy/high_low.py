@@ -47,6 +47,10 @@ class HighLowStrategy:
         self.sl_pct = float(s["sl_pct"])
         self.trend_filter = bool(s.get("trend_filter", True))
         self.pair_overrides = s.get("pair_overrides") or {}
+        # 策略模式: trend(现行,阳低吸多/阴高空) / reversal(反转,阳高空/阴低吸多)
+        # / fade(双向,同桶挂多腿+空腿,先触发者成交、另一腿由 reconciler 撤)。
+        # 与回测 scripts/strategy_lab.py simulate_mode 逐位对齐。
+        self.mode = str(s.get("mode", "trend"))
         # 信号周期: 1D / 12H / 6H / 4H / 2H / 1H。scheduler 按此生成 cron。
         self.signal_bar = str(s.get("signal_bar", "1D"))
         # 单笔张数封顶(与回测口径一致):BTC 1000, ETH/SOL 5000。
@@ -84,6 +88,15 @@ class HighLowStrategy:
     def _float_for(self, pair: str) -> float:
         ov = self.pair_overrides.get(pair) or {}
         return float(ov.get("float_pct", self.float_pct))
+
+    def _mode_for(self, pair: str) -> str:
+        """pair 级策略模式覆盖 → 顶层 mode → 默认 trend。"""
+        ov = self.pair_overrides.get(pair) or {}
+        return str(ov.get("mode", self.mode))
+
+    def mode_for(self, pair: str) -> str:
+        """公开版:外部(scheduler/report)需要拿 pair 级 mode。"""
+        return self._mode_for(pair)
 
     def reentry_floats_for(self, pair: str) -> list[float]:
         """pair 的日内重挂浮动序列。若无配置或为空 → 返回 []（不启用重挂）。
@@ -193,45 +206,70 @@ class HighLowStrategy:
                 return None
 
         if day_close > day_open:
-            direction = "long"
+            prev_dir = "long"   # 前桶阳
         elif day_close < day_open:
-            direction = "short"
+            prev_dir = "short"  # 前桶阴
         else:
             if self.logger:
                 self.logger.info(f"{pair}: flat day, skip")
             return None
 
-        if not self.trend_filter:
-            direction = direction
+        sd = signal_date.isoformat() if isinstance(signal_date, date) else (signal_date or "")
+        day_ctx = {"day_open": day_open, "day_close": day_close,
+                   "day_high": day_high, "day_low": day_low}
+        mode = self._mode_for(pair)
 
+        # fade: 双向挂单。同桶挂多腿(low×(1-f)) + 空腿(high×(1+f)),共享 leg_group,
+        # 先触发者成交、另一腿由 reconciler 撤(OCO)。对齐 strategy_lab.py:137-138。
+        if mode == "fade":
+            coin = pair.split("-")[0]
+            leg_group = f"f{coin}{sd}"
+            leg_long = self._build_leg(pair, "long", day_high, day_low, sd, mode, day_ctx, leg_group)
+            leg_short = self._build_leg(pair, "short", day_high, day_low, sd, mode, day_ctx, leg_group)
+            return {
+                "pair": pair,
+                "mode": "fade",
+                "signal_date": sd,
+                "leg_group": leg_group,
+                "legs": [leg_long, leg_short],
+                "reason": (f"[fade] {coin} 双向挂单 多@{leg_long['entry_price']} "
+                           f"空@{leg_short['entry_price']} (open={day_open} close={day_close})"),
+                **day_ctx,
+            }
+
+        # trend: 跟随前桶方向 (d=d_prev)。reversal: 反向 (d=-d_prev)。对齐 strategy_lab.py:125/129。
+        if mode == "reversal":
+            direction = "short" if prev_dir == "long" else "long"
+        else:  # trend
+            direction = prev_dir
+        return self._build_leg(pair, direction, day_high, day_low, sd, mode, day_ctx, None)
+
+    def _build_leg(self, pair: str, direction: str, day_high: float, day_low: float,
+                   sd: str, mode: str, day_ctx: dict, leg_group: str | None) -> dict:
+        """构造单腿 signal dict。入场价只取决于方向:
+          long  → day_low×(1-float);  short → day_high×(1+float)
+        TP/SL 相对入场价 ±tp_pct/sl_pct。与回测 strategy_lab.py 逐位对齐。"""
         tp_pct, sl_pct = self._tp_sl_for(pair)
         float_pct = self._float_for(pair)
-
         if direction == "long":
             entry_price = round(day_low * (1 - float_pct), 6)
             tp_price = round(entry_price * (1 + tp_pct), 6)
             sl_price = round(entry_price * (1 - sl_pct), 6)
-            reason = (f"day阳 open={day_open} close={day_close} low={day_low} "
-                      f"挂多 @ {entry_price} (low×{1 - float_pct})")
+            reason = (f"[{mode}] 挂多 @ {entry_price} (low={day_low}×{1 - float_pct})")
         else:
             entry_price = round(day_high * (1 + float_pct), 6)
             tp_price = round(entry_price * (1 - tp_pct), 6)
             sl_price = round(entry_price * (1 + sl_pct), 6)
-            reason = (f"day阴 open={day_open} close={day_close} high={day_high} "
-                      f"挂空 @ {entry_price} (high×{1 + float_pct})")
-
-        sd = signal_date.isoformat() if isinstance(signal_date, date) else (signal_date or "")
-
+            reason = (f"[{mode}] 挂空 @ {entry_price} (high={day_high}×{1 + float_pct})")
         return {
             "pair": pair,
             "direction": direction,
             "entry_price": entry_price,
             "tp_price": tp_price,
             "sl_price": sl_price,
-            "day_open": day_open,
-            "day_close": day_close,
-            "day_high": day_high,
-            "day_low": day_low,
             "signal_date": sd,
+            "mode": mode,
+            "leg_group": leg_group,
             "reason": reason,
+            **day_ctx,
         }

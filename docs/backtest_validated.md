@@ -166,7 +166,8 @@ Test:  2026-01-06 → 2026-07-08 (6 个月)
 
 ## 相关文件
 
-- 参数详细数据:`reports/walk_forward.csv`,`reports/slippage_sweep.csv`
-- 网格搜索原始数据:`reports/grid_btc_eth_v2.csv`,`reports/grid_sol_v2.csv`
+- 参数详细数据:`reports/lab_wf_survivors.csv`,`reports/lab_slippage.csv`
+- 网格搜索原始数据:`reports/grid_148_full.csv`(train/test 分档见 `grid_148_train.csv` / `grid_148_test.csv`)
+- v1 时期的 `grid_btc_eth_v2.csv` / `grid_sol_v2.csv` / `walk_forward.csv` / `slippage_sweep.csv` 已于 2026-07-28 清理,需要时从 git 历史取回
 - 回测工具:`scripts/bucket_backtest.py`(单币桶回测),`scripts/combined_backtest.py`(三币联合),`scripts/walk_forward.py`(反过拟合)
 - 运维手册:`docs/OPERATIONS.md`

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -781,3 +781,242 @@ def test_exit_keeps_local_balance_when_okx_fetch_fails(tmp_path):
     r = Reconciler(okx, db, acc, CONFIG)
     r.run_once()
     assert acc.get_balance() == pytest.approx(1100.0)
+
+
+# ---------- fade OCO: 一腿成交撤另一腿 (2026-07 新结构) ----------
+
+def _mk_fade_pair(db, lg="fSOL20260728", pair="SOL-USDT-SWAP",
+                  algo_long="AL", algo_short="AS"):
+    """同桶 fade 双腿: long + short 共享 leg_group。返回 (tid_long, tid_short)。"""
+    tid_l = db.insert_trade(
+        signal_date="2026-06-30", pair=pair, side="long",
+        entry_price=74.0, margin=10.0, mode="PCT",
+        okx_order_id=algo_long, leg_group=lg)
+    tid_s = db.insert_trade(
+        signal_date="2026-06-30", pair=pair, side="short",
+        entry_price=77.0, margin=10.0, mode="PCT",
+        okx_order_id=algo_short, leg_group=lg)
+    return tid_l, tid_s
+
+
+def test_fade_long_fill_cancels_short_sibling(tmp_path):
+    """多腿 entry 成交 → 空腿 OKX 撤单 + db 标 CANCELLED(pnl=0)。"""
+    db, acc = _fresh(tmp_path)
+    tid_l, tid_s = _mk_fade_pair(db)
+    okx = FakeOKX(
+        history_by_pair={"SOL-USDT-SWAP": [
+            {"algoId": "AL", "fillPx": "74.0", "fillTime": "1751328000000",
+             "reduceOnly": "false"},
+        ]},
+        pending=[{"algoId": "AS", "instId": "SOL-USDT-SWAP", "cTime": "1000"}],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+
+    # 空腿被撤: OKX cancel 被调用 + db 标 CANCELLED
+    assert ("AS", "SOL-USDT-SWAP") in okx.cancelled
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    assert rows[tid_s]["exit_reason"] == "CANCELLED"
+    assert rows[tid_s]["pnl"] == 0
+    # 多腿正常入场, 不受影响
+    assert rows[tid_l]["entry_time"] is not None
+    assert rows[tid_l]["exit_price"] is None
+    # 余额/连亏不受 CANCELLED 影响
+    assert acc.get_balance() == pytest.approx(1000.0)
+    assert acc.get_consecutive_losses() == 0
+
+
+def test_fade_short_fill_cancels_long_sibling(tmp_path):
+    """镜像: 空腿成交 → 多腿撤。"""
+    db, acc = _fresh(tmp_path)
+    tid_l, tid_s = _mk_fade_pair(db)
+    okx = FakeOKX(
+        history_by_pair={"SOL-USDT-SWAP": [
+            {"algoId": "AS", "fillPx": "77.0", "fillTime": "1751328000000",
+             "reduceOnly": "false"},
+        ]},
+        pending=[{"algoId": "AL", "instId": "SOL-USDT-SWAP", "cTime": "1000"}],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert ("AL", "SOL-USDT-SWAP") in okx.cancelled
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    assert rows[tid_l]["exit_reason"] == "CANCELLED"
+    assert rows[tid_s]["entry_time"] is not None
+
+
+def test_fade_both_filled_no_cancel_and_both_settle(tmp_path):
+    """both-fill 边界(20s 竞态窗口内行情双向扫过): 两腿都已入场 → 谁也不撤,
+    各自走 TP/SL 结算。不能误撤活仓(会裸奔)。"""
+    db, acc = _fresh(tmp_path)
+    tid_l, tid_s = _mk_fade_pair(db)
+    okx = FakeOKX(
+        history_by_pair={"SOL-USDT-SWAP": [
+            {"algoId": "AL", "fillPx": "74.0", "fillTime": "1751328000000",
+             "reduceOnly": "false"},
+            {"algoId": "AS", "fillPx": "77.0", "fillTime": "1751328005000",
+             "reduceOnly": "false"},
+        ]},
+        pending=[],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    # 谁也没被撤
+    assert okx.cancelled == []
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    assert rows[tid_l]["exit_reason"] is None
+    assert rows[tid_s]["exit_reason"] is None
+    assert rows[tid_l]["entry_time"] is not None
+    assert rows[tid_s]["entry_time"] is not None
+
+
+def test_fade_sibling_cancel_also_clears_residual_order(tmp_path):
+    """撤 sibling 时连已触发未成交的限价残单一起撤(2026-07-16 SOL 残单裸奔事故防线)。"""
+    db, acc = _fresh(tmp_path)
+    tid_l, tid_s = _mk_fade_pair(db)
+    okx = FakeOKX(
+        history_by_pair={"SOL-USDT-SWAP": [
+            {"algoId": "AL", "fillPx": "74.0", "fillTime": "1751328000000",
+             "reduceOnly": "false"},
+        ]},
+        pending=[{"algoId": "AS", "instId": "SOL-USDT-SWAP", "cTime": "1000"}],
+        # 空腿 algo 已触发落地一张限价残单 (未成交)
+        pending_orders=[{"algoId": "AS", "instId": "SOL-USDT-SWAP",
+                         "ordId": "RESID1", "reduceOnly": "false"}],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert ("SOL-USDT-SWAP", "RESID1") in okx.cancelled_orders
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    assert rows[tid_s]["exit_reason"] == "CANCELLED"
+
+
+def test_trend_trade_without_leg_group_skips_oco(tmp_path):
+    """单向 trend trade (leg_group=None) 不触发 OCO 路径 —— 回归保护。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="A1", side="long")
+    # 同 pair 另一笔无关 open trade (无 leg_group), 不能被误撤
+    other = db.insert_trade(
+        signal_date="2026-06-30", pair="BTC-USDT-SWAP", side="short",
+        entry_price=61000.0, margin=100.0, mode="PCT", okx_order_id="B1")
+    okx = FakeOKX(
+        history_by_pair={"BTC-USDT-SWAP": [
+            {"algoId": "A1", "fillPx": "60000", "fillTime": "1751328000000",
+             "reduceOnly": "false"},
+        ]},
+        pending=[{"algoId": "B1", "instId": "BTC-USDT-SWAP", "cTime": "1000"}],
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    assert okx.cancelled == []  # B1 不能被 OCO 误撤
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    assert rows[other]["exit_reason"] is None
+
+
+# ---------- Step-2 平仓匹配的方向校验 (fade both-fill 后绑对腿) ----------
+
+def test_step2_exit_matches_correct_leg_by_pos_side(tmp_path):
+    """两腿都入场后, 平仓单必须按 posSide 绑对腿:
+    short 腿的平仓单(posSide=short)不能绑到 long 腿上。"""
+    db, acc = _fresh(tmp_path)
+    lg = "fSOL20260728"
+    tid_l = db.insert_trade(
+        signal_date="2026-06-30", pair="SOL-USDT-SWAP", side="long",
+        entry_price=74.0, margin=10.0, mode="PCT",
+        okx_order_id="AL", leg_group=lg,
+        entry_time="2026-07-01T14:00:00+00:00")
+    tid_s = db.insert_trade(
+        signal_date="2026-06-30", pair="SOL-USDT-SWAP", side="short",
+        entry_price=77.0, margin=10.0, mode="PCT",
+        okx_order_id="AS", leg_group=lg,
+        entry_time="2026-07-01T14:00:05+00:00")
+    # 只有 short 腿的平仓单出现 (posSide=short, 独立 algoId)
+    okx = FakeOKX(history_by_pair={"SOL-USDT-SWAP": [
+        {"algoId": "TPALGO", "ordId": "O9", "fillPx": "76.0",
+         "fillTime": "1782918000000", "reduceOnly": "true",
+         "posSide": "short", "category": "tp", "pnl": "13.0"},
+    ]})
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    rows = {t["id"]: t for t in db.list_trades(limit=10)}
+    # short 腿结算, long 腿仍 open
+    assert rows[tid_s]["exit_price"] == pytest.approx(76.0)
+    assert rows[tid_s]["pnl"] == pytest.approx(13.0)
+    assert rows[tid_l]["exit_price"] is None
+
+
+# ---------- per-pair signal_bar (混周期) ----------
+
+def test_is_past_bucket_uses_pair_signal_bar(tmp_path):
+    """混周期账户: _is_past_bucket 按 pair 自己的周期判窗。
+    6H pair 的桶 13 小时前已过窗(6h*2=12h), 1D pair 的同刻桶(1d*2=48h)未过。"""
+    from strategy.high_low import HighLowStrategy
+
+    db, acc = _fresh(tmp_path)
+    cfg_mixed = {"strategy": {
+        **CONFIG["strategy"],
+        "signal_bar": "6H",
+        "pair_overrides": {"BTC-USDT-SWAP": {"signal_bar": "1D"}},
+    }}
+    strat = HighLowStrategy(cfg_mixed)
+    r = Reconciler(FakeOKX(), db, acc, CONFIG, strategy=strat)
+
+    sig_13h_ago = (datetime.now(UTC) - timedelta(hours=13)).strftime("%Y-%m-%dT%H:00Z")
+    # SOL 走账户级 6H: 13h > 12h 窗 → 已过
+    assert r._is_past_bucket(sig_13h_ago, "SOL-USDT-SWAP") is True
+    # BTC override 1D: 13h < 48h 窗 → 未过
+    assert r._is_past_bucket(sig_13h_ago, "BTC-USDT-SWAP") is False
+
+
+def test_reentry_count_ignores_opposite_leg_and_cancelled(tmp_path):
+    """fade 双腿桶里 SL 重挂计数: 对向腿和 CANCELLED 腿不计入 already,
+    防止翻倍误触 reentry_floats 上限。"""
+    from strategy.high_low import HighLowStrategy
+
+    db, acc = _fresh(tmp_path)
+    cfg_re = {"strategy": {
+        **CONFIG["strategy"],
+        "pair_overrides": {"SOL-USDT-SWAP": {"reentry_floats": [0.005, 0.01]}},
+    }}
+    strat = HighLowStrategy(cfg_re)
+
+    calls = []
+
+    class SpyOM:
+        def place_algo_orders(self, sig, **kw):
+            calls.append((sig, kw))
+            return "NEW_ALGO"
+
+    lg = "fSOL20260728"
+    # signal_date 必须是"上一个 1D 桶"(昨日 00:00), now 才落在挂单窗口 [sig+1d, sig+2d) 内
+    sig_date = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT00:00Z")
+    # long 腿 SL 平仓; short 腿被 OCO 撤 (CANCELLED)
+    tid_l = db.insert_trade(signal_date=sig_date, pair="SOL-USDT-SWAP", side="long",
+                            entry_price=74.0, margin=10.0, mode="PCT",
+                            okx_order_id="AL", leg_group=lg,
+                            entry_time="2026-07-01T14:00:00+00:00")
+    tid_s = db.insert_trade(signal_date=sig_date, pair="SOL-USDT-SWAP", side="short",
+                            entry_price=77.0, margin=10.0, mode="PCT",
+                            okx_order_id="AS", leg_group=lg)
+    db.update_trade_exit(trade_id=tid_s, exit_price=0, exit_reason="CANCELLED",
+                          pnl=0, exit_time="2026-07-01T14:00:10+00:00")
+    db.update_trade_exit(trade_id=tid_l, exit_price=71.8, exit_reason="SL",
+                          pnl=-3.0, exit_time="2026-07-01T14:30:00+00:00")
+
+    r = Reconciler(FakeOKXWithCandles(), db, acc, CONFIG,
+                   strategy=strat, order_manager=SpyOM())
+    sl_trade = db.list_trades(limit=10)
+    sl_row = [t for t in sl_trade if t["id"] == tid_l][0]
+    r._try_reentry(sl_row, datetime.now(UTC))
+
+    # 老逻辑: same_day=2(两腿) >= len(floats)=2 → 被误跳过。
+    # 新逻辑: 只数同向非 CANCELLED = 1 < 2 → 正常重挂 attempt=2
+    assert len(calls) == 1
+    assert calls[0][1].get("attempt") == 2
+
+
+class FakeOKXWithCandles(FakeOKX):
+    """_try_reentry 需要 get_candles 返回当前桶 K。"""
+    def get_candles(self, instId, bar="1H", limit=24):
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return [[str(now_ms), "74", "75", "71", "72", "0", "0", "0", "1"]]

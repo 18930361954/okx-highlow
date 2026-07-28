@@ -49,3 +49,59 @@ def test_insert_trade_idempotent_by_account_algo_id(tmp_path):
     n1 = db.insert_trade(signal_date="s", pair="p", side="long", account="acc1")
     n2 = db.insert_trade(signal_date="s", pair="p", side="long", account="acc1")
     assert n1 != n2
+
+
+# ---------------- leg_group (fade OCO, 2026-07 新增) ----------------
+
+def test_leg_group_migration_idempotent(tmp_path):
+    """leg_group 列迁移幂等: 二次 init 不炸, 列存在。"""
+    import sqlite3
+    p = tmp_path / "lg.db"
+    DB(p)
+    DB(p)  # 二次 init
+    con = sqlite3.connect(str(p))
+    cols = {r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()}
+    con.close()
+    assert "leg_group" in cols
+
+
+def test_get_open_sibling_leg(tmp_path):
+    db = DB(tmp_path / "lg2.db")
+    lg = "fSOL20260728T06"
+    tid_l = db.insert_trade(signal_date="2026-07-28T06:00Z", pair="SOL-USDT-SWAP",
+                            side="long", entry_price=74.0, okx_order_id="AL",
+                            account="acc", leg_group=lg)
+    tid_s = db.insert_trade(signal_date="2026-07-28T06:00Z", pair="SOL-USDT-SWAP",
+                            side="short", entry_price=77.0, okx_order_id="AS",
+                            account="acc", leg_group=lg)
+    # 互为 sibling
+    assert db.get_open_sibling_leg("acc", lg, tid_l)["id"] == tid_s
+    assert db.get_open_sibling_leg("acc", lg, tid_s)["id"] == tid_l
+    # 账户隔离
+    assert db.get_open_sibling_leg("other", lg, tid_l) is None
+    # 空 leg_group → None
+    assert db.get_open_sibling_leg("acc", "", tid_l) is None
+
+
+def test_get_open_sibling_leg_excludes_closed(tmp_path):
+    """已平/已撤的腿不再是 open sibling。"""
+    db = DB(tmp_path / "lg3.db")
+    lg = "fETH20260728"
+    tid_l = db.insert_trade(signal_date="2026-07-28", pair="ETH-USDT-SWAP",
+                            side="long", entry_price=1900.0, okx_order_id="EL",
+                            account="acc", leg_group=lg)
+    tid_s = db.insert_trade(signal_date="2026-07-28", pair="ETH-USDT-SWAP",
+                            side="short", entry_price=2000.0, okx_order_id="ES",
+                            account="acc", leg_group=lg)
+    db.update_trade_exit(trade_id=tid_s, exit_price=0, exit_reason="CANCELLED",
+                          pnl=0, exit_time="2026-07-28T07:00:00+00:00")
+    assert db.get_open_sibling_leg("acc", lg, tid_l) is None
+
+
+def test_insert_trade_leg_group_default_none(tmp_path):
+    """不传 leg_group 默认 NULL —— 单向策略不受影响。"""
+    db = DB(tmp_path / "lg4.db")
+    db.insert_trade(signal_date="2026-07-28", pair="BTC-USDT-SWAP",
+                    side="long", okx_order_id="B1", account="acc")
+    t = db.list_trades(limit=1, account="acc")[0]
+    assert t["leg_group"] is None
