@@ -122,6 +122,9 @@ accounts:
     env_adapt: demo
     pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
+      # 组合 A 单独 5% 仓位(2026-07-29 用户决策): 10% 下回测 MDD 60.4% 穿 -50% 硬停线
+      # (v1 崩盘同款回撤深度), 5% 下 MDD 31.1% 且 2026 年收益反而更高(+33.9%→+36.8%)。B/C 维持 10%。
+      position_pct: 0.05
       signal_bar: 6H
       mode: trend
       pair_overrides:
