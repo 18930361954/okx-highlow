@@ -1,9 +1,10 @@
 # HighLow Bot · OKX SWAP 多账户挂单机器人
 
-前 K 阴阳判定 → 下一桶浮动挂 trigger 限价 + 服务端 TP/SL。**多账户 · 多信号周期 · 共享 db**。
+前 K 阴阳判定 → 下一桶浮动挂单(trend/reversal 单向,fade 双向 OCO) + 服务端 TP/SL。**多账户 · 混周期 · 共享 db**。
 
-- **信号周期**:支持 1D / 12H / 6H / 4H / 2H / 1H,每账户独立
-- **多币种**:BTC / ETH / SOL,每 pair 独立 float/tp/sl/leverage
+- **信号周期**:支持 1D / 12H / 6H / 4H / 2H / 1H,**每 pair 独立**(同账户可混周期)
+- **三种模式**:trend(顺前桶) / reversal(逆前桶) / fade(双向挂单先触发先成交,OCO 撤对向腿),每 pair 独立
+- **多币种**:BTC / ETH / SOL,每 pair 独立 float/tp/sl/leverage/mode
 - **多账户**:同一进程并行跑,共享 `data/trades.db` 用 `account` 列区分
 - **无状态启动**:catchup 补挂 + reconciler REST 对账,重启自愈
 
@@ -38,11 +39,15 @@ scripts/               # 只留活的
   daily_report.py         # 每日汇总报告
   reset_cooldown.py       # 应急清熔断
 
-tests/                 # pytest(52 项)
+tests/                 # pytest(142 项)
 docs/
-  运维手册.md        # 运维手册(启动/停止/故障/日常查看)
-  回测三层验证报告.md# 三层验证报告(walk-forward + 滑点 + 张数封顶)
-  daily_reports/       # 自动生成的每日 md 报告
+  运维手册.md                        # 启动/停止/故障/日常查看
+  资金与仓位规划.md                  # 仓位/资金阶梯/纪律(权威决策记录)
+  策略研究报告_2026-07.md            # 34 幸存策略 + 推荐组合 A/B/C
+  策略结构_fade_reversal_混周期.md   # v3 新结构使用说明与已知限制
+  回测三层验证报告.md                # 三层验证方法论(walk-forward + 滑点 + 张数封顶)
+  第一轮实盘复盘_2026-07.md          # v1 实盘 -68U 复盘
+  daily_reports/                     # 自动生成的每日 md 报告
 csv_data/              # 730 天历史 K(3 pair × 9 周期 = 27 份)
 reports/               # 回测结果 CSV(grid_148 网格 / lab_* 分层验证 / portfolio_* 组合结论)
 ```
@@ -55,7 +60,7 @@ reports/               # 回测结果 CSV(grid_148 网格 / lab_* 分层验证 /
 # 1) 安装依赖
 python -m pip install -r requirements.txt
 
-# 2) 跑测试(52 项)
+# 2) 跑测试(142 项)
 python -m pytest tests/
 
 # 3) 启动机器人
@@ -80,9 +85,10 @@ python main.py
 
 ## 关键约束
 
-- **杠杆**:BTC/ETH 100x(实盘 & 模拟盘),SOL 实盘 100x 但**模拟盘上限 50x**(config 已按环境覆盖)
-- **仓位**:每笔余额 × 10%,三币满仓总保证金 30%
+- **杠杆**:BTC/ETH 100x,SOL 50x(fade 腿统一 50x,config pair_overrides 覆盖)
+- **仓位**:每笔余额 × position_pct,可按账户覆盖——组合 A 5%,组合 B/C 10%(见 `docs/资金与仓位规划.md`)
 - **熔断**:每账户独立,3 连亏后暂停 24h
+- **硬停线**:任一账户 -50% 无条件停(资金纪律,人工执行)
 
 ---
 

@@ -82,8 +82,11 @@ OKX **没有**「两张反向入场触发单二选一」的原生 OCO。bot 的�
 | 07-20 TP 触发未成交 | SLIP_PCT 穿价偏移(原有,每腿独立生效) | 原有 order_manager 测试 |
 | whipsaw 双持 | both-fill 不误撤 + ERROR 告警 | `test_fade_both_filled_no_cancel_and_both_settle` |
 
-## 五、上线路径(研究文档既定,未执行)
+## 五、上线路径(2026-07-29 更新:已启用)
 
-1. 本次开发只合入代码,**实盘/模拟 config 均未启用 fade/reversal/混周期**。
-2. 按研究建议:fade 需先模拟盘 2-4 周,重点观察 both-fill 频率与 OCO 撤单延迟。
-3. 当前实盘正在跑 v2-trend 半月验证(44.5U,至 ~08-11),验证期内不动。
+1. ~~本次开发只合入代码,config 未启用~~ → **2026-07-28 午后模拟盘已全量启用**(v3-mixed A/B/C,
+   commit ac5cf00),fade/reversal/混周期首次真实运行,实盘全停等验收。
+2. 验证期半个月(至 08-11~15),重点观察 both-fill 频率(硬性门槛 ≤5%)、OCO 撤单延迟、漏单、分腿胜率。
+   验收标准与资金安排见 `资金与仓位规划.md`。
+3. 观测配套已补齐(07-28~29):db `signal_bar` 行级周期列、`trigger_price` 触发价列(滑点=entry_price-trigger_price)、
+   reconciler ORPHAN 前回查 OKX 终态(order_failed 记「漏单」ERROR)。
