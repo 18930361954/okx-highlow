@@ -827,26 +827,53 @@ class Reconciler:
     def _expire_as_orphan(self, db_t: dict) -> None:
         """孤儿改绑失败且信号桶已过 → 把 db trade 标 exit_reason=ORPHAN 平掉。
         pnl=0 fee=0 不影响余额/连亏统计,只是把 open 状态收干净。
-        先撤掉可能残留的已触发未成交限价单, 防孤儿单继续挂着以过期信号成交。"""
-        self._cancel_residual_order(db_t)
-        # 标记前回查 algo 终态: order_failed = trigger 触发后下单被拒(典型: 保证金不足)
-        # = 漏单,验收硬性第三关的统计落点,必须与普通孤儿(canceled 等)区分。
+        先撤掉可能残留的已触发未成交限价单, 防孤儿单继续挂着以过期信号成交。
+        标记前回查 algo 终态:
+          - effective = trigger 已触发。入场单若真实成交是活仓(2026-07-28 trade#537
+            误标事故: 触发 38 分钟后被标 ORPHAN,16.19U 盈利丢失),回填 entry
+            交还正常对账流,绝不标 ORPHAN;
+          - order_failed = trigger 触发后下单被拒(典型: 保证金不足) = 漏单,
+            验收硬性第三关的统计落点,必须与普通孤儿(canceled 等)区分。"""
+        if db_t.get("entry_time"):
+            # 已入场 = 活仓或等待平仓匹配, 由正常对账流处理, 绝不 ORPHAN
+            if self.logger:
+                self.logger.warning(
+                    f"[reconcile] trade#{db_t.get('id')} {db_t.get('pair')} "
+                    f"entry_time={db_t.get('entry_time')} 已入场, 拒绝标 ORPHAN"
+                )
+            return
+
         okx_state = ""
+        od = None
         try:
             od = self.okx.get_algo_order(algoId=db_t.get("okx_order_id"))
-            if od:
-                okx_state = str(od.get("state") or "")
-                if okx_state == "order_failed":
-                    fail_code = od.get("failCode") or od.get("code") or "?"
-                    if self.logger:
-                        self.logger.error(
-                            f"[reconcile] [漏单] trade#{db_t.get('id')} {db_t.get('pair')} "
-                            f"trigger 触发失败(下单被拒) failCode={fail_code} "
-                            f"algoId={db_t.get('okx_order_id')} "
-                            f"signal_date={db_t.get('signal_date')} —— 核对当时保证金占用"
-                        )
-        except Exception:
-            pass  # 回查失败不阻塞 ORPHAN 清理
+        except Exception as e:
+            # 回查失败不能贸然标 ORPHAN: 若实为已触发活仓, 误标即丢 pnl (trade#537 教训)。
+            # 本轮跳过, trade 保持 open, 下轮重试。
+            self._mark_if_net_error(e)
+            if self.logger:
+                self.logger.warning(
+                    f"[reconcile] trade#{db_t.get('id')} {db_t.get('pair')} "
+                    f"标 ORPHAN 前回查 algo 终态失败, 本轮跳过下轮重试: {e}"
+                )
+            return
+        if od:
+            okx_state = str(od.get("state") or "")
+
+        if okx_state in ("effective", "partially_effective") \
+                and self._rescue_triggered_entry(db_t):
+            return
+
+        self._cancel_residual_order(db_t)
+        if okx_state == "order_failed" and od:
+            fail_code = od.get("failCode") or od.get("code") or "?"
+            if self.logger:
+                self.logger.error(
+                    f"[reconcile] [漏单] trade#{db_t.get('id')} {db_t.get('pair')} "
+                    f"trigger 触发失败(下单被拒) failCode={fail_code} "
+                    f"algoId={db_t.get('okx_order_id')} "
+                    f"signal_date={db_t.get('signal_date')} —— 核对当时保证金占用"
+                )
         try:
             self.db.update_trade_exit(
                 trade_id=db_t["id"],
@@ -868,6 +895,54 @@ class Reconciler:
                 self.logger.error(
                     f"[reconcile] _expire_as_orphan trade#{db_t.get('id')} failed: {e}"
                 )
+
+    def _rescue_triggered_entry(self, db_t: dict) -> bool:
+        """algo state=effective(已触发)时回查入场单是否真实成交。
+        成交 → 回填 entry_time/entry_price 交还正常对账流(平仓由主匹配结算),返回 True;
+        回查失败 → 返回 True(保守: 本轮不标 ORPHAN,下轮重试);
+        确认未成交(触发后落地的限价单没吃到) → 返回 False,走原 ORPHAN 清理。"""
+        pair = db_t.get("pair")
+        algo_id = str(db_t.get("okx_order_id") or "")
+        if not pair or not algo_id:
+            return False
+        try:
+            rows = self.okx.list_order_history(instId=pair, state="filled", limit=100)
+        except Exception as e:
+            self._mark_if_net_error(e)
+            if self.logger:
+                self.logger.warning(
+                    f"[reconcile] trade#{db_t.get('id')} {pair} algo=effective "
+                    f"但回查入场成交失败,本轮不标 ORPHAN,下轮重试: {e}"
+                )
+            return True
+        entry = None
+        for o in rows:
+            if str(o.get("algoId") or "") == algo_id and not _is_reduce_only(o):
+                entry = o
+                break
+        if entry is None:
+            return False
+        fill_time = _ms_to_iso(entry.get("fillTime") or entry.get("uTime"))
+        try:
+            px = float(entry.get("fillPx") or entry.get("avgPx") or 0) or None
+        except (TypeError, ValueError):
+            px = None
+        try:
+            self.db.update_trade_entry(db_t["id"], entry_time=fill_time, entry_price=px)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"[reconcile] trade#{db_t.get('id')} rescue update_trade_entry "
+                    f"failed(本轮不标 ORPHAN): {e}"
+                )
+            return True
+        if self.logger:
+            self.logger.warning(
+                f"[reconcile] trade#{db_t.get('id')} {pair} algo=effective 已触发成交 "
+                f"@ {px or db_t.get('entry_price')} time={fill_time} → 回填 entry "
+                f"交还对账流,取消 ORPHAN 标记"
+            )
+        return True
 
     def _sweep_fade_oco(self) -> None:
         """fade OCO 幂等扫描(run_once 尾部, 主 entry/exit 匹配之后):

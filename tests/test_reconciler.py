@@ -472,6 +472,68 @@ def test_orphan_expire_cancels_residual_triggered_order(tmp_path):
     assert okx.cancelled_orders == [("BTC-USDT-SWAP", "ORD_RESIDUAL")]
 
 
+def test_orphan_expire_rescues_triggered_and_filled_entry(tmp_path):
+    """2026-07-28 trade#537 防回归: algo state=effective 且入场单已成交 →
+    绝不标 ORPHAN, 回填 entry_time/entry_price 交还正常对账流。"""
+    db, acc = _fresh(tmp_path)
+    tid = _mk_open_trade(db, algo_id="EFFECTIVE_FILLED")  # 桶早过
+    okx = FakeOKX(
+        history_by_pair={"BTC-USDT-SWAP": [
+            {"algoId": "EFFECTIVE_FILLED", "fillPx": "60100",
+             "fillTime": "1753714875704", "reduceOnly": "false"},
+        ]},
+        pending=[],  # 已触发 → 不在 trigger pending
+        algo_orders={"EFFECTIVE_FILLED": {
+            "state": "effective", "triggerTime": "1753714875706"}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] is None  # 不是 ORPHAN, 依然 open
+    assert t["entry_time"]  # entry 已回填
+    assert t["entry_price"] == pytest.approx(60100.0)
+
+
+def test_orphan_expire_effective_but_unfilled_still_orphans(tmp_path):
+    """algo=effective 但触发后的限价单没成交 (orders-history 无该 algoId 入场单)
+    → 仍走 ORPHAN 清理 (2026-07-16 SOL 残单场景, 残单也要撤)。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="EFFECTIVE_UNFILLED")
+    okx = FakeOKX(
+        history_by_pair={"BTC-USDT-SWAP": []},  # 无成交
+        pending=[],
+        pending_orders=[
+            {"instId": "BTC-USDT-SWAP", "ordId": "ORD_RESIDUAL",
+             "algoId": "EFFECTIVE_UNFILLED", "state": "live"},
+        ],
+        algo_orders={"EFFECTIVE_UNFILLED": {
+            "state": "effective", "triggerTime": "1753714875706"}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] == "ORPHAN"
+    assert ("BTC-USDT-SWAP", "ORD_RESIDUAL") in okx.cancelled_orders
+
+
+def test_orphan_expire_state_lookup_fails_skips_round(tmp_path):
+    """标 ORPHAN 前 get_algo_order 抛异常 → 本轮不标, 保持 open 下轮重试
+    (回查失败时贸然标 ORPHAN 可能误杀已触发活仓)。"""
+    db, acc = _fresh(tmp_path)
+
+    class BoomOKX(FakeOKX):
+        def get_algo_order(self, algoClOrdId=None, algoId=None):
+            raise RuntimeError("net down")
+
+    _mk_open_trade(db, algo_id="DEAD")
+    okx = BoomOKX(pending=[])
+    r = Reconciler(okx, db, acc, CONFIG)
+    r.run_once()
+    t = db.list_trades(limit=1)[0]
+    assert t["exit_reason"] is None  # 保持 open
+    assert t["exit_price"] is None
+
+
 def test_sweep_zombie_open_current_bucket_skips(tmp_path):
     """当前桶(未过窗口)不应被 sweep 误伤。"""
     db, acc = _fresh(tmp_path)
@@ -1053,7 +1115,7 @@ def test_expire_orphan_logs_order_failed_as_missed_fill(tmp_path, caplog):
 
 
 def test_expire_orphan_normal_state_no_missed_fill_log(tmp_path, caplog):
-    """终态 canceled(daily_cancel 撤的)不产生「漏单」告警; 回查失败也不阻塞清理。"""
+    """终态 canceled(daily_cancel 撤的)不产生「漏单」告警; 回查失败保持 open 下轮重试。"""
     import logging
     db, acc = _fresh(tmp_path)
     _mk_open_trade(db, algo_id="C1")
@@ -1066,7 +1128,8 @@ def test_expire_orphan_normal_state_no_missed_fill_log(tmp_path, caplog):
     assert db.list_trades(limit=1)[0]["exit_reason"] == "ORPHAN"
     assert "漏单" not in caplog.text
 
-    # get_algo_order 抛异常 → 不阻塞
+    # get_algo_order 抛异常 → 不标 ORPHAN, 保持 open 下轮重试
+    # (回查失败时贸然标可能误杀已触发活仓, 2026-07-28 trade#537 教训)
     _mk_open_trade(db, algo_id="E1", pair="BTC-USDT-SWAP")
 
     class BoomOKX(FakeOKX):
@@ -1077,4 +1140,4 @@ def test_expire_orphan_normal_state_no_missed_fill_log(tmp_path, caplog):
     row2 = [t for t in db.list_trades(limit=5) if t["okx_order_id"] == "E1"][0]
     r2._expire_as_orphan(row2)
     assert [t for t in db.list_trades(limit=5)
-            if t["okx_order_id"] == "E1"][0]["exit_reason"] == "ORPHAN"
+            if t["okx_order_id"] == "E1"][0]["exit_reason"] is None
