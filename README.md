@@ -40,8 +40,8 @@ scripts/               # 只留活的
 
 tests/                 # pytest(52 项)
 docs/
-  OPERATIONS.md        # 运维手册(启动/停止/故障/日常查看)
-  backtest_validated.md# 三层验证报告(walk-forward + 滑点 + 张数封顶)
+  运维手册.md        # 运维手册(启动/停止/故障/日常查看)
+  回测三层验证报告.md# 三层验证报告(walk-forward + 滑点 + 张数封顶)
   daily_reports/       # 自动生成的每日 md 报告
 csv_data/              # 730 天历史 K(3 pair × 9 周期 = 27 份)
 reports/               # 回测结果 CSV(grid_148 网格 / lab_* 分层验证 / portfolio_* 组合结论)
@@ -62,13 +62,13 @@ python -m pytest tests/
 python main.py
 ```
 
-**日常运维**:详见 `docs/OPERATIONS.md`(启动/停止/切换实盘/日常查看/故障处理)。
+**日常运维**:详见 `docs/运维手册.md`(启动/停止/切换实盘/日常查看/故障处理)。
 
 ---
 
 ## 回测方法论
 
-三层交叉验证,详见 `docs/backtest_validated.md`:
+三层交叉验证,详见 `docs/回测三层验证报告.md`:
 
 1. **Walk-Forward**:18 月 train 选参 + 6 月 test 验证,反过拟合
 2. **滑点敏感性**:0/10/30/50bp 扫描,判断稳健性

@@ -17,7 +17,7 @@ UTC 桶一致，但和历史模拟盘的错桶业绩不能直接类比。
 
 - 数据源：`data/trades.db`（快照文件 `trades_YYYY-MM-DD.db` 附在同目录）
 - 过滤条件：`account = ? AND entry_time IS NOT NULL AND exit_time >= '<start>'`
-- 对比基准：`docs/backtest_validated.md` 里对应参数的预期数字（或 walk-forward test 集）
+- 对比基准：`docs/回测三层验证报告.md` 里对应参数的预期数字（或 walk-forward test 集）
 - 取样命令（示例）：
   ```
   sqlite3 data/trades.db "SELECT pair, side, entry_time, exit_time, exit_reason,
@@ -56,4 +56,4 @@ UTC 桶一致，但和历史模拟盘的错桶业绩不能直接类比。
 
 - db 快照：`trades_YYYY-MM-DD.db`
 - 相关日志：`logs/bot.log.YYYY-MM-DD`（若有）
-- 回测报告：`docs/backtest_validated.md#<section>`
+- 回测报告：`docs/回测三层验证报告.md#<section>`

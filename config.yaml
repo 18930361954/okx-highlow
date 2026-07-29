@@ -55,7 +55,7 @@ accounts:
   # 每笔固定 10% margin,单笔封顶 1500 USDT,taker 5bp × 2,funding 3bp/8h,滑点 10bp。
   # 参数已过 Walk-Forward 反过拟合 (18 月 train → 6 月 test 仍盈利,MDD 不显著恶化)
   # 参数已过 10bp 滑点敏感性 (OKX 主流币日常滑点 5-15bp 是稳健区间)
-  # 参数详情见 docs/backtest_validated.md
+  # 参数详情见 docs/回测三层验证报告.md
   #
   # ==================== 实盘账户 (2026-07-28 全停: 先回模拟盘跑半个月, 稳健优先) ====================
   # v1-highlow 旧策略 07-13~07-26 净 -68.28U 已停; v2-trend 07-27 短暂上实盘, 07-28 撤回模拟盘验证。
@@ -105,9 +105,9 @@ accounts:
         BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.015 }
 
   # ==================== 模拟盘账户 (2026-07-28 启: v3-mixed 推荐组合 A/B/C 全量验证半个月, 至 08-11) ====================
-  # 参数逐项照抄 reports/portfolio_3coin_final.json + docs/strategy_research_2026-07.md 第四节。
+  # 参数逐项照抄 reports/portfolio_3coin_final.json + docs/策略研究报告_2026-07.md 第四节。
   # 本轮首次启用 fade(SOL 唯一幸存结构) / reversal(ETH 12H) / 每账户混周期。
-  # 重点观察项(见 docs/fade_reversal_mixed_period.md 第三节):
+  # 重点观察项(见 docs/策略结构_fade_reversal_混周期.md 第三节):
   #   1) `[reconcile][fade] 两腿都已成交` 出现频率 = both-fill 成本(回测里不存在)
   #   2) trigger 触发失败漏单(计划委托不冻结保证金, 触发瞬间保证金不足会拒单)
   #   3) 混周期桶末撤单是否误撤长周期 pair 未到期挂单
