@@ -75,6 +75,15 @@ class OKXClient:
     # 底层再 retry 反而把幂等键“用掉”后返回 code=1 空响应，同时留下 2~3 张 pending 需 reconcile 撤。
     # 现在 51149 直接抛给上层 order_manager，由 place_algo_orders 的 clOrdId 回查兜底把 algoId 取回。
     _RETRYABLE_OKX_CODES = {"51290"}
+    # 仅 GET 读端可重试的服务端瞬时错误：
+    #   50001 Matching engine upgrading / Service temporarily unavailable
+    #         —— OKX 官方定义为撮合引擎升级/服务临时不可用, msg 明确要求 try again later;
+    #         ccxt 归类 OnMaintenance(→NetworkError, 可退避重试)。常聚集在资金费结算
+    #         时刻(00/08/16 UTC), 2026-07-29 模拟盘 07:31~08:21 UTC 故障持续报此码。
+    # POST 写端不重试: 批量端点返 code=1+sCode=50001 属明确拒单(单据未建成, 重试不会
+    # 重复建单), 但此类故障动辄数十分钟, 底层秒级退避救不回 —— 漏挂由上层 catchup
+    # 补挂窗口恢复, 底层重试只会拖慢失败返回。
+    _RETRYABLE_OKX_CODES_GET = {"50001"}
 
     def _request(
         self,
@@ -123,15 +132,18 @@ class OKXClient:
                         # 让 main.py 的 except 分支决定日志级别
                         if code != "59669":
                             self.logger.warning(msg)
-                    if code in self._RETRYABLE_OKX_CODES and attempt < max_retries - 1:
-                        last_err = OKXError(msg, code=code)
-                        wait = 2 ** attempt
-                        if self.logger:
-                            self.logger.warning(
-                                f"OKX retryable code={code} (attempt {attempt+1}); retry in {wait}s"
-                            )
-                        time.sleep(wait)
-                        continue
+                    if code in self._RETRYABLE_OKX_CODES or (
+                        method == "GET" and code in self._RETRYABLE_OKX_CODES_GET
+                    ):
+                        if attempt < max_retries - 1:
+                            last_err = OKXError(msg, code=code)
+                            wait = 2 ** attempt
+                            if self.logger:
+                                self.logger.warning(
+                                    f"OKX retryable code={code} (attempt {attempt+1}); retry in {wait}s"
+                                )
+                            time.sleep(wait)
+                            continue
                     raise OKXError(msg, code=code)
                 return data
             except (requests.RequestException, ValueError) as e:
