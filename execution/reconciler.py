@@ -190,6 +190,8 @@ class Reconciler:
         # 本轮 run_once 中是否遇到过网络异常。tick 层据此做熔断退避,防止 DNS/断网时刷屏。
         # 每轮 run_once 开头重置。
         self.last_run_had_net_error: bool = False
+        # trade_id → 上次重挂保护的时间戳 ms (防 pending 索引延迟导致重复挂)
+        self._rearm_at: dict[int, int] = {}
 
     @staticmethod
     def _match_position_history(rows: list[dict], side: str, close_px: float,
@@ -536,6 +538,10 @@ class Reconciler:
         # fade OCO: 主 entry/exit 匹配之后统一撤"一腿已成交"组的未成交对向腿。
         # 必须在主循环之后 —— 循环中途 entry_time 未落库会误判对向腿未成交而错撤。
         self._sweep_fade_oco()
+
+        # 活仓保护兜底: TP/SL OCO 触发后落地限价单未成交 → 撤残单重挂 OCO
+        # (2026-07-30 ETH V 反事故: TP 触发未成交, OCO 一次性消耗, SL 裸奔 10h)。
+        self._sweep_unprotected_positions()
 
         # 尾部僵尸兜底: 主匹配跑完后,algoId 仍死、bucket 已过、未 entry filled 的 → ORPHAN
         self._sweep_zombie_open()
@@ -1146,6 +1152,112 @@ class Reconciler:
 
         # 记录本轮 pending algoId 集合供 run_once 尾部 _sweep_zombie_open 使用
         self._last_pending_algo_ids = all_pending_algo_ids
+
+    def _sweep_unprotected_positions(self) -> None:
+        """活仓保护兜底: 已入场未平仓 trade, 若 OKX 上既无 pending TP/SL OCO,
+        也无活的落地平仓限价单可成交保护 → 说明 OCO 触发过但限价没吃到(V 反),
+        撤掉残单并按原 TP/SL 参数重挂独立 OCO。
+
+        2026-07-30 事故: ETH short TP 触发, 限价 1910.55 未成交, OCO 一次性消耗,
+        SL 1983.53 随之作废, 活仓无保护裸奔 10 小时。
+
+        判定链(全部来自 OKX 实时状态, 不依赖本地推断):
+          1. db open trade 且 entry_time 有值(已入场)
+          2. OKX 确认该 pair+posSide 真有持仓(pos != 0)
+          3. 主 algo get_algo_order → attachAlgoOrds 取原 TP/SL 参数
+          4. pending oco/conditional 里没有该 posSide 的 reduceOnly 保护单
+          5. 落地的平仓限价残单(reduceOnly, 带 OCO algoId)一并撤掉再重挂
+        重挂用 place_oco_order(sz=当前持仓量), 5 分钟冷却防 pending 索引延迟重复挂。
+        """
+        try:
+            open_trades = self.db.list_open_trades(account=self.account_name)
+        except Exception:
+            return
+        entered = [t for t in open_trades if t.get("entry_time")]
+        if not entered:
+            return
+
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        for t in entered:
+            tid = t.get("id")
+            pair = t.get("pair")
+            side = str(t.get("side") or "").lower()  # long/short = posSide
+            algo_id = str(t.get("okx_order_id") or "")
+            if not pair or not algo_id or side not in ("long", "short"):
+                continue
+            if now_ms - self._rearm_at.get(tid, 0) < 5 * 60 * 1000:
+                continue
+            try:
+                pos_rows = self.okx.get_positions(instId=pair)
+                pos = next((p for p in pos_rows
+                            if str(p.get("posSide") or "").lower() == side
+                            and float(p.get("pos") or 0) != 0), None)
+                if pos is None:
+                    continue  # 无持仓: 平仓匹配流程会处理
+
+                # 有无 pending 的 OCO/conditional 保护单 (posSide 对齐)
+                protected = False
+                for typ in ("oco", "conditional"):
+                    for o in self.okx.list_pending_algos(instId=pair, ordType=typ):
+                        if str(o.get("posSide") or "").lower() == side:
+                            protected = True
+                            break
+                    if protected:
+                        break
+                if protected:
+                    continue
+
+                # 主 algo 的 attachAlgoOrds = 原始 TP/SL 参数 (权威源)
+                od = self.okx.get_algo_order(algoId=algo_id)
+                attach = (od or {}).get("attachAlgoOrds") or []
+                a = attach[0] if attach and isinstance(attach[0], dict) else {}
+                tp_trig = str(a.get("tpTriggerPx") or "")
+                sl_trig = str(a.get("slTriggerPx") or "")
+                if not tp_trig and not sl_trig:
+                    continue  # 原单就没带 TP/SL, 不属于本兜底范围
+
+                # 撤掉 OCO 触发后落地未成交的平仓残单 (reduceOnly), 释放冻结仓位
+                for o in self.okx.list_pending_orders(instId=pair):
+                    if str(o.get("posSide") or "").lower() != side:
+                        continue
+                    if str(o.get("reduceOnly", "")).lower() != "true":
+                        continue
+                    ord_id = o.get("ordId")
+                    if ord_id:
+                        self.okx.cancel_order(pair, ord_id)
+                        if self.logger:
+                            self.logger.warning(
+                                f"[reconcile] [protect] trade#{tid} {pair} 撤触发未成交"
+                                f"平仓残单 ordId={ord_id} (重挂完整 OCO 前清场)"
+                            )
+
+                close_side = "sell" if side == "long" else "buy"
+                sz = str(pos.get("pos") or "")
+                self.okx.place_oco_order(
+                    instId=pair,
+                    tdMode=str(pos.get("mgnMode") or "cross"),
+                    side=close_side,
+                    sz=sz,
+                    posSide=side,
+                    tpTriggerPx=tp_trig or None,
+                    tpOrdPx=str(a.get("tpOrdPx") or "") or None,
+                    slTriggerPx=sl_trig or None,
+                    slOrdPx=str(a.get("slOrdPx") or "") or None,
+                )
+                self._rearm_at[tid] = now_ms
+                if self.logger:
+                    self.logger.error(
+                        f"[reconcile] [protect] trade#{tid} {pair} {side} 活仓无 TP/SL "
+                        f"保护(OCO 触发未成交后消耗) → 已重挂 OCO tp={tp_trig} sl={sl_trig} "
+                        f"sz={sz}"
+                    )
+            except Exception as e:
+                self._mark_if_net_error(e)
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] [protect] trade#{tid} {pair} 保护检查失败"
+                        f"(下轮重试): {e}"
+                    )
 
     def _sweep_zombie_open(self) -> None:
         """兜底扫 db.open trade: algoId 不在 OKX pending 且信号桶已过 → 标 ORPHAN。

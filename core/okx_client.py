@@ -292,6 +292,45 @@ class OKXClient:
             body["reduceOnly"] = True
         return self._request("POST", "/api/v5/trade/order-algo", body=body)
 
+    def place_oco_order(
+        self,
+        instId: str,
+        tdMode: str,
+        side: str,
+        sz: str,
+        posSide: str | None = None,
+        tpTriggerPx: str | None = None,
+        tpOrdPx: str | None = None,
+        slTriggerPx: str | None = None,
+        slOrdPx: str | None = None,
+        triggerPxType: str = "last",
+        reduceOnly: bool = True,
+        ccy: str = "USDT",
+    ) -> dict:
+        """独立 OCO 止盈止损单(挂在已有持仓上)。
+        注意与 trigger 单相反: oco 的 tp/sl 是顶层字段, attachAlgoOrds 会被拒。"""
+        body: dict[str, Any] = {
+            "instId": instId,
+            "tdMode": tdMode,
+            "side": side,
+            "ordType": "oco",
+            "sz": sz,
+            "ccy": ccy,
+        }
+        if posSide:
+            body["posSide"] = posSide
+        if tpTriggerPx is not None:
+            body["tpTriggerPx"] = tpTriggerPx
+            body["tpOrdPx"] = tpOrdPx if tpOrdPx is not None else "-1"
+            body["tpTriggerPxType"] = triggerPxType
+        if slTriggerPx is not None:
+            body["slTriggerPx"] = slTriggerPx
+            body["slOrdPx"] = slOrdPx if slOrdPx is not None else "-1"
+            body["slTriggerPxType"] = triggerPxType
+        if reduceOnly:
+            body["reduceOnly"] = True
+        return self._request("POST", "/api/v5/trade/order-algo", body=body)
+
     def cancel_algo_order(self, algoId: str, instId: str) -> dict:
         body = [{"algoId": algoId, "instId": instId}]
         return self._request("POST", "/api/v5/trade/cancel-algos", body=body)

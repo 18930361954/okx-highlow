@@ -96,3 +96,62 @@ def test_pending_tp_sl_falls_back_to_top_level():
 
 def test_pending_tp_sl_all_empty_returns_dash():
     assert _pending_tp_sl({}) == ("-", "-")
+
+
+class _FakeOKXPanel:
+    """带持仓 + oco 保护单的最小 fake, 覆盖 _collect/_render 全链路。"""
+
+    def __init__(self, protected=True):
+        self._protected = protected
+
+    def list_pending_algos(self, instType="SWAP", instId=None, ordType="trigger"):
+        if ordType == "oco" and self._protected:
+            return [{"instId": "ETH-USDT-SWAP", "posSide": "short",
+                     "tpTriggerPx": "1910.35", "slTriggerPx": "1983.53"}]
+        return []
+
+    def get_positions(self, instId=None):
+        return [{"instId": "ETH-USDT-SWAP", "posSide": "short", "pos": "5.29",
+                 "avgPx": "1925.57", "last": "1920.11", "upl": "2.88"}]
+
+
+def _mk_monitor(okx):
+    from execution.position_monitor import PositionMonitor
+
+    class _Acc:
+        def get_balance(self):
+            return 100.0
+        def is_in_cooldown(self):
+            return False
+        def get_consecutive_losses(self):
+            return 0
+        max_losses = 3
+
+    class _Db:
+        def list_trades(self, limit=500, account=None, strategy=None):
+            return []
+
+    return PositionMonitor(okx_client=okx, db=_Db(), account_state=_Acc(),
+                           config={})
+
+
+def test_render_position_shows_tp_sl_and_last():
+    """持仓行展示 现价/TP/SL (2026-07-30 裸奔事故可视化需求)。"""
+    from rich.console import Console
+    mon = _mk_monitor(_FakeOKXPanel(protected=True))
+    console = Console(record=True, width=200)
+    console.print(mon._render())
+    out = console.export_text()
+    assert "1920.11" in out          # 现价
+    assert "1910.35" in out          # TP
+    assert "1983.53" in out          # SL
+
+
+def test_render_unprotected_position_warns():
+    """无 TP/SL 保护单的持仓行显示 无! 警示。"""
+    from rich.console import Console
+    mon = _mk_monitor(_FakeOKXPanel(protected=False))
+    console = Console(record=True, width=200)
+    console.print(mon._render())
+    out = console.export_text()
+    assert "无!" in out

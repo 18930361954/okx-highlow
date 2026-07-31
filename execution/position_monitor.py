@@ -306,6 +306,14 @@ class PositionMonitor:
                 pendings = rt.okx.list_pending_algos(ordType="trigger")
             except Exception:
                 pendings = []
+            # 持仓的 TP/SL 保护单: entry 成交后 attach 转成的 oco / 兜底重挂的 oco /
+            # 手工 conditional。按 instId+posSide 匹配到持仓行展示。
+            protect_algos: list[dict] = []
+            for _typ in ("oco", "conditional"):
+                try:
+                    protect_algos.extend(rt.okx.list_pending_algos(ordType=_typ))
+                except Exception:
+                    pass
             try:
                 positions = [p for p in rt.okx.get_positions()
                              if float(p.get("pos", 0) or 0) != 0]
@@ -351,6 +359,7 @@ class PositionMonitor:
                 "losses": losses,
                 "max_losses": max_losses,
                 "pendings": pendings,
+                "protect_algos": protect_algos,
                 "positions": positions,
                 "today_filled": today_filled,
                 "today_pnl": today_pnl,
@@ -510,7 +519,7 @@ class PositionMonitor:
         # === 当前持仓表 ===
         pos_tbl = Table(title="当前持仓 (全账户)", show_header=True,
                          header_style="magenta", expand=True)
-        for c in ("账户", "品种", "方向", "张数", "均价", "未实现盈亏"):
+        for c in ("账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"):
             pos_tbl.add_column(c, no_wrap=True)
         any_pos = False
         for a in snap:
@@ -523,12 +532,24 @@ class PositionMonitor:
                     upl_cell = f"[{upl_style}]{upl_v:+,.2f}[/{upl_style}]" if upl_style else upl
                 except (ValueError, TypeError):
                     upl_cell = upl
+                # 匹配该持仓的 TP/SL 保护单 (instId + posSide 对齐)
+                tp = sl = ""
+                for o in a.get("protect_algos") or []:
+                    if (o.get("instId") == p.get("instId")
+                            and str(o.get("posSide") or "").lower()
+                            == str(p.get("posSide") or "").lower()):
+                        tp, sl = _pending_tp_sl(o)
+                        break
+                # 无保护单 = 裸奔, 红色警示 (2026-07-30 OCO 触发未成交事故可视化)
+                if not tp and not sl:
+                    tp = sl = "[red]无![/red]"
                 pos_tbl.add_row(
                     a["name"], str(p.get("instId", "")), _dir_zh(p.get("posSide", "")),
-                    str(p.get("pos", "")), str(p.get("avgPx", "")), upl_cell,
+                    str(p.get("pos", "")), str(p.get("avgPx", "")),
+                    str(p.get("last", "")), tp or "-", sl or "-", upl_cell,
                 )
         if not any_pos:
-            pos_tbl.add_row("(无)", "", "", "", "", "")
+            pos_tbl.add_row("(无)", "", "", "", "", "", "", "", "")
 
         # === 最近成交表 ===
         # 全账户 · 全历史真实成交(TP/SL/EXIT), 按 exit_time 倒序, 取最近 N 条

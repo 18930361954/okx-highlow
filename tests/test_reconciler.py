@@ -40,6 +40,7 @@ class FakeOKX:
         self.algo_orders = dict(algo_orders or {})  # algoId → 终态单据 (get_algo_order)
         self.cancelled: list[tuple[str, str]] = []
         self.cancelled_orders: list[tuple[str, str]] = []  # (instId, ordId)
+        self.placed_ocos: list[dict] = []  # place_oco_order 调用记录
         self.calls = 0
 
     def list_order_history(self, instId=None, state="filled", limit=100):
@@ -47,7 +48,9 @@ class FakeOKX:
         return list(self.history_by_pair.get(instId, []))
 
     def list_pending_algos(self, instType="SWAP", instId=None, ordType="trigger"):
-        return [o for o in self.pending if not instId or o.get("instId") == instId]
+        return [o for o in self.pending
+                if (not instId or o.get("instId") == instId)
+                and o.get("ordType", "trigger") == ordType]
 
     def cancel_algo_order(self, algoId, instId):
         self.cancelled.append((algoId, instId))
@@ -76,6 +79,16 @@ class FakeOKX:
 
     def get_algo_order(self, algoClOrdId=None, algoId=None):
         return self.algo_orders.get(algoId)
+
+    def place_oco_order(self, instId, tdMode, side, sz, posSide=None,
+                        tpTriggerPx=None, tpOrdPx=None,
+                        slTriggerPx=None, slOrdPx=None,
+                        triggerPxType="last", reduceOnly=True, ccy="USDT"):
+        self.placed_ocos.append({
+            "instId": instId, "side": side, "sz": sz, "posSide": posSide,
+            "tpTriggerPx": tpTriggerPx, "slTriggerPx": slTriggerPx,
+        })
+        return {"code": "0", "data": [{"algoId": f"OCO{len(self.placed_ocos)}"}]}
 
 
 def _fresh(tmp_path):
@@ -532,6 +545,106 @@ def test_orphan_expire_state_lookup_fails_skips_round(tmp_path):
     t = db.list_trades(limit=1)[0]
     assert t["exit_reason"] is None  # 保持 open
     assert t["exit_price"] is None
+
+
+def _mk_entered_trade(db, algo_id="A1", pair="BTC-USDT-SWAP", side="short",
+                       entry_price=60000.0):
+    tid = _mk_open_trade(db, algo_id=algo_id, pair=pair, side=side,
+                          entry_price=entry_price)
+    with db._conn() as c:
+        c.execute("UPDATE trades SET entry_time=? WHERE id=?",
+                  ("2026-06-30T12:00:00+00:00", tid))
+    return tid
+
+
+_ATTACH_TP_SL = {"attachAlgoOrds": [{
+    "tpTriggerPx": "59400", "tpOrdPx": "59406",
+    "slTriggerPx": "60300", "slOrdPx": "60306",
+}]}
+
+
+def test_unprotected_position_rearms_oco(tmp_path):
+    """2026-07-30 ETH V 反事故防回归: 活仓 + OCO 触发未成交(无 pending 保护单,
+    盘口剩 reduceOnly 残单) → 撤残单, 按主 algo attachAlgoOrds 参数重挂 OCO。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "5.29", "mgnMode": "cross"}],
+        pending=[],  # 无任何 pending algo (oco 已消耗)
+        pending_orders=[  # TP 触发后落地未成交的平仓限价残单
+            {"instId": "BTC-USDT-SWAP", "ordId": "RESID_TP",
+             "posSide": "short", "reduceOnly": "true", "state": "live"},
+        ],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert okx.cancelled_orders == [("BTC-USDT-SWAP", "RESID_TP")]
+    assert len(okx.placed_ocos) == 1
+    oco = okx.placed_ocos[0]
+    assert oco["posSide"] == "short" and oco["side"] == "buy"
+    assert oco["sz"] == "5.29"
+    assert oco["tpTriggerPx"] == "59400" and oco["slTriggerPx"] == "60300"
+
+
+def test_protected_position_not_rearmed(tmp_path):
+    """已有 pending OCO 保护单 → 不动。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "5.29", "mgnMode": "cross"}],
+        pending=[{"instId": "BTC-USDT-SWAP", "algoId": "OCO_LIVE",
+                  "ordType": "oco", "posSide": "short"}],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert okx.placed_ocos == []
+    assert okx.cancelled_orders == []
+
+
+def test_no_position_skips_rearm(tmp_path):
+    """OKX 无持仓(已平/未入场) → 交给平仓匹配流程, 不重挂。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert okx.placed_ocos == []
+
+
+def test_rearm_cooldown_prevents_duplicate(tmp_path):
+    """5 分钟冷却: 同一 trade 连续两轮 sweep 只挂一次 (pending 索引延迟防重复)。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "5.29", "mgnMode": "cross"}],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    r._sweep_unprotected_positions()  # 第二轮: pending 索引未更新, 仍查不到保护单
+    assert len(okx.placed_ocos) == 1
+
+
+def test_no_attach_params_skips_rearm(tmp_path):
+    """主 algo 没带 attachAlgoOrds (无 TP/SL 设计的单) → 不属于兜底范围。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "5.29", "mgnMode": "cross"}],
+        algo_orders={"MAIN1": {"state": "effective", "attachAlgoOrds": []}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert okx.placed_ocos == []
 
 
 def test_sweep_zombie_open_current_bucket_skips(tmp_path):
