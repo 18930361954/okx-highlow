@@ -57,52 +57,61 @@ accounts:
   # 参数已过 10bp 滑点敏感性 (OKX 主流币日常滑点 5-15bp 是稳健区间)
   # 参数详情见 docs/回测三层验证报告.md
   #
-  # ==================== 实盘账户 (2026-07-28 全停: 先回模拟盘跑半个月, 稳健优先) ====================
-  # v1-highlow 旧策略 07-13~07-26 净 -68.28U 已停; v2-trend 07-27 短暂上实盘, 07-28 撤回模拟盘验证。
-  # SOL 停跑(单向策略验证全灭); fade/reversal 腿待开发。
-  # 「6H 主攻」— BTC/ETH 6H trend (34 幸存策略中 6H 最优组)
+  # ==================== 实盘账户 (2026-08-03 配置与模拟盘 v3-mixed A/B/C 对齐, 默认停用) ====================
+  # 与下方模拟盘组合逐项一致; 验收通过后用「切到实盘」(GUI) 或 `hlbot-cli env live` 一键启用。
+  #
+  # 组合 A「6H 主攻」— 6H trend BTC + 6H trend ETH + 6H fade SOL
   - account_name: 初级炼气士-实盘
-    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
-    strategy_name: v2-trend
+    enabled: false                    # ← 验收通过后切换启用
+    strategy_name: v3-mixed
     api_key: abf7c8b5-a75d-4470-866f-52b53bb14a86
     secret_key: 0B7B65EF1A008BDD965F2C85DDA652B0
     passphrase: Zdx19971226@@
     env_adapt: real
-    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
+      # 组合 A 单独 5% 仓位(2026-07-29 决策): 10% 下回测 MDD 60.4% 穿硬停线, 5% 下 31.1%
+      position_pct: 0.05
       signal_bar: 6H
+      mode: trend
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.007, tp_pct: 0.008, sl_pct: 0.030 }
-        ETH-USDT-SWAP: { float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.030 }
+        BTC-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.007, tp_pct: 0.008, sl_pct: 0.030 }
+        ETH-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.030 }
+        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.010, tp_pct: 0.010, sl_pct: 0.030, leverage: 50 }
 
-  # 「1D 防御」— BTC/ETH 1D trend 宽 float 族 (f=1.0%, 高胜率低回撤, 30bp 滑点鲁棒性最好)
+  # 组合 B「混周期」— 1D trend BTC + 4H fade ETH + 6H fade SOL
   - account_name: 初级炼气士2-实盘
-    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
-    strategy_name: v2-trend
+    enabled: false                    # ← 验收通过后切换启用
+    strategy_name: v3-mixed
     api_key: 7ff7534b-0975-43e7-88d1-13642a3c8391
     secret_key: ADAFDBEDAA3F4AEFDBAEFB965B75E215
     passphrase: Zdx19971226@@
     env_adapt: real
-    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP]
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
-      signal_bar: 1D
+      signal_bar: 6H
+      mode: trend
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
-        ETH-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.006, sl_pct: 0.030 }
+        BTC-USDT-SWAP: { signal_bar: 1D, mode: trend, float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
+        ETH-USDT-SWAP: { signal_bar: 4H, mode: fade,  float_pct: 0.010, tp_pct: 0.010, sl_pct: 0.025 }
+        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.005, tp_pct: 0.008, sl_pct: 0.030, leverage: 50 }
 
-  # 「12H BTC 单腿」— 12H 周期仅 BTC trend 过验证 (ETH 12H 需 reversal 模式, 待开发)
+  # 组合 C「防御高胜率」— 1D trend BTC + 12H reversal ETH + 6H fade SOL
   - account_name: 初级炼气士3-实盘
-    enabled: false                    # ← 2026-07-28 停: 转模拟盘验证半个月
-    strategy_name: v2-trend
+    enabled: false                    # ← 验收通过后切换启用
+    strategy_name: v3-mixed
     api_key: 8725f04a-af67-4fb8-aad2-ae62e8cf8ce7
     secret_key: 044B421FB88EBC5DDBFE291A3F6BACC9
     passphrase: Zdx19971226@@
     env_adapt: real
-    pairs: [BTC-USDT-SWAP]
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
-      signal_bar: 12H
+      signal_bar: 6H
+      mode: trend
       pair_overrides:
-        BTC-USDT-SWAP: { float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.015 }
+        BTC-USDT-SWAP: { signal_bar: 1D,  mode: trend,    float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.030 }
+        ETH-USDT-SWAP: { signal_bar: 12H, mode: reversal, float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
+        SOL-USDT-SWAP: { signal_bar: 6H,  mode: fade,     float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.030, leverage: 50 }
 
   # ==================== 模拟盘账户 (2026-07-28 启: v3-mixed 推荐组合 A/B/C 全量验证半个月, 至 08-11) ====================
   # 参数逐项照抄 reports/portfolio_3coin_final.json + docs/策略研究报告_2026-07.md 第四节。
