@@ -10,6 +10,7 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 
 from ui.bridge import BotBridge
@@ -36,6 +37,38 @@ def _fmt(v, nd=2) -> str:
         return str(v or "")
 
 
+def _fmt_signed(v, nd=2) -> str:
+    try:
+        return f"{float(v):+,.{nd}f}"
+    except (TypeError, ValueError):
+        return str(v or "")
+
+
+def _dir_plain(raw) -> str:
+    v = str(raw or "").lower()
+    if v in ("long", "buy"):
+        return "做多"
+    if v in ("short", "sell"):
+        return "做空"
+    return str(raw or "")
+
+
+def _pnl_tag(v) -> tuple:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ()
+    if v > 0:
+        return ("profit",)
+    if v < 0:
+        return ("loss",)
+    return ()
+
+
+def _pf_str(pf: float) -> str:
+    return "∞" if pf == float("inf") else f"{pf:.2f}"
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -44,7 +77,7 @@ class App:
         self._snap_stop = threading.Event()
 
         root.title(f"HighLow Bot v{_app_version()}")
-        root.geometry("1180x720")
+        root.geometry("1420x760")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # 状态栏先建 (标签页构建过程会写 self.status), side=bottom 先 pack 保证在底部
@@ -76,59 +109,127 @@ class App:
 
     def _build_monitor_tab(self):
         f = self.tab_mon
+        self._bot_started_at = None
 
-        def mk_tree(parent, title, cols, height):
+        import tkinter.font as tkfont
+        base_font = tkfont.nametofont("TkDefaultFont")
+        self._bold_font = base_font.copy()
+        self._bold_font.configure(weight="bold")
+
+        def mk_tree(parent, title, cols, height, widths=None):
             frame = ttk.LabelFrame(parent, text=title)
             tree = ttk.Treeview(frame, columns=cols, show="headings", height=height)
             for c in cols:
                 tree.heading(c, text=c)
-                tree.column(c, width=90, anchor="center", stretch=True)
+                tree.column(c, width=(widths or {}).get(c, 78), anchor="center", stretch=True)
             tree.pack(fill="both", expand=True)
+            # 红绿盈亏 + env 合计加粗 (Treeview 只支持整行着色)
+            tree.tag_configure("profit", foreground="#0a7d32")
+            tree.tag_configure("loss", foreground="#c62828")
+            tree.tag_configure("total", font=self._bold_font, background="#eef2f7")
             return frame, tree
 
         top = ttk.Frame(f); top.pack(fill="x")
         self.mon_header = tk.StringVar(value="(等待数据 — 机器人未启动)")
-        ttk.Label(top, textvariable=self.mon_header, anchor="w").pack(fill="x", padx=6, pady=4)
+        ttk.Label(top, textvariable=self.mon_header, anchor="w",
+                  font=self._bold_font).pack(fill="x", padx=6, pady=(4, 0))
+        self.mon_header2 = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.mon_header2, anchor="w").pack(fill="x", padx=6, pady=(0, 4))
 
-        fr1, self.tree_acc = mk_tree(f, "账户概览", (
-            "账户", "环境", "周期", "余额", "熔断", "挂单", "持仓", "今日净", "总笔", "胜率", "净PnL"), 4)
+        fr1, self.tree_acc = mk_tree(f, "账户概览 (当前 + 全历史, 含 env 合计)", (
+            "账户", "环境", "周期", "余额", "熔断", "挂单", "持仓", "今日净",
+            "撤/过", "总笔", "胜率", "净PnL", "手续费累", "资金费累", "盈亏比", "回撤%"),
+            5, widths={"账户": 130, "撤/过": 55, "熔断": 45, "环境": 55})
         fr1.pack(fill="x", padx=6, pady=3)
 
         fr2, self.tree_pos = mk_tree(f, "当前持仓", (
-            "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"), 4)
+            "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"),
+            4, widths={"账户": 130, "品种": 110})
         fr2.pack(fill="x", padx=6, pady=3)
         self.tree_pos.tag_configure("unprotected", background="#ffd6d6")
 
         fr3, self.tree_pend = mk_tree(f, "待触发挂单", (
-            "账户", "品种", "方向", "触发价", "TP", "SL"), 5)
+            "账户", "品种", "周期", "方向", "触发价", "TP", "SL", "AlgoID"),
+            5, widths={"账户": 130, "品种": 110, "AlgoID": 140})
         fr3.pack(fill="x", padx=6, pady=3)
 
         fr4, self.tree_recent = mk_tree(f, "最近成交", (
-            "时间", "账户", "品种", "方向", "入场", "出场", "原因", "净PnL"), 5)
+            "时间", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
+            "名义PnL", "手续费", "资金费", "净PnL"),
+            5, widths={"时间": 130, "账户": 130, "品种": 110})
         fr4.pack(fill="both", expand=True, padx=6, pady=3)
 
     def _refresh_monitor(self, snap: list[dict]):
-        from execution.position_monitor import _pending_tp_sl
+        from execution.position_monitor import (_bar_of, _compute_lifetime_stats,
+                                                _exit_reason_zh, _fmt_uptime,
+                                                _pending_tp_sl)
 
         total_bal = sum(a["balance"] for a in snap)
         total_net = sum(a["today_net"] for a in snap)
+        total_pnl = sum(a.get("today_pnl", 0.0) for a in snap)
+        total_fee = sum(a.get("today_fee", 0.0) for a in snap)
+        total_funding = sum(a.get("today_funding", 0.0) for a in snap)
+        total_life_fee = sum(a["lifetime"].get("sum_fee", 0.0) for a in snap)
+        total_life_funding = sum(a["lifetime"].get("sum_funding", 0.0) for a in snap)
+        total_cancelled = sum(a.get("today_cancelled", 0) for a in snap)
+        total_orphan = sum(a.get("today_orphan", 0) for a in snap)
         n_pos = sum(len(a["positions"]) for a in snap)
         n_pend = sum(len(a["pendings"]) for a in snap)
+
+        now = datetime.now(timezone.utc)
+        uptime = (_fmt_uptime((now - self._bot_started_at).total_seconds())
+                  if self._bot_started_at else "-")
         self.mon_header.set(
-            f"总余额 {_fmt(total_bal)} USDT   今日净盈亏 {_fmt(total_net)}   "
-            f"挂单 {n_pend}   持仓 {n_pos}")
+            f"账户 {len(snap)}   总余额 {_fmt(total_bal)} USDT   挂单 {n_pend}   持仓 {n_pos}   "
+            f"今日撤单 {total_cancelled}   今日过期 {total_orphan}   "
+            f"运行 {uptime}   {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        self.mon_header2.set(
+            f"今日名义 {_fmt_signed(total_pnl)}   "
+            f"手续费(今/累) {total_fee:.4f}/{total_life_fee:.4f}   "
+            f"资金费(今/累) {total_funding:+.4f}/{total_life_funding:+.4f}   "
+            f"今日净盈亏 {_fmt_signed(total_net)}")
 
         for tree in (self.tree_acc, self.tree_pos, self.tree_pend, self.tree_recent):
             tree.delete(*tree.get_children())
 
-        for a in snap:
-            lt = a["lifetime"]
+        def _acc_row(name, env, period, balance, in_cd, pendings, positions,
+                     today_net, cancelled, orphan, lt, tags=()):
             self.tree_acc.insert("", "end", values=(
-                a["name"], a["env"], a["signal_bar"], _fmt(a["balance"]),
-                "是" if a["in_cd"] else "否", len(a["pendings"]), len(a["positions"]),
-                _fmt(a["today_net"]), lt["total"], f"{lt['win_rate']:.1f}%",
-                _fmt(lt["net_pnl"])))
+                name, env, period, _fmt(balance), "是" if in_cd else "否",
+                pendings, positions, _fmt_signed(today_net),
+                f"{cancelled}/{orphan}", lt["total"], f"{lt['win_rate']:.1f}%",
+                _fmt_signed(lt["net_pnl"]),
+                f"{lt.get('sum_fee', 0.0):.4f}", f"{lt.get('sum_funding', 0.0):+.4f}",
+                _pf_str(lt["profit_factor"]), f"{lt['max_dd_pct']:.1f}%"),
+                tags=tags)
 
+        # 按 env 分组: real/live 在前, demo 在后; 每组末尾加"env 合计"行
+        by_env: dict[str, list[dict]] = {}
+        for a in snap:
+            by_env.setdefault(a["env"] or "unknown", []).append(a)
+        env_order = [e for e in ("real", "live", "demo") if e in by_env] + \
+                    [e for e in by_env if e not in ("real", "live", "demo")]
+
+        for env in env_order:
+            accts = by_env[env]
+            for a in accts:
+                lt = a["lifetime"]
+                _acc_row(a["name"], env, a["signal_bar"], a["balance"], a["in_cd"],
+                         len(a["pendings"]), len(a["positions"]), a["today_net"],
+                         a.get("today_cancelled", 0), a.get("today_orphan", 0),
+                         lt, tags=_pnl_tag(lt["net_pnl"]))
+            merged_trades = [t for a in accts for t in a["valid_trades"]]
+            merged_bal = sum(a["balance"] for a in accts)
+            agg = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
+            _acc_row(f"{env} 合计", "", "", merged_bal, False,
+                     sum(len(a["pendings"]) for a in accts),
+                     sum(len(a["positions"]) for a in accts),
+                     sum(a["today_net"] for a in accts),
+                     sum(a.get("today_cancelled", 0) for a in accts),
+                     sum(a.get("today_orphan", 0) for a in accts),
+                     agg, tags=("total",))
+
+        for a in snap:
             for p in a["positions"]:
                 tp = sl = ""
                 for o in a.get("protect_algos") or []:
@@ -138,29 +239,39 @@ class App:
                         tp, sl = _pending_tp_sl(o)
                         break
                 unprotected = not tp and not sl
+                tags = ("unprotected",) if unprotected else _pnl_tag(p.get("upl"))
                 self.tree_pos.insert("", "end", values=(
-                    a["name"], p.get("instId", ""), p.get("posSide", ""),
+                    a["name"], p.get("instId", ""), _dir_plain(p.get("posSide", "")),
                     p.get("pos", ""), p.get("avgPx", ""), p.get("last", ""),
-                    tp or "无!", sl or "无!", _fmt(p.get("upl"))),
-                    tags=("unprotected",) if unprotected else ())
+                    tp or "无!", sl or "无!", _fmt_signed(p.get("upl"))),
+                    tags=tags)
 
             for o in a["pendings"]:
                 tp, sl = _pending_tp_sl(o)
                 self.tree_pend.insert("", "end", values=(
-                    a["name"], o.get("instId", ""), o.get("side", ""),
-                    o.get("triggerPx", ""), tp, sl))
+                    a["name"], o.get("instId", ""),
+                    _bar_of(o, a.get("pair_bars") or {}),
+                    _dir_plain(o.get("side", "")),
+                    o.get("triggerPx", ""), tp, sl,
+                    str(o.get("algoId", ""))[:18]))
 
         recent = []
         for a in snap:
             for r in a["valid_trades"]:
-                recent.append((a["name"], r))
+                recent.append((a["name"], r, a.get("pair_bars") or {}))
         recent.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
-        for name, r in recent[:20]:
+        for name, r, pbars in recent[:20]:
+            net = r.get("pnl") or 0
+            fee = r.get("fee") or 0
+            funding = r.get("funding") or 0
+            gross = r.get("pnl_gross") or (net + fee - funding)
             self.tree_recent.insert("", "end", values=(
                 (r.get("exit_time") or "")[:19], name, r.get("pair", ""),
-                r.get("side", ""), _fmt(r.get("entry_price")),
-                _fmt(r.get("exit_price")), r.get("exit_reason", ""),
-                _fmt(r.get("pnl"))))
+                _bar_of(r, pbars), _dir_plain(r.get("side", "")),
+                _fmt(r.get("entry_price")), _fmt(r.get("exit_price")),
+                _exit_reason_zh(r.get("exit_reason", "")), _fmt_signed(gross),
+                f"{fee:.4f}", f"{funding:+.4f}", _fmt_signed(net)),
+                tags=_pnl_tag(net))
 
     # ================= 配置页 =================
 
@@ -508,11 +619,13 @@ class App:
             while True:
                 kind, payload = self.bridge.events.get_nowait()
                 if kind == "started":
+                    self._bot_started_at = datetime.now(timezone.utc)
                     self.status.set(f"运行中: {len(payload)} 个账户 — {', '.join(payload)}")
                     self.btn_start.config(state="disabled")
                     self.btn_stop.config(state="normal")
                     self._ctl_refresh_accounts()
                 elif kind == "stopped":
+                    self._bot_started_at = None
                     self.status.set("已停止")
                     self.btn_start.config(state="normal")
                     self.btn_stop.config(state="disabled")
