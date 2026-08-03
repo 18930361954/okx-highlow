@@ -25,5 +25,10 @@ docs/daily_reports/
 .pytest_cache/
 .pytest_tmp/
 
+# PyInstaller 构建产物
+build/
+dist/
+config.yaml.bak
+
 # claude 本地会话产物
 .claude/

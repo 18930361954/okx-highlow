@@ -39,10 +39,11 @@ class OrderManager:
 
     def __init__(self, okx_client, db, logger=None, ct_val: dict | None = None,
                  td_mode: str = "cross", account: str = DEFAULT_ACCOUNT,
-                 strategy: str | None = None):
+                 strategy: str | None = None, slip_pct: float = SLIP_PCT):
         self.okx = okx_client
         self.db = db
         self.logger = logger
+        self.slip_pct = slip_pct
         # instrument 元信息缓存 pair → {ctVal, lotSz, minSz}
         # 首选:首次下单时从 OKX 拉真值;拉不到用 DEFAULT_INSTRUMENT_META 兜底
         self._meta: dict[str, dict] = {}
@@ -235,13 +236,13 @@ class OrderManager:
         # TP/SL 同样穿价偏移: 挂在触发价上会出现"最新价碰到触发价即回落,限价单不成交,
         # 仓位挂着裸奔"(2026-07-20 ETH 止盈触发未成交事故)。偏移后触发瞬间即 marketable。
         if direction == "long":
-            order_px = round(entry_price * (1 + SLIP_PCT), 6)
-            tp_ord_px = round(tp_price * (1 - SLIP_PCT), 6)   # 卖出平多: 向下穿价
-            sl_ord_px = round(sl_price * (1 - SLIP_PCT), 6)
+            order_px = round(entry_price * (1 + self.slip_pct), 6)
+            tp_ord_px = round(tp_price * (1 - self.slip_pct), 6)   # 卖出平多: 向下穿价
+            sl_ord_px = round(sl_price * (1 - self.slip_pct), 6)
         else:
-            order_px = round(entry_price * (1 - SLIP_PCT), 6)
-            tp_ord_px = round(tp_price * (1 + SLIP_PCT), 6)   # 买入平空: 向上穿价
-            sl_ord_px = round(sl_price * (1 + SLIP_PCT), 6)
+            order_px = round(entry_price * (1 - self.slip_pct), 6)
+            tp_ord_px = round(tp_price * (1 + self.slip_pct), 6)   # 买入平空: 向上穿价
+            sl_ord_px = round(sl_price * (1 + self.slip_pct), 6)
 
         # 幂等键: pair + signal_id + direction + attempt 唯一。
         # OKX 限制 [A-Za-z0-9_-.]{1,32}。sig_id 可能是 '2026-07-08' 或 '2026-07-08T04:00Z'

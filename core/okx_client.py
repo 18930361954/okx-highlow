@@ -28,6 +28,7 @@ class OKXClient:
         logger=None,
         timeout: int = 15,
         proxy_url: str | None = None,
+        base_url: str = OKX_BASE_URL,
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -35,6 +36,7 @@ class OKXClient:
         self.env = env
         self.logger = logger
         self.timeout = timeout
+        self.base_url = base_url
         self._session = requests.Session()
         if proxy_url:
             self._session.proxies = {"http": proxy_url, "https": proxy_url}
@@ -101,7 +103,7 @@ class OKXClient:
             query = ""
         path = endpoint + query
         body_str = json.dumps(body) if body else ""
-        url = OKX_BASE_URL + path
+        url = self.base_url + path
 
         last_err: Exception | None = None
         for attempt in range(max_retries):

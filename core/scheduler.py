@@ -108,6 +108,8 @@ def add_account_jobs(
     report_minute: int = 55,
     signal_second_offset: int = 0,
     pair_signal_bars: dict[str, str] | None = None,
+    signal_minute: int = 2,
+    signal_misfire_grace: int = 300,
 ) -> None:
     """把一个账户的所有 job 注册进已有 scheduler。
     - 单周期(旧行为): signal_bar → 每天 N 次 signal / N 次 cancel cron。
@@ -139,9 +141,9 @@ def add_account_jobs(
     for h in hours:
         sched.add_job(
             _mk_signal(h),
-            trigger=CronTrigger(hour=h, minute=2, second=signal_second_offset, timezone=UTC),
+            trigger=CronTrigger(hour=h, minute=signal_minute, second=signal_second_offset, timezone=UTC),
             id=f"{prefix}.signal_{h:02d}",
-            misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
+            misfire_grace_time=signal_misfire_grace, coalesce=True, max_instances=1, replace_existing=True,
         )
 
     # cancel: 每个桶末尾撤单 (下一次 signal 前 1 分钟)。

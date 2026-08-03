@@ -23,12 +23,14 @@ import requests
 from core.account_state import AccountState
 from core.okx_client import OKXClient, OKXError
 from data.db import DB, DEFAULT_ACCOUNT
-from execution.order_manager import OrderManager
+from execution.order_manager import OrderManager, SLIP_PCT
 from execution.reconciler import Reconciler
 from strategy.high_low import HighLowStrategy
+from utils.app_config import NETWORK_DEFAULTS
+from utils.paths import APP_ROOT
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = APP_ROOT
 
 # ${VAR} 或 ${VAR:default} 占位符 — 私仓一般直接写 key,占位符是备用
 _ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
@@ -120,6 +122,8 @@ class AccountConfig:
     system_config: dict
     proxy_url: str | None
     strategy_name: str | None = None             # 策略版本名(写进 trades.strategy 列)
+    network_config: dict = field(default_factory=dict)   # 顶层 network 段直传
+    advanced_config: dict = field(default_factory=dict)  # 顶层 advanced 段直传
 
     def to_legacy_config(self) -> dict:
         """AccountState/HighLowStrategy 仍吃老结构 {'strategy':..., 'system':..., 'account':...}。"""
@@ -180,6 +184,8 @@ def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
         pairs=pairs, td_mode=td_mode,
         strategy_config=merged_strategy, system_config=system_cfg,
         proxy_url=proxy_url, strategy_name=strategy_name,
+        network_config=dict(top_cfg.get("network") or {}),
+        advanced_config=dict(top_cfg.get("advanced") or {}),
     )
 
 
@@ -237,11 +243,14 @@ class AccountRuntime:
 
         if net_error:
             self._net_fail_count += 1
-            if self._net_fail_count >= _RECON_NET_FAIL_THRESHOLD:
-                over = self._net_fail_count - _RECON_NET_FAIL_THRESHOLD
+            adv_cfg = getattr(self.cfg, "advanced_config", None) or {}
+            th = int(adv_cfg.get("recon_net_fail_threshold", _RECON_NET_FAIL_THRESHOLD))
+            if self._net_fail_count >= th:
+                over = self._net_fail_count - th
                 backoff = min(
-                    _RECON_BACKOFF_BASE_SECS * (2 ** over),
-                    _RECON_BACKOFF_MAX_SECS,
+                    int(adv_cfg.get("recon_backoff_base_sec",
+                                    _RECON_BACKOFF_BASE_SECS)) * (2 ** over),
+                    int(adv_cfg.get("recon_backoff_max_sec", _RECON_BACKOFF_MAX_SECS)),
                 )
                 self._skip_until = time.monotonic() + backoff
                 if self.logger:
@@ -262,19 +271,24 @@ class AccountRuntime:
 def build_runtime(cfg: AccountConfig, db: DB, base_logger) -> AccountRuntime:
     """把 AccountConfig 变成 AccountRuntime。db 是外部注入的共享实例。"""
     logger = _PrefixLogger(base_logger, cfg.name)
+    net_cfg = cfg.network_config or {}
     okx = OKXClient(
         cfg.api_key, cfg.secret_key, cfg.passphrase,
         env=cfg.env, logger=logger, proxy_url=cfg.proxy_url,
+        timeout=int(net_cfg.get("http_timeout_sec", NETWORK_DEFAULTS["http_timeout_sec"])),
+        base_url=str(net_cfg.get("okx_base_url", NETWORK_DEFAULTS["okx_base_url"])),
     )
     legacy_cfg = cfg.to_legacy_config()
     account = AccountState(db, legacy_cfg, logger=logger, account=cfg.name)
     strategy = HighLowStrategy(legacy_cfg, logger=logger)
     order_mgr = OrderManager(okx, db, logger=logger, td_mode=cfg.td_mode, account=cfg.name,
-                             strategy=cfg.strategy_name)
+                             strategy=cfg.strategy_name,
+                             slip_pct=float(cfg.advanced_config.get("slip_pct", SLIP_PCT)))
     reconciler = Reconciler(
         okx, db, account, legacy_cfg, logger=logger,
         strategy=strategy, order_manager=order_mgr,
         account_name=cfg.name,
+        advanced=cfg.advanced_config,
     )
     return AccountRuntime(
         cfg=cfg, okx=okx, db=db, account=account, strategy=strategy,

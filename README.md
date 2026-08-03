@@ -60,14 +60,33 @@ reports/               # 回测结果 CSV(grid_148 网格 / lab_* 分层验证 /
 # 1) 安装依赖
 python -m pip install -r requirements.txt
 
-# 2) 跑测试(142 项)
+# 2) 跑测试
 python -m pytest tests/
 
-# 3) 启动机器人
-python main.py
+# 3) 启动机器人 (三选一)
+python main.py        # 终端面板模式
+python gui_main.py    # GUI 窗口模式
+python main.py report --date 2026-07-30   # 子命令: report / sync-balance / reset-cooldown / fix-orphan / refill-fees / cleanup
 ```
 
 **日常运维**:详见 `docs/运维手册.md`(启动/停止/切换实盘/日常查看/故障处理)。
+
+---
+
+## 打包成 exe (Windows)
+
+```powershell
+build.bat        # = pytest → pyinstaller hlbot.spec → 冒烟 → 泄密断言
+```
+
+产物 `dist\hlbot\`(整个文件夹拷走即可部署):
+
+- `hlbot.exe` — GUI 窗口版(监控/配置编辑/启停控制/日志)
+- `hlbot-cli.exe` — 终端版:无参数=rich 面板模式;带子命令=运维工具(`hlbot-cli report --help`)
+- 首次运行自动在 exe 旁生成 `config.yaml`(从模板),填好 API key 并启用账户后重启
+- `config.yaml`/`.env`/`data/`/`logs/`/`docs/daily_reports/` 都在 exe 旁,可直接编辑/备份
+- 注意:exe 放**可写目录**(不要放 Program Files);停止用窗口按钮或 Ctrl+C,直接关控制台=硬杀
+- 回测类脚本(bucket_backtest / strategy_lab 等 pandas 系)不打包,仍在源码环境跑
 
 ---
 

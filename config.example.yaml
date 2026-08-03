@@ -1,0 +1,84 @@
+# HighLow Bot 配置模板 — 复制为 config.yaml 后填写。
+# API key 三件套支持 ${ENV_VAR} 占位符 (从 .env 读取), 也可直接填明文 (注意保密)。
+# 所有账户默认 enabled: false, 确认参数后再启用。
+
+strategy:
+  # 顶层 = 兜底默认。每个账户会在 accounts[].strategy 里覆盖 signal_bar 和三币 tp/sl/float。
+  pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
+  position_pct: 0.10                  # 每笔仓位 10% 保证金
+  leverage: 100                       # 默认 100x;SOL 可由 pair_overrides 覆盖到 50x
+  float_pct: 0.0015
+  tp_pct: 0.012
+  sl_pct: 0.005
+  trend_filter: true
+  max_consecutive_losses: 3
+  cooldown_hours: 24
+  fixed_mode_threshold: 800000
+  fixed_mode_margin: 1000
+  # 多币下单之间的间隔(秒)。防 OKX algo 单并发限流导致 51149 下单超时。
+  place_gap_sec: 1.0
+  # 单笔张数封顶(与回测口径一致);每账户 pair_overrides 可加 max_contracts 单独覆盖
+  max_contracts:
+    BTC-USDT-SWAP: 1000
+    ETH-USDT-SWAP: 5000
+    SOL-USDT-SWAP: 5000
+
+system:
+  log_level: INFO
+  log_keep_days: 30
+  db_path: data/trades.db
+  daily_report_time_utc: "23:55"
+
+account:
+  env: demo
+  td_mode: cross   # cross 全仓 / isolated 逐仓
+
+network:
+  proxy_enabled: false             # 打开时 OKX REST 全部走 proxy_url
+  proxy_url: "http://127.0.0.1:18081"
+  # okx_base_url: "https://www.okx.com"   # OKX REST 域名 (备用域名/自建反代时改)
+  # http_timeout_sec: 15                  # 单请求超时秒数
+
+# ---------------- advanced: 运行时微调 (整段可删, 删 = 默认行为) ----------------
+# advanced:
+#   slip_pct: 0.0001                 # 挂单穿价偏移 (触发后限价单的让价比例)
+#   fresh_pending_grace_ms: 30000    # 新挂单对账宽限 (毫秒)
+#   rearm_cooldown_sec: 300          # 活仓保护重挂冷却 (秒)
+#   recon_net_fail_threshold: 3      # 网络熔断: 连续失败阈值
+#   recon_backoff_base_sec: 30       # 网络熔断: 退避基数 (秒)
+#   recon_backoff_max_sec: 300       # 网络熔断: 退避上限 (秒)
+#   reconcile_interval_sec: 20       # 对账轮询间隔 (秒)
+#   account_second_offset_step: 3    # 多账户信号触发秒偏移步长
+#   signal_cron_minute: 2            # 信号 cron 的分钟 (整点顺延, 等上一桶收盘)
+#   signal_misfire_grace_sec: 300    # 信号 job 错过后的宽限 (秒)
+#   catchup_skip_bucket_ratio: 0.5   # 启动补挂: 当前桶已过该比例则跳过
+#   panel_refresh_sec: 5             # 终端面板刷新间隔 (秒)
+#   db_busy_timeout_sec: 30          # sqlite busy timeout (秒)
+
+# ---------------- 多账户 ----------------
+# 每账户可选字段:
+#   account_name / name          必填,标识 (用于 db account 列 + 日志前缀)
+#   enabled                       默认 true;false 时跳过
+#   env_adapt / env               real|live / demo
+#   api_key / secret_key / passphrase   该账户的 OKX API 三件套
+#   strategy_name                 策略版本名 (写进 trades.strategy 列, 供报表区分)
+#   pairs                         该账户跑哪些 pair;缺省沿用 strategy.pairs
+#   strategy                      覆盖顶层 strategy 任意字段 (浅覆盖, pair_overrides 深合并)
+#   td_mode                       cross / isolated;缺省沿用 account.td_mode
+accounts:
+  - account_name: 示例账户-模拟
+    enabled: false
+    env_adapt: demo
+    strategy_name: v3-mixed
+    api_key: "${OKX_API_KEY_1}"
+    secret_key: "${OKX_SECRET_KEY_1}"
+    passphrase: "${OKX_PASSPHRASE_1}"
+    pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
+    strategy:
+      position_pct: 0.10
+      signal_bar: 6H
+      mode: trend
+      pair_overrides:
+        BTC-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.007, tp_pct: 0.008, sl_pct: 0.03 }
+        ETH-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.03 }
+        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.01,  tp_pct: 0.01,  sl_pct: 0.03, leverage: 50 }

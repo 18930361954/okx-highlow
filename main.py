@@ -20,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from data.db import DB
 from execution.position_monitor import PositionMonitor
 from utils.logger import get_logger
+from utils.paths import APP_ROOT, ensure_user_files
 from utils.time_helper import (
     fetch_prev_bucket_candles,
     to_ms,
@@ -29,41 +30,12 @@ from utils.time_helper import (
 
 
 UTC = timezone.utc
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_ROOT
 
 
 # ---------------- signal-bucket helpers ----------------
-
-def current_bucket_start(now, signal_bar: str):
-    """给定 now 和 signal_bar,返回「当前正在进行的桶」的起始 UTC datetime。
-    1D 桶起始 = 当天 00:00;4H 桶起始 = 最近一个 0/4/8/12/16/20 时。
-    """
-    hours = signal_hours_for(signal_bar)
-    day_start = now.replace(minute=0, second=0, microsecond=0)
-    # 找 <= now.hour 的最大 h
-    h = max((x for x in hours if x <= now.hour), default=hours[-1] if hours else 0)
-    if h > now.hour:
-        # 当前 hour 小于最小 signal_hour → 用昨天最后一次
-        day_start = day_start - timedelta(days=1)
-        h = hours[-1]
-    return day_start.replace(hour=h)
-
-
-def previous_bucket_start(now, signal_bar: str):
-    """上一桶(即 signal 依据的那一桶)起始 UTC datetime。"""
-    cur = current_bucket_start(now, signal_bar)
-    hours = signal_hours_for(signal_bar)
-    # 找 cur.hour 前面一个 h
-    idx = hours.index(cur.hour)
-    if idx == 0:
-        prev_day = cur - timedelta(days=1)
-        return prev_day.replace(hour=hours[-1])
-    return cur.replace(hour=hours[idx - 1])
-
-
-def bucket_id(start_dt) -> str:
-    """桶标识,存到 db.signal_date。短、可读、UTC。"""
-    return start_dt.strftime("%Y-%m-%dT%H:00Z")
+# 已迁 core/buckets.py (frozen 下 reconciler 不能 from main import)。re-export 保旧引用。
+from core.buckets import bucket_id, current_bucket_start, previous_bucket_start  # noqa: E402,F401
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -279,6 +251,7 @@ def startup_catchup_if_needed(rt: AccountRuntime) -> None:
         logger.warning(f"[catchup] get_positions 失败,仅按 db 判定: {e}")
 
     from core.scheduler import SIGNAL_BAR_HOURS
+    skip_ratio = float(rt.cfg.advanced_config.get("catchup_skip_bucket_ratio", 0.5))
     pending: list[str] = []
     for pair in rt.cfg.pairs:
         signal_bar = rt.strategy.signal_bar_for(pair)
@@ -289,10 +262,10 @@ def startup_catchup_if_needed(rt: AccountRuntime) -> None:
         bucket_hours = 24 // len(hours) if len(hours) >= 1 else 24
         bucket_secs = bucket_hours * 3600
         elapsed = (now - cur_bkt).total_seconds()
-        if elapsed > bucket_secs * 0.5:
+        if elapsed > bucket_secs * skip_ratio:
             logger.info(
                 f"[catchup] {pair} 当前桶 {cur_bkt.strftime('%H:%M')} 已过 "
-                f"{elapsed/60:.0f}/{bucket_secs/60:.0f} 分钟(>50%),跳过补挂,等下桶"
+                f"{elapsed/60:.0f}/{bucket_secs/60:.0f} 分钟(>{skip_ratio:.0%}),跳过补挂,等下桶"
             )
             continue
 
@@ -333,27 +306,22 @@ def init_balance_if_needed(rt: AccountRuntime) -> None:
             rt.logger.error(f"[init] cannot fetch balance: {e}")
 
 
-def main():
-    load_dotenv(PROJECT_ROOT / ".env")
-    config = load_config()
-    base_logger = get_logger(
-        "hl-bot", level=config["system"]["log_level"],
-        keep_days=int(config["system"]["log_keep_days"]),
-    )
-
-    db_path = PROJECT_ROOT / config["system"]["db_path"]
-    db = DB(db_path)
+def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> dict:
+    """启动机器人全部组件 (从 main() 原样抽出, 供 CLI 与 GUI 共用)。
+    返回句柄: {runtimes, sched, monitor, shutdown}。shutdown() 幂等。
+    with_monitor=False 时不起 rich 终端面板 (GUI 模式自己渲染)。"""
+    from utils.app_config import adv
 
     # 加载账户 (无 accounts 段 → 自动合成 default,行为等价旧 main.py)
     try:
         runtimes = load_accounts(config, db, base_logger)
     except Exception as e:
         base_logger.error(f"load_accounts failed: {e}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     if not runtimes:
         base_logger.error("没有可运行的账户,退出")
-        sys.exit(1)
+        raise SystemExit(1)
 
     base_logger.info(f"[boot] 启用 {len(runtimes)} 个账户: {[rt.name for rt in runtimes]}")
 
@@ -392,11 +360,14 @@ def main():
 
     if not ok_runtimes:
         base_logger.error("所有账户 OKX 连接均失败,退出")
-        sys.exit(2)
+        raise SystemExit(2)
 
     # 终端面板:多账户版,显示所有账户余额、挂单、持仓、今日成交
-    monitor = PositionMonitor(runtimes=ok_runtimes, db=db, logger=base_logger)
-    monitor.start()
+    monitor = None
+    if with_monitor:
+        monitor = PositionMonitor(runtimes=ok_runtimes, db=db, logger=base_logger,
+                                  refresh_seconds=adv(config, "panel_refresh_sec"))
+        monitor.start()
 
     # 调度器
     sched = BackgroundScheduler(timezone=UTC)
@@ -406,7 +377,7 @@ def main():
         # 混周期: 每 pair 各自的 signal_bar (pair_overrides.signal_bar 可覆盖账户级)
         pair_bars = {p: rt.strategy.signal_bar_for(p) for p in rt.cfg.pairs}
         # 账户级秒偏移:防多账户同秒触发导致 OKX 51149 并发超时
-        sec_offset = idx * 3
+        sec_offset = idx * adv(config, "account_second_offset_step")
         base_logger.info(f"[{rt.name}] pair_signal_bars="
                           f"{ {p.split('-')[0]: b for p, b in pair_bars.items()} },"
                           f"秒偏移 +{sec_offset}s")
@@ -417,10 +388,12 @@ def main():
             daily_report_fn=lambda: None,   # 各账户不各自出报告,统一由 daily_report_all 出总报告
             daily_cancel_fn=lambda fire_hour=None, rt=rt: daily_cancel(rt, fire_hour=fire_hour),
             reconcile_fn=rt.reconcile_tick,
-            reconcile_interval_seconds=20,
+            reconcile_interval_seconds=adv(config, "reconcile_interval_sec"),
             pair_signal_bars=pair_bars,
             report_hour=rep_h, report_minute=rep_m,
             signal_second_offset=sec_offset,
+            signal_minute=adv(config, "signal_cron_minute"),
+            signal_misfire_grace=adv(config, "signal_misfire_grace_sec"),
         )
 
     # 全局 1 次总报告
@@ -451,6 +424,48 @@ def main():
 
     base_logger.info("[ready] HighLow Bot 系统就绪,等待下一次信号桶触发")
 
+    stopped = {"flag": False}
+
+    def shutdown():
+        if stopped["flag"]:
+            return
+        stopped["flag"] = True
+        try:
+            sched.shutdown(wait=False)
+        except Exception:
+            pass
+        if monitor is not None:
+            monitor.stop()
+
+    return {"runtimes": ok_runtimes, "sched": sched, "monitor": monitor,
+            "shutdown": shutdown, "config": config, "db": db,
+            "base_logger": base_logger}
+
+
+def main():
+    load_dotenv(PROJECT_ROOT / ".env")
+    config = load_config()
+
+    from utils.app_config import adv, validate_config
+    errors = validate_config(config)
+    if errors:
+        print("config.yaml 校验失败:")
+        for e in errors:
+            print(f"  - {e}")
+        sys.exit(1)
+
+    base_logger = get_logger(
+        "hl-bot", level=config["system"]["log_level"],
+        keep_days=int(config["system"]["log_keep_days"]),
+    )
+    from version import __version__
+    base_logger.info(f"[boot] HighLow Bot v{__version__}")
+
+    db_path = PROJECT_ROOT / config["system"]["db_path"]
+    db = DB(db_path, busy_timeout=adv(config, "db_busy_timeout_sec"))
+
+    handle = start_bot(config, base_logger, db, with_monitor=True)
+
     stop_evt = {"stop": False}
 
     def _shutdown(signum, frame):
@@ -458,11 +473,7 @@ def main():
             return
         stop_evt["stop"] = True
         base_logger.info(f"[shutdown] signal {signum} received, stopping...")
-        try:
-            sched.shutdown(wait=False)
-        except Exception:
-            pass
-        monitor.stop()
+        handle["shutdown"]()
 
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGTERM"):
@@ -477,5 +488,63 @@ def main():
     base_logger.info("[shutdown] bye")
 
 
-if __name__ == "__main__":
+# ---------------- CLI 入口 (exe 子命令) ----------------
+
+_SUBCOMMANDS = {
+    "report":         "scripts.daily_report",
+    "sync-balance":   "scripts.sync_balance",
+    "reset-cooldown": "scripts.reset_cooldown",
+    "fix-orphan":     "scripts.fix_orphan_trades",
+    "refill-fees":    "scripts.refill_fees",
+    "cleanup":        "scripts.cleanup_before_restart",
+    "env":            "scripts.switch_env",
+}
+
+_USAGE = """HighLow Bot v{version}
+
+用法: hlbot [子命令] [参数...]
+
+无子命令        启动交易机器人 (终端面板模式)
+report          生成每日报告            [--date YYYY-MM-DD]
+sync-balance    同步本地余额到 OKX 真值  [--account 名称]
+reset-cooldown  重置熔断/连亏计数        [--account 名称 | --all]
+fix-orphan      校验并标记未成交 ORPHAN  [--trade-ids 1,2 --apply]
+refill-fees     补拉历史 pnl/fee 真值    [--account 名称 --dry-run]
+cleanup         重启前清场(撤单+ORPHAN)
+env             切换环境                [demo | live] (缺省显示当前状态)
+
+各子命令支持 --help 查看完整参数。"""
+
+
+def _force_utf8_stdio() -> None:
+    """GBK 控制台/重定向下中文账户名与 emoji 不炸。"""
+    for s in (sys.stdout, sys.stderr):
+        if s and hasattr(s, "reconfigure"):
+            try:
+                s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def cli() -> None:
+    _force_utf8_stdio()
+    ensure_user_files()
+    argv = sys.argv[1:]
+    if argv and argv[0] in _SUBCOMMANDS:
+        import importlib
+        mod = importlib.import_module(_SUBCOMMANDS[argv[0]])
+        sys.argv = [f"hlbot {argv[0]}", *argv[1:]]  # 子脚本 argparse 原样接管
+        sys.exit(mod.main() or 0)
+    if argv and argv[0] in ("-h", "--help", "--version"):
+        from version import __version__
+        print(_USAGE.format(version=__version__))
+        return
+    if argv:
+        from version import __version__
+        print(f"未知子命令: {argv[0]}\n\n{_USAGE.format(version=__version__)}")
+        sys.exit(2)
     main()
+
+
+if __name__ == "__main__":
+    cli()

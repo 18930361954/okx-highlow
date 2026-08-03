@@ -18,6 +18,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from utils.paths import APP_ROOT as ROOT  # noqa: E402,F811 frozen 下指向 exe 旁
 
 from data.db import DB, DEFAULT_ACCOUNT  # noqa: E402
 from core.account_state import AccountState  # noqa: E402

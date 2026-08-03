@@ -1,12 +1,17 @@
 import logging
 import re
+import sys
 import time
 from logging.handlers import TimedRotatingFileHandler
-from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_LOG_DIR = _PROJECT_ROOT / "logs"
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
+from utils.paths import APP_ROOT
+
+_LOG_DIR = APP_ROOT / "logs"
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    # exe 被放进只读目录时不炸 import, 让后续 handler 报错给出可读信息
+    pass
 
 _FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
@@ -34,9 +39,12 @@ def get_logger(
     # 日志时间戳统一 UTC, 与 signal_date / prev_bucket 等业务字段对齐, 免手动 +/-8 换算
     formatter.converter = time.gmtime
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    logger.addHandler(console)
+    # windowed exe (GUI, --noconsole) 下 sys.stderr 为 None, 不挂 console handler
+    # (GUI 日志页直接 tail bot.log, 不依赖 stderr)。
+    if sys.stderr is not None:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        logger.addHandler(console)
 
     log_file = _LOG_DIR / "bot.log"
     file_handler = TimedRotatingFileHandler(

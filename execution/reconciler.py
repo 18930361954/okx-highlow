@@ -10,6 +10,7 @@ from typing import Any
 
 import requests
 
+from core.buckets import bucket_id, previous_bucket_start
 from core.okx_client import OKXError
 from data.db import DEFAULT_ACCOUNT
 
@@ -175,7 +176,8 @@ def _infer_exit_reason_by_price(side: str, entry_price: float, exit_price: float
 class Reconciler:
     def __init__(self, okx_client, db, account_state, config: dict, logger=None,
                  strategy=None, order_manager=None,
-                 account_name: str = DEFAULT_ACCOUNT):
+                 account_name: str = DEFAULT_ACCOUNT,
+                 advanced: dict | None = None):
         self.okx = okx_client
         self.db = db
         self.account = account_state
@@ -187,6 +189,9 @@ class Reconciler:
         self.pairs: list[str] = list(config["strategy"]["pairs"])
         # 全局默认杠杆（兼容旧代码）；实际用 account.leverage_for(pair) 拿 per-pair
         self.leverage = int(config["strategy"]["leverage"])
+        adv = advanced or {}
+        self._grace_ms = int(adv.get("fresh_pending_grace_ms", _FRESH_PENDING_GRACE_MS))
+        self._rearm_cooldown_ms = int(adv.get("rearm_cooldown_sec", 300)) * 1000
         # 本轮 run_once 中是否遇到过网络异常。tick 层据此做熔断退避,防止 DNS/断网时刷屏。
         # 每轮 run_once 开头重置。
         self.last_run_had_net_error: bool = False
@@ -674,13 +679,8 @@ class Reconciler:
         now = (exit_dt or datetime.now(UTC)).astimezone(UTC)
         signal_bar = self._signal_bar_for(pair)
         # 上一桶 (即 signal 依据的那一桶) 起始时间 → 用它作 sig_id
-        try:
-            from main import previous_bucket_start, bucket_id
-            prev = previous_bucket_start(now, signal_bar)
-            sig_id = bucket_id(prev)
-        except Exception:
-            # main 未加载时兜底回退到 1D 语义
-            sig_id = (now.date() - timedelta(days=1)).isoformat()
+        prev = previous_bucket_start(now, signal_bar)
+        sig_id = bucket_id(prev)
 
         # 已有当前桶记录 → 不补
         same_bkt = [x for x in self.db.list_trades_by_date(sig_id, account=self.account_name) if x.get("pair") == pair]
@@ -1047,7 +1047,7 @@ class Reconciler:
         # 全局 pending algoId 集合 (供末尾"僵尸 open"兜底扫描用)
         all_pending_algo_ids = {o.get("algoId") for o in all_pending if o.get("algoId")}
         # 新挂宽限阈值:cTime 早于此值才被当"过期孤儿"处理
-        fresh_threshold_ms = int(datetime.now(UTC).timestamp() * 1000) - _FRESH_PENDING_GRACE_MS
+        fresh_threshold_ms = int(datetime.now(UTC).timestamp() * 1000) - self._grace_ms
 
         # 按 pair 分组
         pending_by_pair: dict[str, list[dict]] = {}
@@ -1185,7 +1185,7 @@ class Reconciler:
             algo_id = str(t.get("okx_order_id") or "")
             if not pair or not algo_id or side not in ("long", "short"):
                 continue
-            if now_ms - self._rearm_at.get(tid, 0) < 5 * 60 * 1000:
+            if now_ms - self._rearm_at.get(tid, 0) < self._rearm_cooldown_ms:
                 continue
             try:
                 pos_rows = self.okx.get_positions(instId=pair)

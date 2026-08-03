@@ -7,3 +7,5 @@ python-dotenv>=1.0.0
 apscheduler>=3.10.0
 rich>=13.0.0
 pytest>=7.4.0
+ruamel.yaml>=0.18.0
+pyinstaller>=6.0.0

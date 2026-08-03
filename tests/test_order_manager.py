@@ -437,3 +437,27 @@ def test_persisted_trade_records_algoId_and_margin(tmp_path):
     assert rows[0]["okx_order_id"] == "ALGO_ID_PERS"
     assert rows[0]["pair"] == "BTC-USDT-SWAP"
     assert rows[0]["side"] == "long"
+
+
+def test_slip_pct_injectable_and_default_matches_constant(tmp_path):
+    """slip_pct 构造注入生效; 不传 = SLIP_PCT (历史行为契约)。"""
+    db = DB(tmp_path / "t.db")
+    okx = MagicMock()
+    okx.set_leverage.return_value = {"code": "0"}
+    okx.place_algo_order.return_value = {"code": "0", "data": [{"algoId": "A"}]}
+
+    # 默认与常量一致
+    om_default = OrderManager(okx, db)
+    assert om_default.slip_pct == SLIP_PCT
+    om_default.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    _, kw = okx.place_algo_order.call_args
+    assert abs(float(kw["orderPx"]) - round(105341.0 * (1 + SLIP_PCT), 6)) < 1e-6
+
+    # 注入 10 倍偏移
+    okx2 = MagicMock()
+    okx2.set_leverage.return_value = {"code": "0"}
+    okx2.place_algo_order.return_value = {"code": "0", "data": [{"algoId": "B"}]}
+    om_wide = OrderManager(okx2, db, slip_pct=0.001)
+    om_wide.place_algo_orders(_mk_signal(), margin=7.5, leverage=100)
+    _, kw2 = okx2.place_algo_order.call_args
+    assert abs(float(kw2["orderPx"]) - round(105341.0 * 1.001, 6)) < 1e-6

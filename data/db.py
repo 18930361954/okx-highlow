@@ -57,14 +57,16 @@ _INDEX_TRADES_ACC_ALGO_UNIQUE = (
 
 
 class DB:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, busy_timeout: int = 30):
         self.path = Path(db_path)
+        self.busy_timeout = busy_timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        conn = sqlite3.connect(str(self.path), timeout=self.busy_timeout,
+                               isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         try:
