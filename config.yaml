@@ -77,7 +77,7 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.007, tp_pct: 0.008, sl_pct: 0.030 }
         ETH-USDT-SWAP: { signal_bar: 6H, mode: trend, float_pct: 0.003, tp_pct: 0.008, sl_pct: 0.030 }
-        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.010, tp_pct: 0.010, sl_pct: 0.030, leverage: 50 }
+        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.010, tp_pct: 0.010, sl_pct: 0.030 }
 
   # 组合 B「混周期」— 1D trend BTC + 4H fade ETH + 6H fade SOL
   - account_name: 初级炼气士2-实盘
@@ -94,7 +94,7 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { signal_bar: 1D, mode: trend, float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
         ETH-USDT-SWAP: { signal_bar: 4H, mode: fade,  float_pct: 0.010, tp_pct: 0.010, sl_pct: 0.025 }
-        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.005, tp_pct: 0.008, sl_pct: 0.030, leverage: 50 }
+        SOL-USDT-SWAP: { signal_bar: 6H, mode: fade,  float_pct: 0.005, tp_pct: 0.008, sl_pct: 0.030 }
 
   # 组合 C「防御高胜率」— 1D trend BTC + 12H reversal ETH + 6H fade SOL
   - account_name: 初级炼气士3-实盘
@@ -111,7 +111,7 @@ accounts:
       pair_overrides:
         BTC-USDT-SWAP: { signal_bar: 1D,  mode: trend,    float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.030 }
         ETH-USDT-SWAP: { signal_bar: 12H, mode: reversal, float_pct: 0.010, tp_pct: 0.008, sl_pct: 0.025 }
-        SOL-USDT-SWAP: { signal_bar: 6H,  mode: fade,     float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.030, leverage: 50 }
+        SOL-USDT-SWAP: { signal_bar: 6H,  mode: fade,     float_pct: 0.005, tp_pct: 0.006, sl_pct: 0.030 }
 
   # ==================== 模拟盘账户 (2026-07-28 启: v3-mixed 推荐组合 A/B/C 全量验证半个月, 至 08-11) ====================
   # 参数逐项照抄 reports/portfolio_3coin_final.json + docs/策略研究报告_2026-07.md 第四节。
