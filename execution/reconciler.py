@@ -1160,6 +1160,8 @@ class Reconciler:
 
         2026-07-30 事故: ETH short TP 触发, 限价 1910.55 未成交, OCO 一次性消耗,
         SL 1983.53 随之作废, 活仓无保护裸奔 10 小时。
+        2026-08-06 事故: BTC short SL 触发未成交, 现价已越过原 SL, 重挂被 OKX
+        51278 拒绝, 每轮重试死循环 12 分钟无保护 → 价格越过触发价时改市价平仓。
 
         判定链(全部来自 OKX 实时状态, 不依赖本地推断):
           1. db open trade 且 entry_time 有值(已入场)
@@ -1168,6 +1170,9 @@ class Reconciler:
           4. pending oco/conditional 里没有该 posSide 的 reduceOnly 保护单
           5. 落地的平仓限价残单(reduceOnly, 带 OCO algoId)一并撤掉再重挂
         重挂用 place_oco_order(sz=当前持仓量), 5 分钟冷却防 pending 索引延迟重复挂。
+        重挂被 51277-51280 拒(现价已越过 TP/SL 触发价, 原价永远挂不回去) →
+        把越线一侧收敛到现价 ±0.2% 重挂(触发即市价): 保护立刻恢复、亏损锁在
+        现价附近, 又保留 V 反弹回 TP 的机会; 收敛仍失败才市价平仓兜底。
         """
         try:
             open_trades = self.db.list_open_trades(account=self.account_name)
@@ -1233,23 +1238,61 @@ class Reconciler:
 
                 close_side = "sell" if side == "long" else "buy"
                 sz = str(pos.get("pos") or "")
-                self.okx.place_oco_order(
-                    instId=pair,
-                    tdMode=str(pos.get("mgnMode") or "cross"),
-                    side=close_side,
-                    sz=sz,
-                    posSide=side,
-                    tpTriggerPx=tp_trig or None,
-                    tpOrdPx=str(a.get("tpOrdPx") or "") or None,
-                    slTriggerPx=sl_trig or None,
-                    slOrdPx=str(a.get("slOrdPx") or "") or None,
-                )
+                mgn_mode = str(pos.get("mgnMode") or "cross")
+                tp_px = str(a.get("tpOrdPx") or "") or None
+                sl_px = str(a.get("slOrdPx") or "") or None
+
+                # 现价已越过原触发价时原价挂不回去(OKX 51277-51280): 把越线一侧
+                # 收敛到现价 ±0.2% 触发即市价 —— 保护立即恢复, 逆行 0.2% 内止出,
+                # V 反弹回来则仓位保住。2026-08-06 BTC 事故: 原 SL 被穿越, 原价
+                # 重挂每 20s 被 51278 拒, 裸奔 12 分钟靠价格回落才恢复。
+                last = float(pos.get("last") or pos.get("markPx") or 0)
+                converged = []
+                if last > 0:
+                    up, down = round(last * 1.002, 6), round(last * 0.998, 6)
+                    if tp_trig:
+                        v = float(tp_trig)
+                        if (v <= last) if side == "long" else (v >= last):
+                            tp_trig, tp_px = str(up if side == "long" else down), "-1"
+                            converged.append(f"tp→{tp_trig}")
+                    if sl_trig:
+                        v = float(sl_trig)
+                        if (v >= last) if side == "long" else (v <= last):
+                            sl_trig, sl_px = str(down if side == "long" else up), "-1"
+                            converged.append(f"sl→{sl_trig}")
+                try:
+                    self.okx.place_oco_order(
+                        instId=pair,
+                        tdMode=mgn_mode,
+                        side=close_side,
+                        sz=sz,
+                        posSide=side,
+                        tpTriggerPx=tp_trig or None,
+                        tpOrdPx=tp_px,
+                        slTriggerPx=sl_trig or None,
+                        slOrdPx=sl_px,
+                    )
+                except OKXError as e:
+                    if not any(f"sCode={c}" in str(e)
+                               for c in ("51277", "51278", "51279", "51280")):
+                        raise
+                    # 收敛后仍越线被拒(极速行情竞态) → 市价平仓兜底, 绝不留裸仓
+                    self.okx.close_position(pair, mgn_mode, posSide=side)
+                    self._rearm_at[tid] = now_ms
+                    if self.logger:
+                        self.logger.error(
+                            f"[reconcile] [protect] trade#{tid} {pair} {side} "
+                            f"重挂 OCO 触发价仍越线被拒({e}) → 已市价平仓, "
+                            f"等对账回填盈亏"
+                        )
+                    continue
                 self._rearm_at[tid] = now_ms
                 if self.logger:
+                    extra = f" (越线收敛: {', '.join(converged)})" if converged else ""
                     self.logger.error(
                         f"[reconcile] [protect] trade#{tid} {pair} {side} 活仓无 TP/SL "
                         f"保护(OCO 触发未成交后消耗) → 已重挂 OCO tp={tp_trig} sl={sl_trig} "
-                        f"sz={sz}"
+                        f"sz={sz}{extra}"
                     )
             except Exception as e:
                 self._mark_if_net_error(e)

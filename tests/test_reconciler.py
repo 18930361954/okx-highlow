@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.account_state import AccountState
+from core.okx_client import OKXError
 from data.db import DB
 from execution.reconciler import Reconciler
 
@@ -41,6 +42,8 @@ class FakeOKX:
         self.cancelled: list[tuple[str, str]] = []
         self.cancelled_orders: list[tuple[str, str]] = []  # (instId, ordId)
         self.placed_ocos: list[dict] = []  # place_oco_order 调用记录
+        self.closed_positions: list[dict] = []  # close_position 调用记录
+        self.oco_error: Exception | None = None  # 设了就让 place_oco_order 抛
         self.calls = 0
 
     def list_order_history(self, instId=None, state="filled", limit=100):
@@ -84,11 +87,18 @@ class FakeOKX:
                         tpTriggerPx=None, tpOrdPx=None,
                         slTriggerPx=None, slOrdPx=None,
                         triggerPxType="last", reduceOnly=True, ccy="USDT"):
+        if self.oco_error is not None:
+            raise self.oco_error
         self.placed_ocos.append({
             "instId": instId, "side": side, "sz": sz, "posSide": posSide,
             "tpTriggerPx": tpTriggerPx, "slTriggerPx": slTriggerPx,
         })
         return {"code": "0", "data": [{"algoId": f"OCO{len(self.placed_ocos)}"}]}
+
+    def close_position(self, instId, mgnMode, posSide=None, ccy="USDT",
+                       autoCxl=True):
+        self.closed_positions.append({"instId": instId, "posSide": posSide})
+        return {"code": "0"}
 
 
 def _fresh(tmp_path):
@@ -645,6 +655,61 @@ def test_no_attach_params_skips_rearm(tmp_path):
     r = Reconciler(okx, db, acc, CONFIG)
     r._sweep_unprotected_positions()
     assert okx.placed_ocos == []
+
+
+def test_rearm_converges_breached_sl_to_last_price(tmp_path):
+    """2026-08-06 BTC 事故防回归: 现价已越过原 SL (short, last 60500 > SL 60300)
+    → SL 收敛到现价 +0.2% 重挂, 而不是原价被 51278 拒到死循环。TP 未越线保持原价。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "1.87", "mgnMode": "cross", "last": "60500"}],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert len(okx.placed_ocos) == 1
+    oco = okx.placed_ocos[0]
+    assert oco["tpTriggerPx"] == "59400"          # 未越线, 原价保留
+    assert float(oco["slTriggerPx"]) == pytest.approx(60500 * 1.002)
+    assert okx.closed_positions == []
+
+
+def test_rearm_rejected_price_breach_closes_position(tmp_path):
+    """收敛后仍被 51278 拒 (极速行情竞态) → 市价平仓兜底, 绝不留裸仓。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "1.87", "mgnMode": "cross", "last": "60500"}],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    okx.oco_error = OKXError(
+        "OKX error code=1 msg= sCode=51278 sMsg=SL trigger price cannot be "
+        "lower than the last price  endpoint=/api/v5/trade/order-algo",
+        code="1")
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()
+    assert okx.placed_ocos == []
+    assert okx.closed_positions == [
+        {"instId": "BTC-USDT-SWAP", "posSide": "short"}]
+
+
+def test_rearm_other_okx_error_no_market_close(tmp_path):
+    """非触发价越线类错误 (如余额/参数) → 不市价平仓, 走下轮重试。"""
+    db, acc = _fresh(tmp_path)
+    _mk_entered_trade(db, algo_id="MAIN1")
+    okx = FakeOKX(
+        positions=[{"instId": "BTC-USDT-SWAP", "posSide": "short",
+                    "pos": "1.87", "mgnMode": "cross"}],
+        algo_orders={"MAIN1": {"state": "effective", **_ATTACH_TP_SL}},
+    )
+    okx.oco_error = OKXError("OKX error code=1 msg= sCode=51119 sMsg=whatever",
+                             code="1")
+    r = Reconciler(okx, db, acc, CONFIG)
+    r._sweep_unprotected_positions()   # 不抛出 (外层 except 吃掉记 warning)
+    assert okx.closed_positions == []
 
 
 def test_sweep_zombie_open_current_bucket_skips(tmp_path):

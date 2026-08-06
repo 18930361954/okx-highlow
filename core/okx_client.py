@@ -337,6 +337,16 @@ class OKXClient:
         body = [{"algoId": algoId, "instId": instId}]
         return self._request("POST", "/api/v5/trade/cancel-algos", body=body)
 
+    def close_position(self, instId: str, mgnMode: str,
+                       posSide: str | None = None, ccy: str = "USDT",
+                       autoCxl: bool = True) -> dict:
+        """市价全平该 posSide 持仓。autoCxl=True 连带撤掉该持仓的 pending 平仓单。"""
+        body: dict[str, Any] = {"instId": instId, "mgnMode": mgnMode,
+                                "ccy": ccy, "autoCxl": autoCxl}
+        if posSide:
+            body["posSide"] = posSide
+        return self._request("POST", "/api/v5/trade/close-position", body=body)
+
     def list_pending_orders(self, instType: str = "SWAP",
                             instId: str | None = None) -> list[dict]:
         """未成交的「普通」订单(非 algo)。
