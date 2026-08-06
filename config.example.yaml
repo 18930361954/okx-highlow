@@ -58,6 +58,7 @@ network:
 # ---------------- 多账户 ----------------
 # 每账户可选字段:
 #   account_name / name          必填,标识 (用于 db account 列 + 日志前缀)
+#   group                         组名 (纯分类标签, GUI 分组展示用; 无此字段归「未分组」)
 #   enabled                       默认 true;false 时跳过
 #   env_adapt / env               real|live / demo
 #   api_key / secret_key / passphrase   该账户的 OKX API 三件套
@@ -67,6 +68,7 @@ network:
 #   td_mode                       cross / isolated;缺省沿用 account.td_mode
 accounts:
   - account_name: 示例账户-模拟
+    group: 模拟盘
     enabled: false
     env_adapt: demo
     strategy_name: v3-mixed

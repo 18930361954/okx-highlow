@@ -29,6 +29,9 @@ NETWORK_DEFAULTS: dict = {
     "http_timeout_sec": 15,                 # okx_client timeout
 }
 
+# 一个组最多挂几个账号。GUI 分组编辑与 validate_config 共用同一上限。
+GROUP_MAX_ACCOUNTS = 3
+
 # GUI 显示用中文名 (yaml 键保持英文不变, 保配置兼容)
 ADVANCED_LABELS: dict = {
     "slip_pct": "挂单穿价偏移",
@@ -104,6 +107,7 @@ def validate_config(top_cfg: dict) -> list[str]:
         if not isinstance(accounts, list):
             errors.append("accounts 必须是列表")
         else:
+            group_counts: dict[str, int] = {}
             for i, raw in enumerate(accounts):
                 if not isinstance(raw, dict):
                     errors.append(f"accounts[{i}] 必须是映射")
@@ -111,6 +115,13 @@ def validate_config(top_cfg: dict) -> list[str]:
                 name = raw.get("account_name") or raw.get("name") or f"#{i}"
                 if bool(raw.get("enabled", True)) and not raw.get("api_key"):
                     errors.append(f"账户 {name}: enabled=true 但 api_key 为空")
+                g = str(raw.get("group") or "")
+                if g:
+                    group_counts[g] = group_counts.get(g, 0) + 1
+            for g, n in group_counts.items():
+                if n > GROUP_MAX_ACCOUNTS:
+                    errors.append(
+                        f"组 {g} 有 {n} 个账号, 超过上限 {GROUP_MAX_ACCOUNTS}")
 
     # 未知 advanced/network 键提示 (拼错键会静默用默认, 给个 warning 文案)
     for section, defaults in (("advanced", ADVANCED_DEFAULTS),

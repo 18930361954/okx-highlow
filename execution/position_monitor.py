@@ -351,6 +351,7 @@ class PositionMonitor:
             results.append({
                 "rt": rt,
                 "name": rt.name,
+                "group": getattr(rt.cfg, "group", "") or "",
                 "env": getattr(rt.cfg, "env", ""),
                 "signal_bar": _bars_summary(pair_bars) or getattr(rt.strategy, "signal_bar", "1D"),
                 "pair_bars": pair_bars,

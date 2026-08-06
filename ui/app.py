@@ -4,6 +4,10 @@
 - 监控数据复用 PositionMonitor._collect() (worker 线程采集 → queue → after 消费)
 - 配置编辑走 ui.config_store (ruamel round-trip, 保注释), 保存后提示重启生效
 - 运行控制只调既有编排函数 (scheduler pause/resume, main.daily_cancel)
+
+账号以「组」组织 (accounts[].group, 见 ui/config_store.py): 1 组最多 3 个账号,
+组只是分类标签 —— 策略全部挂在账号上。三个页面统一按组呈现。
+布局全部自适应: ScrollableTree + autosize_columns, 窗口几何存 data/ui_state.json。
 """
 from __future__ import annotations
 
@@ -13,13 +17,19 @@ import tkinter as tk
 from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 
+from ui import ui_state
 from ui.bridge import BotBridge
-from utils.app_config import ADVANCED_DEFAULTS, ADVANCED_LABELS
+from ui.dialogs import AccountDialog, ProxyDialog
+from ui.widgets import ScrollableTree, make_labeled_tree
+from utils.app_config import ADVANCED_DEFAULTS, ADVANCED_LABELS, GROUP_MAX_ACCOUNTS
 from utils.paths import APP_ROOT
 
 _POLL_MS = 500          # UI 消费 queue 的节拍
 _SNAPSHOT_SEC = 5.0     # worker 采集间隔
 _LOG_TAIL_LINES = 200
+
+_GROUP_PREFIX = "g:"    # 配置/控制页树节点 iid 前缀
+_ACC_PREFIX = "a:"
 
 
 def _app_version() -> str:
@@ -69,21 +79,34 @@ def _pf_str(pf: float) -> str:
     return "∞" if pf == float("inf") else f"{pf:.2f}"
 
 
+def _group_label(raw_group: str) -> str:
+    from ui.config_store import UNGROUPED_LABEL
+    return raw_group or UNGROUPED_LABEL
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.bridge = BotBridge()
         self.snapshots: queue.Queue = queue.Queue()
         self._snap_stop = threading.Event()
+        # 界面上新建但还没加账号的组 —— 扁平 accounts 结构下空组无处持久化,
+        # 只活在本次会话, 保存时提示用户。
+        self._pending_groups: list[str] = []
 
         root.title(f"HighLow Bot v{_app_version()}")
-        root.geometry("1420x760")
+        root.minsize(ui_state.MIN_W, ui_state.MIN_H)
+        ui_state.restore_window(root)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # 状态栏先建 (标签页构建过程会写 self.status), side=bottom 先 pack 保证在底部
         self.status = tk.StringVar(value="未启动 — 到「控制」页启动机器人")
         ttk.Label(root, textvariable=self.status, anchor="w",
                   relief="sunken").pack(fill="x", side="bottom")
+
+        import tkinter.font as tkfont
+        self._bold_font = tkfont.nametofont("TkDefaultFont").copy()
+        self._bold_font.configure(weight="bold")
 
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True)
@@ -101,9 +124,17 @@ class App:
         self._build_control_tab()
         self._build_log_tab()
 
+        self.root.after(200, self._restore_sashes)
         threading.Thread(target=self._snapshot_worker, name="gui-snapshot",
                          daemon=True).start()
         self.root.after(_POLL_MS, self._drain_queues)
+
+    def _restore_sashes(self):
+        try:
+            self.root.update_idletasks()
+            ui_state.restore_sashes(self.mon_paned, "monitor")
+        except Exception:
+            pass
 
     # ================= 监控页 =================
 
@@ -111,53 +142,43 @@ class App:
         f = self.tab_mon
         self._bot_started_at = None
 
-        import tkinter.font as tkfont
-        base_font = tkfont.nametofont("TkDefaultFont")
-        self._bold_font = base_font.copy()
-        self._bold_font.configure(weight="bold")
-
-        def mk_tree(parent, title, cols, height, widths=None):
-            frame = ttk.LabelFrame(parent, text=title)
-            tree = ttk.Treeview(frame, columns=cols, show="headings", height=height)
-            for c in cols:
-                tree.heading(c, text=c)
-                tree.column(c, width=(widths or {}).get(c, 78), anchor="center", stretch=True)
-            tree.pack(fill="both", expand=True)
-            # 红绿盈亏 + env 合计加粗 (Treeview 只支持整行着色)
-            tree.tag_configure("profit", foreground="#0a7d32")
-            tree.tag_configure("loss", foreground="#c62828")
-            tree.tag_configure("total", font=self._bold_font, background="#eef2f7")
-            return frame, tree
-
-        top = ttk.Frame(f); top.pack(fill="x")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
         self.mon_header = tk.StringVar(value="(等待数据 — 机器人未启动)")
         ttk.Label(top, textvariable=self.mon_header, anchor="w",
                   font=self._bold_font).pack(fill="x", padx=6, pady=(4, 0))
         self.mon_header2 = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.mon_header2, anchor="w").pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(top, textvariable=self.mon_header2, anchor="w").pack(
+            fill="x", padx=6, pady=(0, 4))
 
-        fr1, self.tree_acc = mk_tree(f, "账户概览 (当前 + 全历史, 含 env 合计)", (
-            "账户", "环境", "周期", "余额", "熔断", "挂单", "持仓", "今日净",
-            "撤/过", "总笔", "胜率", "净PnL", "手续费累", "资金费累", "盈亏比", "回撤%"),
-            5, widths={"账户": 130, "撤/过": 55, "熔断": 45, "环境": 55})
-        fr1.pack(fill="x", padx=6, pady=3)
+        # 四张表放进可拖分栏 — 用户想看哪块就把哪块拉大, 每块内部自带滚动条
+        self.mon_paned = ttk.PanedWindow(f, orient="vertical")
+        self.mon_paned.pack(fill="both", expand=True, padx=6, pady=3)
 
-        fr2, self.tree_pos = mk_tree(f, "当前持仓", (
-            "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"),
-            4, widths={"账户": 130, "品种": 110})
-        fr2.pack(fill="x", padx=6, pady=3)
+        def add_pane(title, cols, headers=None, tree_column=False, weight=1):
+            frame, st = make_labeled_tree(
+                self.mon_paned, title, cols, headers=headers,
+                tree_column=tree_column, height=5, bold_font=self._bold_font)
+            self.mon_paned.add(frame, weight=weight)
+            return st
+
+        self.tree_acc = add_pane(
+            "账户概览 (按组折叠; 组行 = 组合计, 底部 env 合计)",
+            ("环境", "周期", "余额", "熔断", "挂单", "持仓", "今日净", "撤/过",
+             "总笔", "胜率", "净PnL", "手续费累", "资金费累", "盈亏比", "回撤%"),
+            tree_column=True, weight=2)
+        self.tree_acc.tree.heading("#0", text="组 / 账户")
+
+        self.tree_pos = add_pane("当前持仓", (
+            "组", "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"))
         self.tree_pos.tag_configure("unprotected", background="#ffd6d6")
 
-        fr3, self.tree_pend = mk_tree(f, "待触发挂单", (
-            "账户", "品种", "周期", "方向", "触发价", "TP", "SL", "AlgoID"),
-            5, widths={"账户": 130, "品种": 110, "AlgoID": 140})
-        fr3.pack(fill="x", padx=6, pady=3)
+        self.tree_pend = add_pane("待触发挂单", (
+            "组", "账户", "品种", "周期", "方向", "触发价", "TP", "SL", "AlgoID"))
 
-        fr4, self.tree_recent = mk_tree(f, "最近成交", (
-            "时间", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
-            "名义PnL", "手续费", "资金费", "净PnL"),
-            5, widths={"时间": 130, "账户": 130, "品种": 110})
-        fr4.pack(fill="both", expand=True, padx=6, pady=3)
+        self.tree_recent = add_pane("最近成交", (
+            "时间", "组", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
+            "名义PnL", "手续费", "资金费", "净PnL"), weight=2)
 
     def _refresh_monitor(self, snap: list[dict]):
         from execution.position_monitor import (_bar_of, _compute_lifetime_stats,
@@ -189,47 +210,70 @@ class App:
             f"资金费(今/累) {total_funding:+.4f}/{total_life_funding:+.4f}   "
             f"今日净盈亏 {_fmt_signed(total_net)}")
 
+        # 记住展开状态, 刷新后还原 (每 5s 重建一次表格, 否则组会自动全收起)
+        expanded = {iid for iid in self.tree_acc.get_children()
+                    if self.tree_acc.tree.item(iid, "open")}
         for tree in (self.tree_acc, self.tree_pos, self.tree_pend, self.tree_recent):
-            tree.delete(*tree.get_children())
+            tree.clear()
 
-        def _acc_row(name, env, period, balance, in_cd, pendings, positions,
-                     today_net, cancelled, orphan, lt, tags=()):
-            self.tree_acc.insert("", "end", values=(
-                name, env, period, _fmt(balance), "是" if in_cd else "否",
-                pendings, positions, _fmt_signed(today_net),
-                f"{cancelled}/{orphan}", lt["total"], f"{lt['win_rate']:.1f}%",
-                _fmt_signed(lt["net_pnl"]),
-                f"{lt.get('sum_fee', 0.0):.4f}", f"{lt.get('sum_funding', 0.0):+.4f}",
-                _pf_str(lt["profit_factor"]), f"{lt['max_dd_pct']:.1f}%"),
-                tags=tags)
+        def _acc_values(env, period, balance, in_cd, pendings, positions,
+                        today_net, cancelled, orphan, lt):
+            return (env, period, _fmt(balance), "是" if in_cd else "否",
+                    pendings, positions, _fmt_signed(today_net),
+                    f"{cancelled}/{orphan}", lt["total"], f"{lt['win_rate']:.1f}%",
+                    _fmt_signed(lt["net_pnl"]),
+                    f"{lt.get('sum_fee', 0.0):.4f}", f"{lt.get('sum_funding', 0.0):+.4f}",
+                    _pf_str(lt["profit_factor"]), f"{lt['max_dd_pct']:.1f}%")
 
-        # 按 env 分组: real/live 在前, demo 在后; 每组末尾加"env 合计"行
+        def _agg_row(parent, label, accts, tags, iid=None):
+            """一组/一个 env 的合计行 — 复用 _compute_lifetime_stats, 与账号行同口径。"""
+            merged_trades = [t for a in accts for t in a["valid_trades"]]
+            merged_bal = sum(a["balance"] for a in accts)
+            agg = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
+            envs = sorted({a["env"] or "" for a in accts})
+            kw = {"iid": iid} if iid else {}
+            return self.tree_acc.insert(
+                parent, "end", text=label,
+                values=_acc_values(
+                    envs[0] if len(envs) == 1 else "混合", "", merged_bal, False,
+                    sum(len(a["pendings"]) for a in accts),
+                    sum(len(a["positions"]) for a in accts),
+                    sum(a["today_net"] for a in accts),
+                    sum(a.get("today_cancelled", 0) for a in accts),
+                    sum(a.get("today_orphan", 0) for a in accts), agg),
+                tags=tags, open=True, **kw)
+
+        # ---- 按组分块: 组节点行本身就是组合计 (折叠后仍看得到) ----
+        by_group: dict[str, list[dict]] = {}
+        for a in snap:
+            by_group.setdefault(a.get("group") or "", []).append(a)
+
+        for raw_g, accts in by_group.items():
+            # 固定 iid: 每 5s 重建表格, 用自动 iid 的话展开状态永远对不上, 组会一直被收起
+            gid = _agg_row("", f"{_group_label(raw_g)}  ({len(accts)} 账号)", accts,
+                           ("group_total",), iid=_GROUP_PREFIX + raw_g)
+            self.tree_acc.tree.item(gid, open=(gid in expanded) if expanded else True)
+            for a in accts:
+                lt = a["lifetime"]
+                self.tree_acc.insert(
+                    gid, "end", text=a["name"],
+                    values=_acc_values(
+                        a["env"], a["signal_bar"], a["balance"], a["in_cd"],
+                        len(a["pendings"]), len(a["positions"]), a["today_net"],
+                        a.get("today_cancelled", 0), a.get("today_orphan", 0), lt),
+                    tags=_pnl_tag(lt["net_pnl"]))
+
+        # ---- env 合计留在最底部 (实盘/模拟盘口径不能混) ----
         by_env: dict[str, list[dict]] = {}
         for a in snap:
             by_env.setdefault(a["env"] or "unknown", []).append(a)
         env_order = [e for e in ("real", "live", "demo") if e in by_env] + \
                     [e for e in by_env if e not in ("real", "live", "demo")]
-
         for env in env_order:
-            accts = by_env[env]
-            for a in accts:
-                lt = a["lifetime"]
-                _acc_row(a["name"], env, a["signal_bar"], a["balance"], a["in_cd"],
-                         len(a["pendings"]), len(a["positions"]), a["today_net"],
-                         a.get("today_cancelled", 0), a.get("today_orphan", 0),
-                         lt, tags=_pnl_tag(lt["net_pnl"]))
-            merged_trades = [t for a in accts for t in a["valid_trades"]]
-            merged_bal = sum(a["balance"] for a in accts)
-            agg = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
-            _acc_row(f"{env} 合计", "", "", merged_bal, False,
-                     sum(len(a["pendings"]) for a in accts),
-                     sum(len(a["positions"]) for a in accts),
-                     sum(a["today_net"] for a in accts),
-                     sum(a.get("today_cancelled", 0) for a in accts),
-                     sum(a.get("today_orphan", 0) for a in accts),
-                     agg, tags=("total",))
+            _agg_row("", f"{env} 合计", by_env[env], ("total",), iid="env:" + env)
 
         for a in snap:
+            g = _group_label(a.get("group") or "")
             for p in a["positions"]:
                 tp = sl = ""
                 for o in a.get("protect_algos") or []:
@@ -241,7 +285,7 @@ class App:
                 unprotected = not tp and not sl
                 tags = ("unprotected",) if unprotected else _pnl_tag(p.get("upl"))
                 self.tree_pos.insert("", "end", values=(
-                    a["name"], p.get("instId", ""), _dir_plain(p.get("posSide", "")),
+                    g, a["name"], p.get("instId", ""), _dir_plain(p.get("posSide", "")),
                     p.get("pos", ""), p.get("avgPx", ""), p.get("last", ""),
                     tp or "无!", sl or "无!", _fmt_signed(p.get("upl"))),
                     tags=tags)
@@ -249,7 +293,7 @@ class App:
             for o in a["pendings"]:
                 tp, sl = _pending_tp_sl(o)
                 self.tree_pend.insert("", "end", values=(
-                    a["name"], o.get("instId", ""),
+                    g, a["name"], o.get("instId", ""),
                     _bar_of(o, a.get("pair_bars") or {}),
                     _dir_plain(o.get("side", "")),
                     o.get("triggerPx", ""), tp, sl,
@@ -258,28 +302,34 @@ class App:
         recent = []
         for a in snap:
             for r in a["valid_trades"]:
-                recent.append((a["name"], r, a.get("pair_bars") or {}))
-        recent.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
-        for name, r, pbars in recent[:20]:
+                recent.append((_group_label(a.get("group") or ""), a["name"], r,
+                               a.get("pair_bars") or {}))
+        recent.sort(key=lambda x: x[2].get("exit_time") or "", reverse=True)
+        for g, name, r, pbars in recent[:50]:
             net = r.get("pnl") or 0
             fee = r.get("fee") or 0
             funding = r.get("funding") or 0
             gross = r.get("pnl_gross") or (net + fee - funding)
             self.tree_recent.insert("", "end", values=(
-                (r.get("exit_time") or "")[:19], name, r.get("pair", ""),
+                (r.get("exit_time") or "")[:19], g, name, r.get("pair", ""),
                 _bar_of(r, pbars), _dir_plain(r.get("side", "")),
                 _fmt(r.get("entry_price")), _fmt(r.get("exit_price")),
                 _exit_reason_zh(r.get("exit_reason", "")), _fmt_signed(gross),
                 f"{fee:.4f}", f"{funding:+.4f}", _fmt_signed(net)),
                 tags=_pnl_tag(net))
 
+        for tree in (self.tree_acc, self.tree_pos, self.tree_pend, self.tree_recent):
+            tree.autosize()
+
     # ================= 配置页 =================
 
     def _build_config_tab(self):
         f = self.tab_cfg
-        bar = ttk.Frame(f); bar.pack(fill="x", padx=6, pady=4)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", padx=6, pady=4)
         ttk.Button(bar, text="重新加载", command=self._cfg_load).pack(side="left")
-        ttk.Button(bar, text="保存到 config.yaml", command=self._cfg_save).pack(side="left", padx=6)
+        ttk.Button(bar, text="保存到 config.yaml",
+                   command=self._cfg_save).pack(side="left", padx=6)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(bar, text="切到模拟盘",
                    command=lambda: self._cfg_switch_env("demo")).pack(side="left")
@@ -288,40 +338,82 @@ class App:
         ttk.Label(bar, text="保存后需重启机器人生效 (控制页: 停止 → 启动)",
                   foreground="#a04000").pack(side="left", padx=10)
 
-        body = ttk.Frame(f); body.pack(fill="both", expand=True, padx=6, pady=3)
+        # ---- 组/账号 增删改 工具栏 ----
+        bar2 = ttk.Frame(f)
+        bar2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(bar2, text="组:").pack(side="left")
+        ttk.Button(bar2, text="新建", command=self._cfg_add_group).pack(side="left", padx=2)
+        ttk.Button(bar2, text="重命名", command=self._cfg_rename_group).pack(side="left", padx=2)
+        ttk.Button(bar2, text="删除", command=self._cfg_delete_group).pack(side="left", padx=2)
+        ttk.Separator(bar2, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(bar2, text="账号:").pack(side="left")
+        self.btn_acc_add = ttk.Button(bar2, text="添加", command=self._cfg_add_account)
+        self.btn_acc_add.pack(side="left", padx=2)
+        ttk.Button(bar2, text="编辑", command=self._cfg_edit_account).pack(side="left", padx=2)
+        ttk.Button(bar2, text="删除", command=self._cfg_delete_account).pack(side="left", padx=2)
+        ttk.Label(bar2, text=f"(1 组最多 {GROUP_MAX_ACCOUNTS} 个账号; "
+                             "删除账号 = 配置里注释掉, 历史成交数据保留)",
+                  foreground="#666").pack(side="left", padx=10)
 
-        left = ttk.LabelFrame(body, text="账户 (双击「启用」列切换)")
-        left.pack(side="left", fill="both", expand=True)
-        cols = ("启用", "账户", "环境", "策略", "币种")
-        self.tree_cfg_acc = ttk.Treeview(left, columns=cols, show="headings", height=8)
-        for c in cols:
-            self.tree_cfg_acc.heading(c, text=c)
-            self.tree_cfg_acc.column(c, width=80 if c == "启用" else 150, anchor="center")
-        self.tree_cfg_acc.pack(fill="both", expand=True)
-        self.tree_cfg_acc.bind("<Double-1>", self._cfg_toggle_enabled)
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True, padx=6, pady=3)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+
+        left = ttk.LabelFrame(body, text="账户 (双击「启用」列切换; 组行双击 = 整组启用/停用)")
+        left.grid(row=0, column=0, sticky="nsew")
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        cols = ("启用", "环境", "策略", "币种")
+        self.tree_cfg_acc = ScrollableTree(left, columns=cols, tree_column=True, height=10)
+        self.tree_cfg_acc.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.tree_cfg_acc.tree.heading("#0", text="组 / 账户")
+        self.tree_cfg_acc.tag_configure("group", font=self._bold_font)
+        self.tree_cfg_acc.bind_tree("<Double-1>", self._cfg_on_double_click)
+        self.tree_cfg_acc.bind_tree("<<TreeviewSelect>>", self._cfg_on_select)
 
         po_frame = ttk.LabelFrame(body, text="选中账户的 pair 参数 (双击单元格编辑)")
-        po_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        po_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        po_frame.rowconfigure(0, weight=1)
+        po_frame.columnconfigure(0, weight=1)
         po_cols = ("pair", "signal_bar", "mode", "float_pct", "tp_pct", "sl_pct", "leverage")
         po_headers = {"pair": "币种", "signal_bar": "信号周期", "mode": "模式",
                       "float_pct": "浮动价%", "tp_pct": "止盈%", "sl_pct": "止损%",
                       "leverage": "杠杆"}
-        self.tree_cfg_po = ttk.Treeview(po_frame, columns=po_cols, show="headings", height=8)
-        for c in po_cols:
-            self.tree_cfg_po.heading(c, text=po_headers[c])
-            self.tree_cfg_po.column(c, width=88, anchor="center")
-        self.tree_cfg_po.pack(fill="both", expand=True)
-        self.tree_cfg_acc.bind("<<TreeviewSelect>>", self._cfg_show_pair_overrides)
-        self.tree_cfg_po.bind("<Double-1>", self._cfg_edit_po_cell)
+        self.tree_cfg_po = ScrollableTree(po_frame, columns=po_cols,
+                                          headers=po_headers, height=10)
+        self.tree_cfg_po.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.tree_cfg_po.bind_tree("<Double-1>", self._cfg_edit_po_cell)
 
+        # ---- 代理设置 (全局唯一 1 个) ----
+        px = ttk.LabelFrame(f, text="代理设置 (全局唯一, OKX REST 全部走它)")
+        px.pack(fill="x", padx=6, pady=4)
+        pxb = ttk.Frame(px)
+        pxb.pack(fill="x", padx=8, pady=6)
+        self.proxy_text = tk.StringVar(value="")
+        ttk.Label(pxb, textvariable=self.proxy_text, width=52,
+                  anchor="w").pack(side="left")
+        self.btn_px_add = ttk.Button(pxb, text="添加", command=self._px_add)
+        self.btn_px_add.pack(side="left", padx=3)
+        self.btn_px_edit = ttk.Button(pxb, text="编辑", command=self._px_edit)
+        self.btn_px_edit.pack(side="left", padx=3)
+        self.btn_px_del = ttk.Button(pxb, text="删除", command=self._px_delete)
+        self.btn_px_del.pack(side="left", padx=3)
+        self.btn_px_test = ttk.Button(pxb, text="测试连通性", command=self._px_test)
+        self.btn_px_test.pack(side="left", padx=(12, 3))
+
+        # ---- 运行参数 ----
         adv_frame = ttk.LabelFrame(f, text="运行参数 (留空 = 默认值, 保存进 config.yaml 的 advanced 段)")
         adv_frame.pack(fill="x", padx=6, pady=4)
         self.adv_vars: dict[str, tk.StringVar] = {}
-        grid = ttk.Frame(adv_frame); grid.pack(fill="x", padx=4, pady=4)
+        grid = ttk.Frame(adv_frame)
+        grid.pack(fill="x", padx=4, pady=4)
         for i, (key, default) in enumerate(ADVANCED_DEFAULTS.items()):
-            r, c = divmod(i, 4)
+            r, c = divmod(i, 5)
             label = ADVANCED_LABELS.get(key, key)
-            ttk.Label(grid, text=label).grid(row=r, column=c * 2, sticky="e", padx=(8, 2), pady=2)
+            ttk.Label(grid, text=label).grid(row=r, column=c * 2, sticky="e",
+                                             padx=(8, 2), pady=2)
             var = tk.StringVar()
             self.adv_vars[key] = var
             ent = ttk.Entry(grid, textvariable=var, width=10)
@@ -331,6 +423,509 @@ class App:
 
         self._cfg_data = None
         self._cfg_load()
+
+    # ---------- 配置页: 加载与渲染 ----------
+
+    def _cfg_load(self):
+        from ui import config_store
+        try:
+            self._cfg_data = config_store.load_raw()
+        except Exception as e:
+            messagebox.showerror("加载失败", f"config.yaml 读取失败:\n{e}")
+            return
+        self._pending_groups = []
+        self._cfg_render_tree()
+        self.tree_cfg_po.clear()
+        adv = config_store.get_advanced(self._cfg_data)
+        for key, var in self.adv_vars.items():
+            var.set(str(adv.get(key, "")))
+        self._px_refresh()
+        self.status.set("配置已加载")
+
+    def _cfg_render_tree(self, select_iid: str | None = None):
+        """重建组/账号树。组节点 iid = 'g:<组名>', 账号节点 iid = 'a:<index>'。"""
+        from ui import config_store
+        tree = self.tree_cfg_acc
+        tree.clear()
+        groups = config_store.list_groups(self._cfg_data)
+        seen = {g["raw_name"] for g in groups}
+        for g in groups:
+            accs = g["accounts"]
+            n_on = sum(1 for a in accs if a["enabled"])
+            envs = sorted({a["env"] for a in accs if a["env"]})
+            strats = sorted({a["strategy_name"] for a in accs if a["strategy_name"]})
+            coins = sorted({p.split("-")[0] for a in accs for p in a["pairs"]})
+            gid = tree.insert("", "end", iid=_GROUP_PREFIX + g["raw_name"],
+                              text=f"{g['name']}  ({len(accs)}/{GROUP_MAX_ACCOUNTS})",
+                              values=(f"{n_on}/{len(accs)}", ",".join(envs),
+                                      ",".join(strats), ",".join(coins)),
+                              tags=("group",), open=True)
+            for a in accs:
+                tree.insert(gid, "end", iid=_ACC_PREFIX + str(a["index"]),
+                            text=a["name"],
+                            values=("✓" if a["enabled"] else "✗", a["env"],
+                                    a["strategy_name"],
+                                    ",".join(p.split("-")[0] for p in a["pairs"])))
+        # 本次会话新建、还没加账号的空组
+        for g in self._pending_groups:
+            if g in seen:
+                continue
+            tree.insert("", "end", iid=_GROUP_PREFIX + g,
+                        text=f"{g}  (0/{GROUP_MAX_ACCOUNTS})",
+                        values=("0/0", "", "", ""), tags=("group",))
+        tree.autosize()
+        if select_iid and tree.tree.exists(select_iid):
+            tree.tree.selection_set(select_iid)
+            tree.tree.see(select_iid)
+
+    # ---------- 配置页: 选中与双击 ----------
+
+    def _cfg_selected(self) -> tuple[str | None, int | None]:
+        """返回 (组名, 账号 index)。选中组节点 → (组名, None);
+        选中账号 → (该账号所在组, index)。"""
+        sel = self.tree_cfg_acc.selection()
+        if not sel:
+            return None, None
+        iid = sel[0]
+        if iid.startswith(_GROUP_PREFIX):
+            return iid[len(_GROUP_PREFIX):], None
+        idx = int(iid[len(_ACC_PREFIX):])
+        parent = self.tree_cfg_acc.tree.parent(iid)
+        return parent[len(_GROUP_PREFIX):], idx
+
+    def _cfg_on_select(self, _event=None):
+        from ui import config_store
+        group, idx = self._cfg_selected()
+        self.tree_cfg_po.clear()
+        # 组满 3 个 → 「添加账号」灰掉
+        full = False
+        if group is not None and self._cfg_data is not None:
+            full = config_store.group_count(self._cfg_data, group) >= GROUP_MAX_ACCOUNTS
+        self.btn_acc_add.config(state="disabled" if full else "normal")
+        if full:
+            self.status.set(f"组 {_group_label(group)} 已满 {GROUP_MAX_ACCOUNTS} 个账号")
+        if idx is None:
+            return
+        po = config_store.get_pair_overrides(self._cfg_data, idx)
+        for pair, ov in po.items():
+            self.tree_cfg_po.insert("", "end", iid=pair, values=(
+                pair.split("-")[0], ov.get("signal_bar", ""), ov.get("mode", ""),
+                ov.get("float_pct", ""), ov.get("tp_pct", ""), ov.get("sl_pct", ""),
+                ov.get("leverage", "")))
+        self.tree_cfg_po.autosize()
+
+    def _cfg_on_double_click(self, event):
+        """双击「启用」列: 账号行切自己, 组行切整组。双击账号其它列 = 打开编辑。"""
+        if self._cfg_data is None:
+            return
+        tree = self.tree_cfg_acc.tree
+        row = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        if not row:
+            return
+        tree.selection_set(row)
+        if row.startswith(_GROUP_PREFIX):
+            if col == "#1":
+                self._cfg_toggle_group(row[len(_GROUP_PREFIX):])
+            return
+        if col == "#1":
+            self._cfg_toggle_account(int(row[len(_ACC_PREFIX):]))
+        else:
+            self._cfg_edit_account()
+
+    def _cfg_toggle_account(self, idx: int):
+        from ui import config_store
+        cur = bool(self._cfg_data["accounts"][idx].get("enabled", True))
+        config_store.set_account_enabled(self._cfg_data, idx, not cur)
+        name = config_store.list_accounts(self._cfg_data)[idx]["name"]
+        self._cfg_render_tree(select_iid=_ACC_PREFIX + str(idx))
+        self.status.set(f"账户 {name} → {'启用' if not cur else '禁用'} (未保存)")
+
+    def _cfg_toggle_group(self, group: str):
+        from ui import config_store
+        accs = [a for a in config_store.list_accounts(self._cfg_data)
+                if a["group"] == group]
+        if not accs:
+            self.status.set(f"组 {_group_label(group)} 还没有账号")
+            return
+        # 有任一未启用 → 全开; 全部已启用 → 全关
+        target = not all(a["enabled"] for a in accs)
+        n = config_store.set_group_enabled(self._cfg_data, group, target)
+        self._cfg_render_tree(select_iid=_GROUP_PREFIX + group)
+        self.status.set(f"组 {_group_label(group)}: {n} 个账号 → "
+                        f"{'启用' if target else '禁用'} (未保存)")
+
+    # ---------- 配置页: 组的增删改 ----------
+
+    def _cfg_add_group(self):
+        from ui import config_store
+        if self._cfg_data is None:
+            return
+        name = _ask_string(self.root, "新建组", "组名:")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("组名无效", "组名不能为空")
+            return
+        if name in config_store.group_names(self._cfg_data) or name in self._pending_groups:
+            messagebox.showwarning("组名重复", f"组 {name} 已存在")
+            return
+        self._pending_groups.append(name)
+        self._cfg_render_tree(select_iid=_GROUP_PREFIX + name)
+        self.status.set(f"已新建组 {name} — 空组无法写进 config.yaml, 请给它添加账号")
+        self._cfg_add_account()
+
+    def _cfg_rename_group(self):
+        from ui import config_store
+        group, _idx = self._cfg_selected()
+        if group is None:
+            messagebox.showinfo("提示", "先在左侧选中一个组")
+            return
+        if not group:
+            messagebox.showinfo("提示", "「未分组」不是真实的组, 请直接编辑账号来设置它的组")
+            return
+        new = _ask_string(self.root, "重命名组", "新组名:", group)
+        if new is None:
+            return
+        new = new.strip()
+        if not new or new == group:
+            return
+        if new in config_store.group_names(self._cfg_data):
+            messagebox.showwarning("组名重复", f"组 {new} 已存在")
+            return
+        n = config_store.rename_group(self._cfg_data, group, new)
+        if group in self._pending_groups:
+            self._pending_groups[self._pending_groups.index(group)] = new
+        self._cfg_render_tree(select_iid=_GROUP_PREFIX + new)
+        self.status.set(f"组 {group} → {new} ({n} 个账号, 未保存)")
+
+    def _cfg_delete_group(self):
+        from ui import config_store
+        group, _idx = self._cfg_selected()
+        if group is None:
+            messagebox.showinfo("提示", "先在左侧选中一个组")
+            return
+        accs = [a for a in config_store.list_accounts(self._cfg_data)
+                if a["group"] == group]
+        if not accs:
+            if group in self._pending_groups:
+                self._pending_groups.remove(group)
+                self._cfg_render_tree()
+                self.status.set(f"已移除空组 {group}")
+            return
+        if not group:
+            messagebox.showinfo("提示", "「未分组」不能删除, 请逐个删除其中的账号")
+            return
+        if not messagebox.askyesno(
+                "删除组", f"删除组 {group} 及其 {len(accs)} 个账号?\n\n"
+                f"账号: {', '.join(a['name'] for a in accs)}\n\n"
+                "配置会被注释掉 (可手动去掉 # 恢复), data/trades.db 里的"
+                "历史成交记录全部保留。", icon="warning"):
+            return
+        n = config_store.delete_group(self._cfg_data, group)
+        self._pending_groups = [g for g in self._pending_groups if g != group]
+        self._cfg_render_tree()
+        self.status.set(f"已删除组 {group} ({n} 个账号注释掉, 未保存)")
+
+    # ---------- 配置页: 账号的增删改 ----------
+
+    def _cfg_all_pairs(self) -> list[str]:
+        top = (self._cfg_data or {}).get("strategy") or {}
+        pairs = list(top.get("pairs") or [])
+        for a in (self._cfg_data or {}).get("accounts") or []:
+            for p in a.get("pairs") or []:
+                if p not in pairs:
+                    pairs.append(str(p))
+        return pairs or ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+
+    def _cfg_group_choices(self) -> list[str]:
+        from ui import config_store
+        names = config_store.group_names(self._cfg_data)
+        return names + [g for g in self._pending_groups if g not in names]
+
+    def _cfg_add_account(self):
+        from ui import config_store
+        if self._cfg_data is None:
+            return
+        group, _idx = self._cfg_selected()
+        group = group or ""
+        if group and config_store.group_count(self._cfg_data, group) >= GROUP_MAX_ACCOUNTS:
+            messagebox.showwarning(
+                "组已满", f"组 {group} 已有 {GROUP_MAX_ACCOUNTS} 个账号, "
+                          f"一个组最多 {GROUP_MAX_ACCOUNTS} 个。\n"
+                          "请新建一个组, 或先删除组内已有账号。")
+            return
+        taken = {a["name"] for a in config_store.list_accounts(self._cfg_data)}
+        res = AccountDialog.show(
+            self.root, groups=self._cfg_group_choices(),
+            all_pairs=self._cfg_all_pairs(), taken_names=taken,
+            initial={"group": group, "env": "demo"}, title="添加账号")
+        if res is None:
+            return
+        try:
+            idx = config_store.add_account(self._cfg_data, res["group"], {
+                "account_name": res["account_name"],
+                "enabled": res["enabled"],
+                "strategy_name": res["strategy_name"] or "",
+                "api_key": res["api_key"],
+                "secret_key": res["secret_key"],
+                "passphrase": res["passphrase"],
+                "env_adapt": res["env"],
+                "pairs": res["pairs"],
+            })
+        except config_store.GroupFullError as e:
+            messagebox.showwarning("组已满", str(e))
+            return
+        if not res["strategy_name"]:
+            config_store.update_account(self._cfg_data, idx, {"strategy_name": None})
+        self._apply_strategy_result(idx, res)
+        self._pending_groups = [g for g in self._pending_groups if g != res["group"]]
+        self._cfg_render_tree(select_iid=_ACC_PREFIX + str(idx))
+        self.status.set(f"已添加账号 {res['account_name']} (未保存)")
+
+    def _cfg_edit_account(self):
+        from ui import config_store
+        _group, idx = self._cfg_selected()
+        if idx is None:
+            messagebox.showinfo("提示", "先在左侧选中一个账号 (不是组)")
+            return
+        acc = self._cfg_data["accounts"][idx]
+        info = config_store.list_accounts(self._cfg_data)[idx]
+        sf = config_store.get_account_strategy_fields(self._cfg_data, idx)
+        taken = {a["name"] for a in config_store.list_accounts(self._cfg_data)
+                 if a["index"] != idx}
+        res = AccountDialog.show(
+            self.root, groups=self._cfg_group_choices(),
+            all_pairs=self._cfg_all_pairs(), taken_names=taken,
+            initial={
+                "account_name": info["name"],
+                "group": info["group"],
+                "enabled": info["enabled"],
+                "env": info["env"] or "demo",
+                "strategy_name": info["strategy_name"],
+                "api_key": str(acc.get("api_key") or ""),
+                "secret_key": str(acc.get("secret_key") or ""),
+                "passphrase": str(acc.get("passphrase") or ""),
+                "pairs": info["pairs"],
+                "strategy_fields": sf,
+                "pair_overrides": config_store.get_pair_overrides(self._cfg_data, idx),
+            },
+            title=f"编辑账号 — {info['name']}")
+        if res is None:
+            return
+        # 换组时先检查目标组容量
+        if res["group"] != info["group"] and res["group"]:
+            if config_store.group_count(self._cfg_data, res["group"]) >= GROUP_MAX_ACCOUNTS:
+                messagebox.showwarning(
+                    "组已满", f"组 {res['group']} 已有 {GROUP_MAX_ACCOUNTS} 个账号")
+                return
+        config_store.update_account(self._cfg_data, idx, {
+            "account_name": res["account_name"],
+            "group": res["group"] or None,
+            "enabled": res["enabled"],
+            "strategy_name": res["strategy_name"],
+            "api_key": res["api_key"],
+            "secret_key": res["secret_key"],
+            "passphrase": res["passphrase"],
+            "env_adapt": res["env"],
+            "pairs": res["pairs"],
+        })
+        # 老配置可能用 name / env 键, 避免和新写的 account_name / env_adapt 打架
+        for legacy in ("name", "env"):
+            if legacy in acc:
+                del acc[legacy]
+        self._apply_strategy_result(idx, res)
+        self._pending_groups = [g for g in self._pending_groups if g != res["group"]]
+        self._cfg_render_tree(select_iid=_ACC_PREFIX + str(idx))
+        self._cfg_on_select()
+        self.status.set(f"已编辑账号 {res['account_name']} (未保存)")
+
+    def _apply_strategy_result(self, idx: int, res: dict):
+        """把对话框里的账户级策略与每币覆盖写回 config (None = 删除该覆盖)。"""
+        from ui import config_store
+        for key, val in (res.get("strategy_fields") or {}).items():
+            config_store.set_account_strategy_field(self._cfg_data, idx, key, val)
+        overrides = res.get("pair_overrides") or {}
+        for pair, ov in overrides.items():
+            for key, val in ov.items():
+                config_store.set_pair_override_field(self._cfg_data, idx, pair, key, val)
+        # 取消勾选的币种, 连带删掉它的覆盖块
+        existing = config_store.get_pair_overrides(self._cfg_data, idx)
+        stale = [p for p in existing if p not in overrides]
+        if stale:
+            po = (self._cfg_data["accounts"][idx].get("strategy") or {}).get("pair_overrides")
+            for p in stale:
+                if po is not None:
+                    po.pop(p, None)
+        # 覆盖块被清空 → 删掉空壳, 保持 yaml 干净
+        acc_strategy = self._cfg_data["accounts"][idx].get("strategy")
+        if acc_strategy is not None:
+            po = acc_strategy.get("pair_overrides")
+            if po is not None:
+                for p in [k for k, v in po.items() if not v]:
+                    po.pop(p, None)
+                if not po:
+                    acc_strategy.pop("pair_overrides", None)
+            if not acc_strategy:
+                self._cfg_data["accounts"][idx].pop("strategy", None)
+
+    def _cfg_delete_account(self):
+        from ui import config_store
+        _group, idx = self._cfg_selected()
+        if idx is None:
+            messagebox.showinfo("提示", "先在左侧选中一个账号 (不是组)")
+            return
+        info = config_store.list_accounts(self._cfg_data)[idx]
+        if not messagebox.askyesno(
+                "删除账号", f"删除账号 {info['name']}?\n\n"
+                "它在 config.yaml 里会被注释掉 (可手动去掉 # 恢复),\n"
+                "data/trades.db 里的历史成交记录全部保留。", icon="warning"):
+            return
+        config_store.soft_delete_account(self._cfg_data, idx)
+        self._cfg_render_tree()
+        self.tree_cfg_po.clear()
+        self.status.set(f"已删除账号 {info['name']} (注释掉, 未保存)")
+
+    # ---------- 配置页: pair 覆盖单元格编辑 ----------
+
+    _PO_COLS = ("pair", "signal_bar", "mode", "float_pct", "tp_pct", "sl_pct", "leverage")
+    _PO_LABELS = {"signal_bar": "信号周期", "mode": "模式", "float_pct": "浮动价%",
+                  "tp_pct": "止盈%", "sl_pct": "止损%", "leverage": "杠杆"}
+
+    def _cfg_edit_po_cell(self, event):
+        if self._cfg_data is None:
+            return
+        tree = self.tree_cfg_po.tree
+        row = tree.identify_row(event.y)
+        col_id = tree.identify_column(event.x)
+        if not row or col_id == "#1":
+            return  # pair 名不可改
+        col_idx = int(col_id[1:]) - 1
+        key = self._PO_COLS[col_idx]
+        label = self._PO_LABELS.get(key, key)
+        _group, acc_idx = self._cfg_selected()
+        if acc_idx is None:
+            return
+        old = tree.set(row, key)
+        new = _ask_string(self.root, f"{row} · {label}",
+                          f"{label} 新值 (清空 = 删除该覆盖, 回退全局默认):", old)
+        if new is None:
+            return
+        from ui import config_store
+        if new.strip() == "":
+            value = None
+        elif key in ("signal_bar", "mode"):
+            value = new.strip()
+        elif key == "leverage":
+            try:
+                value = int(new)
+            except ValueError:
+                messagebox.showerror("类型错误", f"{label} 需要整数")
+                return
+        else:
+            try:
+                value = float(new)
+            except ValueError:
+                messagebox.showerror("类型错误", f"{label} 需要数字")
+                return
+        config_store.set_pair_override_field(self._cfg_data, acc_idx, row, key, value)
+        tree.set(row, key, "" if value is None else value)
+        self.status.set(f"{row} {label} = {value!r} (未保存)")
+
+    # ---------- 配置页: 代理 ----------
+
+    def _px_refresh(self):
+        from ui import config_store
+        if self._cfg_data is None:
+            return
+        px = config_store.get_proxy(self._cfg_data)
+        url, enabled = px["url"], px["enabled"]
+        if not url:
+            self.proxy_text.set("未配置代理 — OKX 请求直连")
+        else:
+            self.proxy_text.set(f"{url}    [{'启用' if enabled else '已配置但停用'}]")
+        has = bool(url)
+        # 只支持 1 个 → 已有时禁用「添加」
+        self.btn_px_add.config(state="disabled" if has else "normal")
+        for btn in (self.btn_px_edit, self.btn_px_del, self.btn_px_test):
+            btn.config(state="normal" if has else "disabled")
+
+    def _px_add(self):
+        from ui import config_store
+        res = ProxyDialog.show(self.root, url="", enabled=True, title="添加代理")
+        if res is None:
+            return
+        config_store.set_proxy(self._cfg_data, res["url"], res["enabled"])
+        self._px_refresh()
+        self.status.set(f"代理已设为 {res['url']} (未保存)")
+
+    def _px_edit(self):
+        from ui import config_store
+        px = config_store.get_proxy(self._cfg_data)
+        res = ProxyDialog.show(self.root, url=px["url"], enabled=px["enabled"],
+                               title="编辑代理")
+        if res is None:
+            return
+        config_store.set_proxy(self._cfg_data, res["url"], res["enabled"])
+        self._px_refresh()
+        self.status.set(f"代理已改为 {res['url']} (未保存)")
+
+    def _px_delete(self):
+        from ui import config_store
+        if not messagebox.askyesno(
+                "删除代理", "删除代理配置?\n\n删除后 OKX 请求直连 —— "
+                "如果你所在网络需要代理才能访问 OKX, 机器人会连不上。"):
+            return
+        config_store.clear_proxy(self._cfg_data)
+        self._px_refresh()
+        self.status.set("代理已删除 (未保存)")
+
+    def _px_test(self):
+        """走当前填的代理打一次 OKX 公共接口。worker 线程跑, 不卡 UI。"""
+        from ui import config_store
+        from utils.app_config import net
+        px = config_store.get_proxy(self._cfg_data)
+        url = px["url"]
+        if not url:
+            return
+        base = net(self._cfg_data, "okx_base_url")
+        timeout = net(self._cfg_data, "http_timeout_sec")
+        self.btn_px_test.config(state="disabled")
+        self.status.set(f"正在通过 {url} 测试连接 {base} ...")
+
+        def worker():
+            import time
+            import requests
+            t0 = time.time()
+            try:
+                r = requests.get(f"{base}/api/v5/public/time",
+                                 proxies={"http": url, "https": url},
+                                 timeout=timeout)
+                ms = (time.time() - t0) * 1000
+                if r.status_code == 200:
+                    msg = ("ok", f"代理可用: {base} 返回 200, 耗时 {ms:.0f} ms")
+                else:
+                    msg = ("warn", f"代理连通但 OKX 返回 HTTP {r.status_code} "
+                                   f"(耗时 {ms:.0f} ms)")
+            except Exception as e:
+                msg = ("err", f"代理不可用: {type(e).__name__}: {e}")
+            self.root.after(0, lambda: self._px_test_done(msg))
+
+        threading.Thread(target=worker, name="proxy-test", daemon=True).start()
+
+    def _px_test_done(self, msg):
+        kind, text = msg
+        self.btn_px_test.config(state="normal")
+        self.status.set(text)
+        if kind == "ok":
+            messagebox.showinfo("代理测试", text)
+        elif kind == "warn":
+            messagebox.showwarning("代理测试", text)
+        else:
+            messagebox.showerror("代理测试", text)
+
+    # ---------- 配置页: 环境切换与保存 ----------
 
     def _cfg_switch_env(self, env: str):
         """一键切环境: 启用目标环境全部账户, 禁用其余, 确认后立即保存。"""
@@ -359,101 +954,6 @@ class App:
         self._cfg_load()  # 刷新表格勾选状态
         self.status.set(f"已切到{label}: 启用 {n} 个账户, 重启机器人生效")
 
-    def _cfg_load(self):
-        from ui import config_store
-        try:
-            self._cfg_data = config_store.load_raw()
-        except Exception as e:
-            messagebox.showerror("加载失败", f"config.yaml 读取失败:\n{e}")
-            return
-        self.tree_cfg_acc.delete(*self.tree_cfg_acc.get_children())
-        for acc in config_store.list_accounts(self._cfg_data):
-            self.tree_cfg_acc.insert("", "end", iid=str(acc["index"]), values=(
-                "✓" if acc["enabled"] else "✗", acc["name"], acc["env"],
-                acc["strategy_name"],
-                ",".join(p.split("-")[0] for p in acc["pairs"])))
-        self.tree_cfg_po.delete(*self.tree_cfg_po.get_children())
-        adv = config_store.get_advanced(self._cfg_data)
-        for key, var in self.adv_vars.items():
-            var.set(str(adv.get(key, "")))
-        self.status.set("配置已加载")
-
-    def _cfg_toggle_enabled(self, event):
-        if self._cfg_data is None:
-            return
-        row = self.tree_cfg_acc.identify_row(event.y)
-        col = self.tree_cfg_acc.identify_column(event.x)
-        if not row or col != "#1":
-            return
-        from ui import config_store
-        idx = int(row)
-        cur = bool(self._cfg_data["accounts"][idx].get("enabled", True))
-        config_store.set_account_enabled(self._cfg_data, idx, not cur)
-        vals = list(self.tree_cfg_acc.item(row, "values"))
-        vals[0] = "✓" if not cur else "✗"
-        self.tree_cfg_acc.item(row, values=vals)
-        self.status.set(f"账户 {vals[1]} → {'启用' if not cur else '禁用'} (未保存)")
-
-    def _cfg_show_pair_overrides(self, _event=None):
-        if self._cfg_data is None:
-            return
-        sel = self.tree_cfg_acc.selection()
-        self.tree_cfg_po.delete(*self.tree_cfg_po.get_children())
-        if not sel:
-            return
-        from ui import config_store
-        idx = int(sel[0])
-        po = config_store.get_pair_overrides(self._cfg_data, idx)
-        for pair, ov in po.items():
-            self.tree_cfg_po.insert("", "end", iid=pair, values=(
-                pair.split("-")[0], ov.get("signal_bar", ""), ov.get("mode", ""),
-                ov.get("float_pct", ""), ov.get("tp_pct", ""), ov.get("sl_pct", ""),
-                ov.get("leverage", "")))
-
-    _PO_COLS = ("pair", "signal_bar", "mode", "float_pct", "tp_pct", "sl_pct", "leverage")
-    _PO_LABELS = {"signal_bar": "信号周期", "mode": "模式", "float_pct": "浮动价%",
-                  "tp_pct": "止盈%", "sl_pct": "止损%", "leverage": "杠杆"}
-
-    def _cfg_edit_po_cell(self, event):
-        if self._cfg_data is None:
-            return
-        row = self.tree_cfg_po.identify_row(event.y)
-        col_id = self.tree_cfg_po.identify_column(event.x)
-        if not row or col_id == "#1":
-            return  # pair 名不可改
-        col_idx = int(col_id[1:]) - 1
-        key = self._PO_COLS[col_idx]
-        label = self._PO_LABELS.get(key, key)
-        sel_acc = self.tree_cfg_acc.selection()
-        if not sel_acc:
-            return
-        old = self.tree_cfg_po.set(row, key)
-        new = _ask_string(self.root, f"{row} · {label}",
-                          f"{label} 新值 (清空 = 删除该覆盖, 回退全局默认):", old)
-        if new is None:
-            return
-        from ui import config_store
-        acc_idx = int(sel_acc[0])
-        if new.strip() == "":
-            value = None
-        elif key in ("signal_bar", "mode"):
-            value = new.strip()
-        elif key == "leverage":
-            try:
-                value = int(new)
-            except ValueError:
-                messagebox.showerror("类型错误", f"{label} 需要整数")
-                return
-        else:
-            try:
-                value = float(new)
-            except ValueError:
-                messagebox.showerror("类型错误", f"{label} 需要数字")
-                return
-        config_store.set_pair_override_field(self._cfg_data, acc_idx, row, key, value)
-        self.tree_cfg_po.set(row, key, "" if value is None else value)
-        self.status.set(f"{row} {label} = {value!r} (未保存)")
-
     def _cfg_save(self):
         if self._cfg_data is None:
             return
@@ -469,13 +969,15 @@ class App:
                 config_store.set_advanced_field(self._cfg_data, key, type(default)(raw))
             except (TypeError, ValueError):
                 label = ADVANCED_LABELS.get(key, key)
-                messagebox.showerror("类型错误", f"{label} = {raw!r} 无法转成 {type(default).__name__}")
+                messagebox.showerror("类型错误",
+                                     f"{label} = {raw!r} 无法转成 {type(default).__name__}")
                 return
         # 保存前校验
         import yaml as _pyyaml
         from utils.app_config import validate_config
         try:
             import io
+
             from ui.config_store import _yaml
             buf = io.StringIO()
             _yaml.dump(self._cfg_data, buf)
@@ -492,8 +994,13 @@ class App:
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
             return
+        # 空组无处落地 (accounts 扁平结构), 提示而不是静默丢
+        empty = [g for g in self._pending_groups
+                 if config_store.group_count(self._cfg_data, g) == 0]
+        extra = (f"\n\n注意: 组 {', '.join(empty)} 还没有账号, 未写入配置 "
+                 "(空组无法保存, 给它添加账号后再保存)。" if empty else "")
         messagebox.showinfo("已保存", "config.yaml 已保存 (旧文件备份为 config.yaml.bak)。\n"
-                                     "重启机器人后生效: 控制页 停止 → 启动。")
+                                     "重启机器人后生效: 控制页 停止 → 启动。" + extra)
         self.status.set("配置已保存, 重启生效")
 
     # ================= 控制页 =================
@@ -504,33 +1011,45 @@ class App:
         life.pack(fill="x", padx=6, pady=6)
         self.btn_start = ttk.Button(life, text="启动", command=self._ctl_start)
         self.btn_start.pack(side="left", padx=6, pady=6)
-        self.btn_stop = ttk.Button(life, text="停止", command=self._ctl_stop, state="disabled")
+        self.btn_stop = ttk.Button(life, text="停止", command=self._ctl_stop,
+                                   state="disabled")
         self.btn_stop.pack(side="left", padx=6)
         ttk.Label(life, text="停止 = 优雅退出 (撤 job + 停面板, 挂单/持仓不动, OKX 侧继续有效)"
                   ).pack(side="left", padx=10)
 
-        acc = ttk.LabelFrame(f, text="账户级控制 (运行中可用)")
+        acc = ttk.LabelFrame(f, text="账户级控制 (运行中可用; 选中组 = 对整组生效)")
         acc.pack(fill="both", expand=True, padx=6, pady=6)
-        cols = ("账户", "信号挂单", "操作说明")
-        self.tree_ctl = ttk.Treeview(acc, columns=cols, show="headings", height=6)
-        for c in cols:
-            self.tree_ctl.heading(c, text=c)
-            self.tree_ctl.column(c, width=180, anchor="center")
-        self.tree_ctl.pack(fill="x", padx=4, pady=4)
+        acc.rowconfigure(0, weight=1)
+        acc.columnconfigure(0, weight=1)
+        cols = ("信号挂单", "环境")
+        self.tree_ctl = ScrollableTree(acc, columns=cols, tree_column=True, height=8)
+        self.tree_ctl.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.tree_ctl.tree.heading("#0", text="组 / 账户")
+        self.tree_ctl.tag_configure("group", font=self._bold_font)
 
-        btns = ttk.Frame(acc); btns.pack(fill="x", padx=4, pady=4)
-        ttk.Button(btns, text="暂停信号挂单", command=lambda: self._ctl_pause(True)).pack(side="left", padx=4)
-        ttk.Button(btns, text="恢复信号挂单", command=lambda: self._ctl_pause(False)).pack(side="left", padx=4)
-        ttk.Button(btns, text="撤销全部挂单", command=self._ctl_cancel_all).pack(side="left", padx=16)
+        btns = ttk.Frame(acc)
+        btns.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        ttk.Button(btns, text="暂停信号挂单",
+                   command=lambda: self._ctl_pause(True)).pack(side="left", padx=4)
+        ttk.Button(btns, text="恢复信号挂单",
+                   command=lambda: self._ctl_pause(False)).pack(side="left", padx=4)
+        ttk.Button(btns, text="撤销全部挂单",
+                   command=self._ctl_cancel_all).pack(side="left", padx=16)
         ttk.Label(btns, text="暂停只停新挂单, 对账/结算继续跑; 撤单不动已成交持仓"
                   ).pack(side="left", padx=8)
 
     def _ctl_refresh_accounts(self):
-        self.tree_ctl.delete(*self.tree_ctl.get_children())
-        for name in self.bridge.account_names():
-            paused = name in self.bridge.paused_accounts
-            self.tree_ctl.insert("", "end", iid=name, values=(
-                name, "已暂停" if paused else "运行中", ""))
+        self.tree_ctl.clear()
+        for raw_g, names in self.bridge.account_groups():
+            gid = self.tree_ctl.insert(
+                "", "end", iid=_GROUP_PREFIX + raw_g,
+                text=f"{_group_label(raw_g)}  ({len(names)} 账号)",
+                values=("", ""), tags=("group",), open=True)
+            for name in names:
+                paused = name in self.bridge.paused_accounts
+                self.tree_ctl.insert(gid, "end", iid=_ACC_PREFIX + name, text=name,
+                                     values=("已暂停" if paused else "运行中", ""))
+        self.tree_ctl.autosize()
 
     def _ctl_start(self):
         self.btn_start.config(state="disabled")
@@ -542,41 +1061,58 @@ class App:
             return
         self.bridge.stop()
 
-    def _ctl_selected_account(self) -> str | None:
+    def _ctl_selected_accounts(self) -> tuple[str, list[str]]:
+        """返回 (描述, 账户名列表)。选中组节点 → 组内全部账户。"""
         sel = self.tree_ctl.selection()
         if not sel:
-            messagebox.showinfo("提示", "先在表格里选中一个账户")
-            return None
-        return sel[0]
+            messagebox.showinfo("提示", "先在表格里选中一个账户或一个组")
+            return "", []
+        iid = sel[0]
+        if iid.startswith(_GROUP_PREFIX):
+            raw_g = iid[len(_GROUP_PREFIX):]
+            names = [n for g, ns in self.bridge.account_groups() if g == raw_g
+                     for n in ns]
+            return f"组 {_group_label(raw_g)}", names
+        name = iid[len(_ACC_PREFIX):]
+        return name, [name]
 
     def _ctl_pause(self, pause: bool):
-        name = self._ctl_selected_account()
-        if not name:
+        desc, names = self._ctl_selected_accounts()
+        if not names:
             return
-        n = (self.bridge.pause_signals(name) if pause
-             else self.bridge.resume_signals(name))
+        total = 0
+        for name in names:
+            total += (self.bridge.pause_signals(name) if pause
+                      else self.bridge.resume_signals(name))
         self._ctl_refresh_accounts()
-        self.status.set(f"{name}: {'暂停' if pause else '恢复'} {n} 个信号 job")
+        self.status.set(f"{desc}: {'暂停' if pause else '恢复'} {total} 个信号 job "
+                        f"({len(names)} 个账户)")
 
     def _ctl_cancel_all(self):
-        name = self._ctl_selected_account()
-        if not name:
+        desc, names = self._ctl_selected_accounts()
+        if not names:
             return
-        if not messagebox.askyesno("确认撤单", f"撤销 {name} 的全部待触发挂单?"):
+        if not messagebox.askyesno(
+                "确认撤单", f"撤销 {desc} 的全部待触发挂单?\n\n"
+                f"涉及账户: {', '.join(names)}"):
             return
-        msg = self.bridge.cancel_all_pending(name)
-        self.status.set(f"{name}: {msg}")
+        msgs = [f"{n}: {self.bridge.cancel_all_pending(n)}" for n in names]
+        self.status.set(f"{desc} — " + "; ".join(msgs))
 
     # ================= 日志页 =================
 
     def _build_log_tab(self):
         f = self.tab_log
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
         self.log_text = tk.Text(f, wrap="none", state="disabled",
                                 font=("Consolas", 9))
         ys = ttk.Scrollbar(f, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=ys.set)
-        ys.pack(side="right", fill="y")
-        self.log_text.pack(fill="both", expand=True)
+        xs = ttk.Scrollbar(f, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
         self._log_pos = 0
         self.root.after(2000, self._tail_log)
 
@@ -655,6 +1191,12 @@ class App:
             if not messagebox.askyesno(
                     "退出", "机器人仍在运行。\n退出将优雅停止 (挂单/持仓不动)。继续?"):
                 return
+        try:
+            state = ui_state.capture_window(self.root)
+            state["sashes"] = {"monitor": ui_state.capture_sashes(self.mon_paned, 3)}
+            ui_state.save(state)
+        except Exception:
+            pass
         self._snap_stop.set()
         self.bridge.stop()
         self.root.destroy()

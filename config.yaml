@@ -62,6 +62,7 @@ accounts:
   #
   # 组合 A「6H 主攻」— 6H trend BTC + 6H trend ETH + 6H fade SOL
   - account_name: 初级炼气士-实盘
+    group: 实盘
     enabled: false                    # ← 验收通过后切换启用
     strategy_name: v3-mixed
     api_key: abf7c8b5-a75d-4470-866f-52b53bb14a86
@@ -81,6 +82,7 @@ accounts:
 
   # 组合 B「混周期」— 1D trend BTC + 4H fade ETH + 6H fade SOL
   - account_name: 初级炼气士2-实盘
+    group: 实盘
     enabled: false                    # ← 验收通过后切换启用
     strategy_name: v3-mixed
     api_key: 7ff7534b-0975-43e7-88d1-13642a3c8391
@@ -98,6 +100,7 @@ accounts:
 
   # 组合 C「防御高胜率」— 1D trend BTC + 12H reversal ETH + 6H fade SOL
   - account_name: 初级炼气士3-实盘
+    group: 实盘
     enabled: false                    # ← 验收通过后切换启用
     strategy_name: v3-mixed
     api_key: 8725f04a-af67-4fb8-aad2-ae62e8cf8ce7
@@ -123,6 +126,7 @@ accounts:
   #
   # 组合 A「6H 主攻」— 6H trend BTC + 6H trend ETH + 6H fade SOL
   - account_name: 初级炼气士-模拟
+    group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 A
     strategy_name: v3-mixed
     api_key: e5b77589-31a3-456b-8900-834de01fef45
@@ -143,6 +147,7 @@ accounts:
 
   # 组合 B「混周期」— 1D trend BTC + 4H fade ETH + 6H fade SOL (三组合 MDD 最低 29.6%)
   - account_name: 初级炼气士2-模拟
+    group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 B
     strategy_name: v3-mixed
     api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
@@ -160,6 +165,7 @@ accounts:
 
   # 组合 C「防御高胜率」— 1D trend BTC + 12H reversal ETH + 6H fade SOL (胜率 90.7% 最高)
   - account_name: 初级炼气士3-模拟
+    group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 C
     strategy_name: v3-mixed
     api_key: fbdcc756-3241-4560-9540-6476c96f2548

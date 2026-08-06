@@ -122,6 +122,7 @@ class AccountConfig:
     system_config: dict
     proxy_url: str | None
     strategy_name: str | None = None             # 策略版本名(写进 trades.strategy 列)
+    group: str = ""                              # 所属组(纯分类标签, GUI 分组展示用;不参与策略合并)
     network_config: dict = field(default_factory=dict)   # 顶层 network 段直传
     advanced_config: dict = field(default_factory=dict)  # 顶层 advanced 段直传
 
@@ -184,6 +185,7 @@ def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
         pairs=pairs, td_mode=td_mode,
         strategy_config=merged_strategy, system_config=system_cfg,
         proxy_url=proxy_url, strategy_name=strategy_name,
+        group=str(raw.get("group") or ""),
         network_config=dict(top_cfg.get("network") or {}),
         advanced_config=dict(top_cfg.get("advanced") or {}),
     )

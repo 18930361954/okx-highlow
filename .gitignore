@@ -11,6 +11,9 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 
+# GUI 界面偏好 (窗口尺寸/分栏位置)
+data/ui_state.json
+
 # 日志（含 rotate 后的 bot.log.YYYY-MM-DD）
 logs/
 

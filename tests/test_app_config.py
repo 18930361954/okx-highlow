@@ -81,3 +81,67 @@ def test_validate_network_known_keys_pass():
     cfg["network"] = {"proxy_enabled": True, "proxy_url": "http://127.0.0.1:1",
                       "okx_base_url": "https://www.okx.com", "http_timeout_sec": 15}
     assert validate_config(cfg) == []
+
+
+# ---------------- 分组 (group) ----------------
+
+def test_validate_group_over_limit_flagged():
+    """1 组最多 3 个账号 —— 手改 config 超限时要报出来。"""
+    from utils.app_config import GROUP_MAX_ACCOUNTS
+    cfg = _minimal_valid_config()
+    cfg["accounts"] = [
+        {"account_name": f"a{i}", "group": "组A", "enabled": True, "api_key": "k"}
+        for i in range(GROUP_MAX_ACCOUNTS + 1)
+    ]
+    errs = validate_config(cfg)
+    assert any("组A" in e and str(GROUP_MAX_ACCOUNTS) in e for e in errs)
+
+
+def test_validate_group_at_limit_passes():
+    from utils.app_config import GROUP_MAX_ACCOUNTS
+    cfg = _minimal_valid_config()
+    cfg["accounts"] = [
+        {"account_name": f"a{i}", "group": "组A", "enabled": True, "api_key": "k"}
+        for i in range(GROUP_MAX_ACCOUNTS)
+    ]
+    assert validate_config(cfg) == []
+
+
+def test_validate_ungrouped_accounts_not_limited():
+    """没写 group 的账户不算「一个组」, 不受 3 个上限约束 (旧配置兼容)。"""
+    cfg = _minimal_valid_config()
+    cfg["accounts"] = [
+        {"account_name": f"a{i}", "enabled": True, "api_key": "k"} for i in range(6)
+    ]
+    assert validate_config(cfg) == []
+
+
+def test_validate_disabled_accounts_count_toward_group_limit():
+    """停用的账号仍占组内名额 —— GUI 的「添加」按钮按总数灰掉, 校验须同口径。"""
+    cfg = _minimal_valid_config()
+    cfg["accounts"] = [
+        {"account_name": "a1", "group": "组A", "enabled": True, "api_key": "k"},
+        {"account_name": "a2", "group": "组A", "enabled": False, "api_key": "k"},
+        {"account_name": "a3", "group": "组A", "enabled": False, "api_key": "k"},
+        {"account_name": "a4", "group": "组A", "enabled": False, "api_key": "k"},
+    ]
+    assert any("组A" in e for e in validate_config(cfg))
+
+
+def test_group_flows_into_account_config():
+    """group 要贯通到 AccountConfig, 监控快照才能按组聚合。"""
+    from core.multi_account import _build_account_config
+    cfg = _minimal_valid_config()
+    raw = {"account_name": "a1", "group": "实盘", "enabled": True, "api_key": "k",
+           "env_adapt": "demo"}
+    acc = _build_account_config("a1", raw, cfg)
+    assert acc.group == "实盘"
+
+
+def test_missing_group_defaults_to_empty_string():
+    """旧配置无 group 字段 → 空字符串, 不是 None (界面统一按「未分组」处理)。"""
+    from core.multi_account import _build_account_config
+    cfg = _minimal_valid_config()
+    acc = _build_account_config(
+        "a1", {"account_name": "a1", "enabled": True, "api_key": "k"}, cfg)
+    assert acc.group == ""

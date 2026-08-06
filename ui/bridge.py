@@ -146,3 +146,18 @@ class BotBridge:
     def account_names(self) -> list[str]:
         h = self.handle
         return [rt.name for rt in h["runtimes"]] if h else []
+
+    def account_groups(self) -> list[tuple[str, list[str]]]:
+        """[(组名, [账户名...])], 保持 runtime 顺序。组为空的归到 '' (界面显示未分组)。"""
+        h = self.handle
+        if not h:
+            return []
+        order: list[str] = []
+        by_group: dict[str, list[str]] = {}
+        for rt in h["runtimes"]:
+            g = str(getattr(rt.cfg, "group", "") or "")
+            if g not in by_group:
+                by_group[g] = []
+                order.append(g)
+            by_group[g].append(rt.name)
+        return [(g, by_group[g]) for g in order]
