@@ -33,6 +33,7 @@ hiddenimports = [
     "scripts.fix_orphan_trades",
     "scripts.refill_fees",
     "scripts.cleanup_before_restart",
+    "scripts.cancel_stale_algos",
     "scripts.switch_env",
 ]
 

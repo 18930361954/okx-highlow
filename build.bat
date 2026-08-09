@@ -29,7 +29,10 @@ move "dist\hlbot" "dist\hlbot-v%VER%" >nul || goto :fail
 
 echo.
 echo BUILD OK: dist\hlbot-v%VER%\  (hlbot.exe=GUI, hlbot-cli.exe=终端/子命令)
-echo 发布: 整个 hlbot-v%VER% 文件夹拷到部署机; 更新 = 停止后覆盖 exe+_internal, 不动 config/data/logs
+echo.
+echo 部署 = 把新 exe + _internal 覆盖进 dist\hlbot-live\, data/logs/config/.env 一律不动。
+echo        绝不首启 dist\hlbot-v%VER%\ —— 它自带的 seed 库是打包时的快照, 首启会顶掉正史。
+echo        打包前记得: copy dist\hlbot-live\data\trades.db data\trades.db  (保 seed 最新)
 echo 记得: git tag v%VER%
 exit /b 0
 
