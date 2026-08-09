@@ -10,6 +10,7 @@ __pycache__/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.db.bak*
 
 # GUI 界面偏好 (窗口尺寸/分栏位置)
 data/ui_state.json

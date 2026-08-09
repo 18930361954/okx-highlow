@@ -26,7 +26,7 @@ strategy:
 
 system:
   log_level: INFO
-  log_keep_days: 30
+  log_keep_days: 14
   db_path: data/trades.db
   daily_report_time_utc: "23:55"
 

@@ -27,6 +27,7 @@ from utils.paths import APP_ROOT
 _POLL_MS = 500          # UI 消费 queue 的节拍
 _SNAPSHOT_SEC = 5.0     # worker 采集间隔
 _LOG_TAIL_LINES = 200
+_LOG_TAIL_BYTES = 256 * 1024   # 单次最多回读的尾部字节数 (首次加载/轮转后)
 
 _GROUP_PREFIX = "g:"    # 配置/控制页树节点 iid 前缀
 _ACC_PREFIX = "a:"
@@ -1120,10 +1121,32 @@ class App:
         try:
             path = APP_ROOT / "logs" / "bot.log"
             if path.exists():
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                # TimedRotatingFileHandler 每天把 bot.log 改名归档后新建空文件,
+                # 此时 _log_pos 停在旧文件末尾, 直接 seek 会越过新文件 EOF ->
+                # read() 恒为空, 日志页永久停更。文件变小即视为已轮转, 从头读。
+                size = path.stat().st_size
+                if size < self._log_pos:
+                    self._log_pos = 0
+                # 首次加载/轮转后从 0 读, 断网刷屏时单个文件可达数 MB,
+                # 一次性 insert 会冻住 UI。日志页只留 _LOG_TAIL_LINES 行, 读尾部即可。
+                if size - self._log_pos > _LOG_TAIL_BYTES:
+                    self._log_pos = size - _LOG_TAIL_BYTES
+                    truncated = True
+                else:
+                    truncated = False
+                # 必须用二进制读: 文本模式下 seek/tell 的偏移量与 st_size 的字节数
+                # 不是一个量纲(中文日志尤甚), 混用会把读取位置带偏。
+                with open(path, "rb") as fh:
                     fh.seek(self._log_pos)
-                    new = fh.read()
+                    raw = fh.read()
                     self._log_pos = fh.tell()
+                new = raw.decode("utf-8", errors="replace")
+                if new:
+                    # 从中间字节切入时首行多半是半行(errors=replace 还可能留下乱码),
+                    # 丢掉它只损失一行, 换来干净输出。
+                    if truncated:
+                        nl = new.find("\n")
+                        new = new[nl + 1:] if nl >= 0 else ""
                 if new:
                     self.log_text.config(state="normal")
                     self.log_text.insert("end", new)
