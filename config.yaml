@@ -129,7 +129,7 @@ accounts:
     group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 A
     strategy_name: v3-mixed
-    strategy_start_date: "2026-07-28" # 全量对账只回填此日期之后的持仓
+    strategy_start_date: "2026-07-28T00:00:00" # 策略实际启动时间，回填历史持仓从此时开始
     api_key: e5b77589-31a3-456b-8900-834de01fef45
     secret_key: 10930BAADD1DFB4C324A9066A2BC4CC1
     passphrase: Zdx19971226@@
@@ -151,7 +151,7 @@ accounts:
     group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 B
     strategy_name: v3-mixed
-    strategy_start_date: "2026-07-28" # 全量对账只回填此日期之后的持仓
+    strategy_start_date: "2026-07-28T00:00:00" # 策略实际启动时间，回填历史持仓从此时开始
     api_key: 2053874a-9bb8-42c2-b77e-2822c9ecf2de
     secret_key: 92BBD3C260D31827F0AA39BA0ABFFD56
     passphrase: Zdx19971226@@
@@ -170,7 +170,7 @@ accounts:
     group: 模拟盘
     enabled: true                     # ← 2026-07-28 启: v3-mixed 组合 C
     strategy_name: v3-mixed
-    strategy_start_date: "2026-07-28" # 全量对账只回填此日期之后的持仓
+    strategy_start_date: "2026-07-28T00:00:00" # 策略实际启动时间，回填历史持仓从此时开始
     api_key: fbdcc756-3241-4560-9540-6476c96f2548
     secret_key: F92BE16A31E148D3D52FC9E6832A7489
     passphrase: Zdx19971226@@
