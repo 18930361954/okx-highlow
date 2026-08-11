@@ -217,21 +217,21 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
         except Exception as e:
             logger.warning(f"[startup-sync] 配置的 strategy_start_date 格式错误: {config_start_date}, {e}")
 
-    # 如果配置未指定，查询该账户策略首次启动时间（第一笔非RECOVERED记录）
+    # 如果配置未指定，查询该账户第一笔实际入场的时间
     if not strategy_start:
         try:
             with runtime.db._conn() as conn:
                 first_trade = conn.execute("""
-                    SELECT MIN(created_at) FROM trades
-                    WHERE account=? AND (exit_reason IS NULL OR exit_reason != 'RECOVERED')
+                    SELECT MIN(entry_time) FROM trades
+                    WHERE account=? AND entry_time IS NOT NULL
                 """, (runtime.name,)).fetchone()
 
             if first_trade and first_trade[0]:
                 strategy_start = datetime.fromisoformat(first_trade[0])
-                logger.info(f"[startup-sync] 从数据库推断策略启动时间: {strategy_start.isoformat()}")
+                logger.info(f"[startup-sync] 从数据库推断策略启动时间（第一笔入场）: {strategy_start.isoformat()}")
             else:
-                # 没有正常交易记录，说明是全新账户，不回填任何历史
-                logger.info(f"[startup-sync] 账户无正常交易记录，跳过历史持仓回填")
+                # 没有任何入场记录，说明是全新账户，不回填任何历史
+                logger.info(f"[startup-sync] 账户无入场记录，跳过历史持仓回填")
                 return
         except Exception as e:
             logger.error(f"[startup-sync] 查询策略启动时间失败: {e}")
