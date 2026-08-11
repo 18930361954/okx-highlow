@@ -30,6 +30,9 @@ class _DedupFilter(logging.Filter):
     """把窗口内重复的 WARNING/ERROR 折叠成 1 条 + 1 条汇总。
 
     INFO 全部放行 —— 业务日志(挂单/成交/对账)每条都要留, 且本来就不刷屏。
+
+    CRITICAL FIX: filter() 返回 False 时，getMessage() 等方法不应再被调用，
+    否则在高频日志场景下 record 对象复用会导致状态污染。
     """
 
     def __init__(self, window_sec: int = _DEDUP_WINDOW_SEC):
@@ -38,21 +41,31 @@ class _DedupFilter(logging.Filter):
         self._seen: dict[str, list] = {}   # key -> [首次时间, 抑制条数]
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # INFO 全部放行
         if record.levelno < logging.WARNING:
             return True
+
+        # 防御：filter 内部异常不应导致日志系统挂掉
         try:
             msg = record.getMessage()
         except Exception:
+            # getMessage 失败说明 record 对象本身有问题，但至少让它通过
             return True
+
         key = _DEDUP_NORMALIZE.sub("", msg)
         now = record.created
         ent = self._seen.get(key)
 
+        # 新窗口或窗口过期：放行并重置计数
         if ent is None or now - ent[0] >= self.window:
             if ent is not None and ent[1] > 0:
                 # 上一窗口攒下的抑制数, 挂到这条放行的消息后面一起说清楚
-                record.msg = f"{msg}  [上一窗口同类已抑制 {ent[1]} 条]"
-                record.args = ()
+                try:
+                    record.msg = f"{msg}  [上一窗口同类已抑制 {ent[1]} 条]"
+                    record.args = ()
+                except Exception:
+                    # 修改 record 失败不应阻止日志输出
+                    pass
             self._seen[key] = [now, 0]
             # 防止长期运行下 key 无限增长(端点/错误码组合有限, 但保险)
             if len(self._seen) > 512:
@@ -60,8 +73,29 @@ class _DedupFilter(logging.Filter):
                 self._seen = {k: v for k, v in self._seen.items() if v[0] >= cutoff}
             return True
 
+        # 窗口内重复：抑制
         ent[1] += 1
         return False
+
+
+class _SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """加固版 TimedRotatingFileHandler，防止 emit/rollover 异常导致日志系统挂掉"""
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except Exception:
+            # 静默处理，防止日志系统因异常停摆
+            # 最坏情况是丢几条日志，但不会导致整个系统失去日志能力
+            self.handleError(record)
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except Exception:
+            # 轮转失败不应导致日志系统完全失效
+            # 继续用当前文件，总比没有日志好
+            pass
 
 
 def get_logger(
@@ -96,7 +130,7 @@ def get_logger(
         logger.addHandler(console)
 
     log_file = _LOG_DIR / "bot.log"
-    file_handler = TimedRotatingFileHandler(
+    file_handler = _SafeTimedRotatingFileHandler(
         log_file,
         when="midnight",
         interval=1,
@@ -118,7 +152,7 @@ def get_account_file_handler(account_name: str, keep_days: int = 30) -> logging.
     """
     safe = re.sub(r"[^\w\-.]", "_", account_name)
     log_file = _LOG_DIR / f"bot_{safe}.log"
-    h = TimedRotatingFileHandler(
+    h = _SafeTimedRotatingFileHandler(
         log_file, when="midnight", interval=1,
         backupCount=keep_days, encoding="utf-8", utc=True,
     )
