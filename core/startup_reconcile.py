@@ -209,7 +209,7 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
 
     # 优先使用配置中明确指定的策略启动时间
     strategy_start = None
-    config_start_date = runtime.cfg.get("strategy_start_date")
+    config_start_date = runtime.cfg.strategy_start_date
     if config_start_date:
         try:
             strategy_start = datetime.fromisoformat(config_start_date).replace(tzinfo=UTC)

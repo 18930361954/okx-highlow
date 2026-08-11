@@ -122,6 +122,7 @@ class AccountConfig:
     system_config: dict
     proxy_url: str | None
     strategy_name: str | None = None             # 策略版本名(写进 trades.strategy 列)
+    strategy_start_date: str | None = None       # 策略启动时间(YYYY-MM-DD),启动对账只回填此日期之后的持仓
     group: str = ""                              # 所属组(纯分类标签, GUI 分组展示用;不参与策略合并)
     network_config: dict = field(default_factory=dict)   # 顶层 network 段直传
     advanced_config: dict = field(default_factory=dict)  # 顶层 advanced 段直传
@@ -179,12 +180,18 @@ def _build_account_config(name: str, raw: dict, top_cfg: dict) -> AccountConfig:
     if strategy_name is not None:
         strategy_name = str(strategy_name)
 
+    # 策略启动时间(用于启动对账时过滤历史数据)
+    strategy_start_date = raw.get("strategy_start_date") or None
+    if strategy_start_date is not None:
+        strategy_start_date = str(strategy_start_date)
+
     return AccountConfig(
         name=name, enabled=enabled, env=env,
         api_key=api_key, secret_key=secret_key, passphrase=passphrase,
         pairs=pairs, td_mode=td_mode,
         strategy_config=merged_strategy, system_config=system_cfg,
         proxy_url=proxy_url, strategy_name=strategy_name,
+        strategy_start_date=strategy_start_date,
         group=str(raw.get("group") or ""),
         network_config=dict(top_cfg.get("network") or {}),
         advanced_config=dict(top_cfg.get("advanced") or {}),
