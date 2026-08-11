@@ -405,7 +405,63 @@ def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> d
         misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
     )
 
+    # 过期订单清理: 每 4 小时一次
+    from core.stale_order_cleanup import cleanup_stale_orders
+    def cleanup_all_accounts():
+        for rt in ok_runtimes:
+            try:
+                cleanup_stale_orders(rt)
+            except Exception as e:
+                rt.logger.error(f"[stale-cleanup] 失败: {e}")
+
+    sched.add_job(
+        cleanup_all_accounts,
+        trigger=CronTrigger(hour="*/4", minute=15, timezone=UTC),
+        id="stale_order_cleanup",
+        misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    # 每日 DB 自愈: 每天 23:50 深度对账
+    from core.daily_db_heal import daily_db_heal
+    def daily_heal_all_accounts():
+        for rt in ok_runtimes:
+            try:
+                daily_db_heal(rt)
+            except Exception as e:
+                rt.logger.error(f"[daily-heal] 失败: {e}")
+
+    sched.add_job(
+        daily_heal_all_accounts,
+        trigger=CronTrigger(hour=23, minute=50, timezone=UTC),
+        id="daily_db_heal",
+        misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    # 到点未挂检测: 每小时检查一次
+    from core.missing_signal_check import check_missing_signals
+    def check_missing_all_accounts():
+        for rt in ok_runtimes:
+            try:
+                check_missing_signals(rt)
+            except Exception as e:
+                rt.logger.error(f"[missing-signal] 失败: {e}")
+
+    sched.add_job(
+        check_missing_all_accounts,
+        trigger=CronTrigger(hour="*", minute=5, timezone=UTC),
+        id="missing_signal_check",
+        misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
+    )
+
     sched.start()
+
+    # 启动全量对账: 修复断网/重启/OKX错误期间的所有不一致
+    from core.startup_reconcile import startup_full_reconcile
+    for rt in ok_runtimes:
+        try:
+            startup_full_reconcile(rt)
+        except Exception as e:
+            rt.logger.error(f"启动全量对账失败: {e}")
 
     # 启动立刻各账户跑一次 orphan 扫描(撤同 clOrdId 的历史重复单)+ reconcile + catchup
     for rt in ok_runtimes:

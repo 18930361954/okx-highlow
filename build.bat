@@ -33,6 +33,11 @@ echo.
 echo 部署 = 把新 exe + _internal 覆盖进 dist\hlbot-live\, data/logs/config/.env 一律不动。
 echo        绝不首启 dist\hlbot-v%VER%\ —— 它自带的 seed 库是打包时的快照, 首启会顶掉正史。
 echo        打包前记得: copy dist\hlbot-live\data\trades.db data\trades.db  (保 seed 最新)
+echo.
+echo ⚠️  数据同步完成后，清理旧版本避免排查问题找错地方:
+echo    python scripts\cleanup_old_versions.py          (预览)
+echo    python scripts\cleanup_old_versions.py --confirm (执行)
+echo.
 echo 记得: git tag v%VER%
 exit /b 0
 

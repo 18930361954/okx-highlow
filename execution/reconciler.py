@@ -673,6 +673,7 @@ class Reconciler:
         - db 里当前信号桶 sig_id 该 pair 无任何 trade
         - OKX 无 pending / 无持仓 该 pair
         - 账户未熔断
+        - 信号未过期（距离桶起始不超过桶长的 50%）
         """
         if not pair or not self.strategy or not self.order_manager:
             return
@@ -681,6 +682,17 @@ class Reconciler:
         # 上一桶 (即 signal 依据的那一桶) 起始时间 → 用它作 sig_id
         prev = previous_bucket_start(now, signal_bar)
         sig_id = bucket_id(prev)
+
+        # === 过期检查：距离桶起始超过桶长 50% 不补挂 ===
+        bucket_secs = _BUCKET_SECS.get(signal_bar, 3600)
+        elapsed_secs = (now - prev).total_seconds()
+        if elapsed_secs > bucket_secs * 0.5:
+            if self.logger:
+                self.logger.info(
+                    f"[catchup-exit] {pair} 信号已过期 "
+                    f"(elapsed={elapsed_secs:.0f}s > {bucket_secs*0.5:.0f}s), 不补挂"
+                )
+            return
 
         # 已有当前桶记录 → 不补
         same_bkt = [x for x in self.db.list_trades_by_date(sig_id, account=self.account_name) if x.get("pair") == pair]
