@@ -123,8 +123,15 @@ def test_recover_missing_trades_from_okx(mock_runtime):
         ]
     }
 
-    # db 查询：不存在
-    mock_runtime.db._mock_conn.execute.return_value.fetchone.return_value = None
+    # Mock 策略启动时间查询（返回一个早于历史持仓的时间）
+    from datetime import datetime
+    mock_conn = mock_runtime.db._mock_conn
+
+    # 第一次查询：策略首次启动时间（早于持仓时间，所以会回填）
+    mock_conn.execute.return_value.fetchone.side_effect = [
+        ("2026-08-01 00:00:00",),  # 策略启动时间
+        None,  # posId 查询：不存在
+    ]
 
     _recover_missing_trades_from_okx(mock_runtime, days=7)
 

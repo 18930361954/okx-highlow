@@ -200,11 +200,36 @@ def _check_db_trades_in_okx(runtime: "AccountRuntime") -> None:
 
 
 def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -> None:
-    """从 OKX 历史持仓回填 db 缺失的交易记录"""
+    """从 OKX 历史持仓回填 db 缺失的交易记录
+
+    重要：只回填策略首次启动之后的持仓，避免同步策略启动前的历史交易
+    """
     logger = runtime.logger
     logger.info(f"[startup-sync] 3/4 扫描最近 {days} 天 OKX 历史持仓...")
 
+    # 查询该账户策略首次启动时间（第一笔非RECOVERED记录）
+    try:
+        with runtime.db._conn() as conn:
+            first_trade = conn.execute("""
+                SELECT MIN(created_at) FROM trades
+                WHERE account=? AND (exit_reason IS NULL OR exit_reason != 'RECOVERED')
+            """, (runtime.name,)).fetchone()
+
+        if first_trade and first_trade[0]:
+            strategy_start = datetime.fromisoformat(first_trade[0])
+            logger.info(f"[startup-sync] 策略首次启动: {strategy_start.isoformat()}")
+        else:
+            # 没有正常交易记录，说明是全新账户，不回填任何历史
+            logger.info(f"[startup-sync] 账户无正常交易记录，跳过历史持仓回填")
+            return
+    except Exception as e:
+        logger.error(f"[startup-sync] 查询策略启动时间失败: {e}")
+        return
+
     since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    # 限制回填时间不早于策略启动时间
+    strategy_start_ms = int(strategy_start.timestamp() * 1000)
+    since_ms = max(since_ms, strategy_start_ms)
 
     # 从 strategy_config 获取 pairs
     pairs = runtime.cfg.strategy_config.get("pairs", [])
