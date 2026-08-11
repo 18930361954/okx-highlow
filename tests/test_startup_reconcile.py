@@ -20,9 +20,17 @@ def mock_runtime():
     """创建 mock runtime"""
     runtime = MagicMock()
     runtime.name = "test-account"
-    runtime.pairs = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    runtime.cfg = MagicMock()
+    runtime.cfg.strategy_config = {"pairs": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]}
     runtime.logger = MagicMock()
+
+    # Mock db._conn() context manager
+    mock_conn = MagicMock()
     runtime.db = MagicMock()
+    runtime.db._conn.return_value.__enter__ = MagicMock(return_value=mock_conn)
+    runtime.db._conn.return_value.__exit__ = MagicMock(return_value=False)
+    runtime.db._mock_conn = mock_conn  # 保存引用供测试使用
+
     runtime.okx = MagicMock()
     runtime.account = MagicMock()
     return runtime
@@ -41,12 +49,12 @@ def test_check_okx_positions_in_db_normal(mock_runtime):
     ]
 
     # db 有对应 open trade
-    mock_runtime.db.execute.return_value.fetchone.return_value = (123, 60000.0)
+    mock_runtime.db._mock_conn.execute.return_value.fetchone.return_value = (123, 60000.0)
 
     _check_okx_positions_in_db(mock_runtime)
 
     # 应该查询 db
-    mock_runtime.db.execute.assert_called()
+    mock_runtime.db._mock_conn.execute.assert_called()
     # 不应该报错
     assert not any("🔴" in str(call) for call in mock_runtime.logger.error.call_args_list)
 
@@ -64,7 +72,7 @@ def test_check_okx_positions_missing_in_db(mock_runtime):
     ]
 
     # db 无记录
-    mock_runtime.db.execute.return_value.fetchone.return_value = None
+    mock_runtime.db._mock_conn.execute.return_value.fetchone.return_value = None
 
     _check_okx_positions_in_db(mock_runtime)
 
@@ -76,7 +84,7 @@ def test_check_okx_positions_missing_in_db(mock_runtime):
 def test_check_db_trades_cancelled_in_okx(mock_runtime):
     """测试：db open trade 在 OKX 已撤销 - 标记 CANCELLED"""
     # db 有 open trade
-    mock_runtime.db.execute.return_value.fetchall.return_value = [
+    mock_runtime.db._mock_conn.execute.return_value.fetchall.return_value = [
         (901, "ETH-USDT-SWAP", "long", "algo123", "2026-08-09T00:00Z", "2026-08-09 04:02:04", None)
     ]
 
@@ -91,7 +99,7 @@ def test_check_db_trades_cancelled_in_okx(mock_runtime):
     _check_db_trades_in_okx(mock_runtime)
 
     # 应该标记为 CANCELLED
-    calls = [str(call) for call in mock_runtime.db.execute.call_args_list]
+    calls = [str(call) for call in mock_runtime.db._mock_conn.execute.call_args_list]
     assert any("CANCELLED" in call for call in calls)
 
 
@@ -116,12 +124,12 @@ def test_recover_missing_trades_from_okx(mock_runtime):
     }
 
     # db 查询：不存在
-    mock_runtime.db.execute.return_value.fetchone.return_value = None
+    mock_runtime.db._mock_conn.execute.return_value.fetchone.return_value = None
 
     _recover_missing_trades_from_okx(mock_runtime, days=7)
 
     # 应该插入新记录
-    calls = [str(call) for call in mock_runtime.db.execute.call_args_list]
+    calls = [str(call) for call in mock_runtime.db._mock_conn.execute.call_args_list]
     assert any("INSERT INTO trades" in call for call in calls)
     assert any("RECOVERED" in call for call in calls)
 
@@ -159,7 +167,7 @@ def test_startup_full_reconcile_integration(mock_runtime):
     """测试：完整启动对账流程"""
     # Mock 所有依赖
     mock_runtime.okx.get_positions.return_value = []
-    mock_runtime.db.execute.return_value.fetchall.return_value = []
+    mock_runtime.db._mock_conn.execute.return_value.fetchall.return_value = []
     mock_runtime.okx._request.return_value = {"data": []}
     mock_runtime.okx.get_cash_balance.return_value = 1000.0
     mock_runtime.account.get_balance.return_value = 1000.0

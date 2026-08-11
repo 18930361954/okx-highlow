@@ -70,11 +70,12 @@ def _check_okx_positions_in_db(runtime: "AccountRuntime") -> None:
 
         # 查询 db 是否有该持仓的 open trade
         try:
-            open_trade = runtime.db.execute("""
-                SELECT id, entry_price FROM trades
-                WHERE account=? AND pair=? AND side=? AND exit_price IS NULL
-                LIMIT 1
-            """, (runtime.name, pair, pos_side)).fetchone()
+            with runtime.db._conn() as conn:
+                open_trade = conn.execute("""
+                    SELECT id, entry_price FROM trades
+                    WHERE account=? AND pair=? AND side=? AND exit_price IS NULL
+                    LIMIT 1
+                """, (runtime.name, pair, pos_side)).fetchone()
         except Exception as e:
             logger.warning(f"[startup-sync] 查询 db trade 失败: {e}")
             continue
@@ -100,11 +101,12 @@ def _check_db_trades_in_okx(runtime: "AccountRuntime") -> None:
 
     # 查询 db 所有 open trades
     try:
-        open_trades = runtime.db.execute("""
-            SELECT id, pair, side, okx_order_id, signal_date, created_at, entry_time
-            FROM trades
-            WHERE account=? AND exit_price IS NULL
-        """, (runtime.name,)).fetchall()
+        with runtime.db._conn() as conn:
+            open_trades = conn.execute("""
+                SELECT id, pair, side, okx_order_id, signal_date, created_at, entry_time
+                FROM trades
+                WHERE account=? AND exit_price IS NULL
+            """, (runtime.name,)).fetchall()
     except Exception as e:
         logger.error(f"[startup-sync] 查询 db open trades 失败: {e}")
         return
@@ -204,7 +206,9 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
 
     since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
 
-    for pair in runtime.pairs:
+    # 从 strategy_config 获取 pairs
+    pairs = runtime.cfg.strategy_config.get("pairs", [])
+    for pair in pairs:
         try:
             resp = runtime.okx._request(
                 "GET", "/api/v5/account/positions-history",
@@ -228,12 +232,13 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
 
                 # 检查 db 是否有该持仓（宽松匹配：入场时间±5分钟）
                 try:
-                    existing = runtime.db.execute("""
-                        SELECT id FROM trades
-                        WHERE account=? AND pair=?
-                          AND abs(julianday(entry_time) - julianday(?)) < 0.0035
-                        LIMIT 1
-                    """, (runtime.name, pair, open_time)).fetchone()
+                    with runtime.db._conn() as conn:
+                        existing = conn.execute("""
+                            SELECT id FROM trades
+                            WHERE account=? AND pair=?
+                              AND abs(julianday(entry_time) - julianday(?)) < 0.0035
+                            LIMIT 1
+                        """, (runtime.name, pair, open_time)).fetchone()
                 except Exception as e:
                     logger.warning(f"[recover] 查询 db 失败: {e}")
                     existing = None
@@ -251,27 +256,28 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
                 )
 
                 try:
-                    runtime.db.execute("""
-                        INSERT INTO trades (
-                            account, pair, side, signal_date, signal_bar,
-                            entry_price, exit_price, exit_reason,
-                            entry_time, exit_time,
-                            pnl, pnl_gross, fee, funding,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    """, (
-                        runtime.name, pair,
-                        "long" if pos["posSide"] == "long" else "short",
-                        "RECOVERED", "UNKNOWN",
-                        float(pos.get("openAvgPx", 0) or 0),
-                        float(pos.get("closeAvgPx", 0) or 0),
-                        "RECOVERED",
-                        open_time, close_time,
-                        pnl,
-                        float(pos.get("pnl", 0) or 0),
-                        abs(float(pos.get("fee", 0) or 0)),
-                        float(pos.get("fundingFee", 0) or 0)
-                    ))
+                    with runtime.db._conn() as conn:
+                        conn.execute("""
+                            INSERT INTO trades (
+                                account, pair, side, signal_date, signal_bar,
+                                entry_price, exit_price, exit_reason,
+                                entry_time, exit_time,
+                                pnl, pnl_gross, fee, funding,
+                                created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        """, (
+                            runtime.name, pair,
+                            "long" if pos["posSide"] == "long" else "short",
+                            "RECOVERED", "UNKNOWN",
+                            float(pos.get("openAvgPx", 0) or 0),
+                            float(pos.get("closeAvgPx", 0) or 0),
+                            "RECOVERED",
+                            open_time, close_time,
+                            pnl,
+                            float(pos.get("pnl", 0) or 0),
+                            abs(float(pos.get("fee", 0) or 0)),
+                            float(pos.get("fundingFee", 0) or 0)
+                        ))
                     logger.info(f"[recover] ✓ {pair} posId={pos_id} 已回填")
                 except Exception as e:
                     logger.error(f"[recover] {pair} posId={pos_id} 回填失败: {e}")
@@ -311,12 +317,13 @@ def _validate_and_sync_balance(runtime: "AccountRuntime") -> None:
 def _mark_trade_cancelled(runtime: "AccountRuntime", trade_id: int) -> None:
     """标记 trade 为 CANCELLED"""
     try:
-        runtime.db.execute("""
-            UPDATE trades
-            SET exit_price=0, exit_reason='CANCELLED',
-                exit_time=datetime('now'), pnl=0, fee=0
-            WHERE id=?
-        """, (trade_id,))
+        with runtime.db._conn() as conn:
+            conn.execute("""
+                UPDATE trades
+                SET exit_price=0, exit_reason='CANCELLED',
+                    exit_time=datetime('now'), pnl=0, fee=0
+                WHERE id=?
+            """, (trade_id,))
         runtime.logger.info(f"[startup-sync] ✓ trade#{trade_id} → CANCELLED")
     except Exception as e:
         runtime.logger.error(f"[startup-sync] 标记 trade#{trade_id} CANCELLED 失败: {e}")
@@ -325,12 +332,13 @@ def _mark_trade_cancelled(runtime: "AccountRuntime", trade_id: int) -> None:
 def _mark_trade_orphan(runtime: "AccountRuntime", trade_id: int) -> None:
     """标记 trade 为 ORPHAN"""
     try:
-        runtime.db.execute("""
-            UPDATE trades
-            SET exit_price=0, exit_reason='ORPHAN',
-                exit_time=datetime('now'), pnl=0, fee=0
-            WHERE id=?
-        """, (trade_id,))
+        with runtime.db._conn() as conn:
+            conn.execute("""
+                UPDATE trades
+                SET exit_price=0, exit_reason='ORPHAN',
+                    exit_time=datetime('now'), pnl=0, fee=0
+                WHERE id=?
+            """, (trade_id,))
         runtime.logger.info(f"[startup-sync] ✓ trade#{trade_id} → ORPHAN")
     except Exception as e:
         runtime.logger.error(f"[startup-sync] 标记 trade#{trade_id} ORPHAN 失败: {e}")
