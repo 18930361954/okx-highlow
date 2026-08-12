@@ -41,13 +41,14 @@ def cleanup_stale_orders(runtime: "AccountRuntime") -> int:
 
     # 查询所有未入场的 open trades
     try:
-        open_trades = runtime.db.execute("""
-            SELECT id, pair, signal_date, signal_bar, okx_order_id, created_at
-            FROM trades
-            WHERE account=? AND exit_price IS NULL
-              AND entry_time IS NULL
-              AND okx_order_id IS NOT NULL
-        """, (runtime.name,)).fetchall()
+        with runtime.db._conn() as conn:
+            open_trades = conn.execute("""
+                SELECT id, pair, signal_date, signal_bar, okx_order_id, created_at
+                FROM trades
+                WHERE account=? AND exit_price IS NULL
+                  AND entry_time IS NULL
+                  AND okx_order_id IS NOT NULL
+            """, (runtime.name,)).fetchall()
     except Exception as e:
         logger.error(f"[stale-cleanup] 查询 open trades 失败: {e}")
         return 0
@@ -89,12 +90,13 @@ def cleanup_stale_orders(runtime: "AccountRuntime") -> int:
 
             # 标记为 EXPIRED
             try:
-                runtime.db.execute("""
-                    UPDATE trades
-                    SET exit_price=0, exit_reason='EXPIRED',
-                        exit_time=datetime('now'), pnl=0, fee=0
-                    WHERE id=?
-                """, (trade_id,))
+                with runtime.db._conn() as conn:
+                    conn.execute("""
+                        UPDATE trades
+                        SET exit_price=0, exit_reason='EXPIRED',
+                            exit_time=datetime('now'), pnl=0, fee=0
+                        WHERE id=?
+                    """, (trade_id,))
                 logger.info(f"[stale-cleanup] ✓ trade#{trade_id} → EXPIRED")
                 cleaned += 1
             except Exception as e:
@@ -127,10 +129,11 @@ def check_missed_signals(runtime: "AccountRuntime") -> None:
 
         # 检查 db 是否有该桶的记录
         try:
-            existing = runtime.db.execute("""
-                SELECT COUNT(*) FROM trades
-                WHERE account=? AND pair=? AND signal_date=?
-            """, (runtime.name, pair, sig_id)).fetchone()
+            with runtime.db._conn() as conn:
+                existing = conn.execute("""
+                    SELECT COUNT(*) FROM trades
+                    WHERE account=? AND pair=? AND signal_date=?
+                """, (runtime.name, pair, sig_id)).fetchone()
 
             if existing and existing[0] > 0:
                 continue  # 已有记录
@@ -148,10 +151,11 @@ def check_missed_signals(runtime: "AccountRuntime") -> None:
 
         # 检查是否有 pending 或持仓
         try:
-            has_pending = runtime.db.execute("""
-                SELECT COUNT(*) FROM trades
-                WHERE account=? AND pair=? AND exit_price IS NULL
-            """, (runtime.name, pair)).fetchone()
+            with runtime.db._conn() as conn:
+                has_pending = conn.execute("""
+                    SELECT COUNT(*) FROM trades
+                    WHERE account=? AND pair=? AND exit_price IS NULL
+                """, (runtime.name, pair)).fetchone()
 
             if has_pending and has_pending[0] > 0:
                 continue  # 有未平仓记录

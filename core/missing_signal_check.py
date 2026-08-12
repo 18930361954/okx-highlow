@@ -35,7 +35,7 @@ def check_missing_signals(runtime):
 
     for pair_cfg in runtime.cfg.pairs:
         pair = pair_cfg if isinstance(pair_cfg, str) else pair_cfg.get('symbol')
-        signal_bar = runtime.cfg.get_pair_signal_bar(pair)
+        signal_bar = runtime.strategy.signal_bar_for(pair)
 
         # 上一个完整桶的起始时间
         prev_bucket = previous_bucket_start(now, signal_bar)
