@@ -263,6 +263,11 @@ def _recover_missing_trades_from_okx(runtime: "AccountRuntime", days: int = 7) -
                 open_ts = int(pos["cTime"])
                 close_ts = int(pos["uTime"])
 
+                # 二次过滤：只回填开仓时间 >= strategy_start 的持仓
+                # OKX positions-history 的 begin 参数过滤的是平仓时间(uTime)，不是开仓时间(cTime)
+                if open_ts < strategy_start_ms:
+                    continue
+
                 open_time = datetime.fromtimestamp(open_ts / 1000, tz=UTC).isoformat()
                 close_time = datetime.fromtimestamp(close_ts / 1000, tz=UTC).isoformat()
 
