@@ -63,6 +63,8 @@ def cleanup_stale_orders(runtime: "AccountRuntime") -> int:
         # 计算订单年龄
         try:
             created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
         except Exception:
             logger.warning(f"[stale-cleanup] trade#{trade_id} created_at 解析失败: {created_at}")
             continue
