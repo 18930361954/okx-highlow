@@ -421,7 +421,7 @@ def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> d
         misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
     )
 
-    # 每日 DB 自愈: 每天 23:50 深度对账
+    # 日间健康检查: 每 4 小时深度对账 (04:00, 08:00, 12:00, 16:00, 20:00, 23:50 UTC)
     from core.daily_db_heal import daily_db_heal
     def daily_heal_all_accounts():
         for rt in ok_runtimes:
@@ -432,9 +432,28 @@ def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> d
 
     sched.add_job(
         daily_heal_all_accounts,
-        trigger=CronTrigger(hour=23, minute=50, timezone=UTC),
+        trigger=CronTrigger(hour="4,8,12,16,20,23", minute=50, timezone=UTC),
         id="daily_db_heal",
-        misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
+        misfire_grace_time=600, coalesce=True, max_instances=1, replace_existing=True,
+    )
+
+    # 余额主动同步: 每小时检查无持仓账户并同步余额
+    def hourly_balance_sync():
+        """每小时同步余额（无持仓时），吸收充值/提现"""
+        for rt in ok_runtimes:
+            try:
+                held_pairs = _pairs_with_open_position(rt.okx, rt.logger)
+                if held_pairs is None or len(held_pairs) > 0:
+                    continue  # 查询失败或有持仓时跳过
+                _sync_balance_before_place(rt, held_pairs)
+            except Exception as e:
+                rt.logger.warning(f"[hourly-balance-sync] 失败: {e}")
+
+    sched.add_job(
+        hourly_balance_sync,
+        trigger=CronTrigger(minute=5, timezone=UTC),  # 每小时 05 分
+        id="hourly_balance_sync",
+        misfire_grace_time=600, coalesce=True, max_instances=1, replace_existing=True,
     )
 
     # 到点未挂检测: 每小时检查一次
