@@ -161,31 +161,52 @@ def _mark_orphan_trades(runtime) -> int:
 def _recover_missing_trades(runtime, days=30, rate_limit_delay=0.5) -> int:
     """从 OKX 历史持仓回填 db 缺失的交易
 
-    P3优化: 添加限速控制，避免触发 OKX API 限流
+    只回填策略启动时间之后的持仓，避免污染验证数据。
+    使用 begin 参数 + 开仓时间二次过滤，与 startup_reconcile 保持一致。
 
     Args:
         runtime: AccountRuntime 实例
-        days: 回溯天数
+        days: 回溯天数（但不早于策略启动时间）
         rate_limit_delay: 每次 API 调用后的延迟（秒）
 
     Returns:
         回填的记录数量
     """
     import time
+    from datetime import datetime, timezone
     logger = runtime.logger
+    UTC = timezone.utc
+
+    # 策略启动时间：优先读配置，否则不回填历史
+    strategy_start_ms = None
+    config_start_date = getattr(runtime.cfg, 'strategy_start_date', None)
+    if config_start_date:
+        try:
+            strategy_start = datetime.fromisoformat(config_start_date).replace(tzinfo=UTC)
+            strategy_start_ms = int(strategy_start.timestamp() * 1000)
+            logger.info(f"[daily-heal] 回填起点: {strategy_start.isoformat()}")
+        except Exception as e:
+            logger.warning(f"[daily-heal] strategy_start_date 格式错误: {e}")
+
+    if strategy_start_ms is None:
+        logger.info("[daily-heal] 未配置 strategy_start_date，跳过历史回填（防止数据污染）")
+        return 0
+
     since = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    # 取两者较大值：不早于策略启动时间
+    since = max(since, strategy_start_ms)
 
     recovered_count = 0
 
     for pair in runtime.cfg.pairs:
         try:
-            # P3优化: API 调用前限速
+            # 限速：避免触发 OKX API 限流
             time.sleep(rate_limit_delay)
 
             resp = runtime.okx._request('GET', '/api/v5/account/positions-history', params={
                 'instType': 'SWAP',
                 'instId': pair,
-                'after': str(since),
+                'begin': str(strategy_start_ms),  # 从策略启动时间开始（平仓时间过滤）
                 'limit': '100'
             })
 
@@ -195,6 +216,11 @@ def _recover_missing_trades(runtime, days=30, rate_limit_delay=0.5) -> int:
             for pos in resp['data']:
                 open_ts = int(pos['cTime'])
                 close_ts = int(pos['uTime'])
+
+                # 二次过滤：只回填开仓时间 >= strategy_start 的持仓
+                # OKX positions-history 的 begin 参数过滤的是平仓时间，不是开仓时间
+                if open_ts < strategy_start_ms:
+                    continue
 
                 open_time = datetime.fromtimestamp(open_ts/1000, tz=UTC).isoformat()
                 close_time = datetime.fromtimestamp(close_ts/1000, tz=UTC).isoformat()
