@@ -244,6 +244,29 @@ class Reconciler:
         if isinstance(exc, requests.RequestException):
             self.last_run_had_net_error = True
 
+    def _check_network_recovery_and_heal(self) -> None:
+        """P2优化: 网络故障恢复后主动触发 mini_heal 补齐漂移数据。
+        检测逻辑: 前次有网络错误 + 本轮成功 → 判定为恢复,触发对账。"""
+        if not hasattr(self, '_prev_had_net_error'):
+            self._prev_had_net_error = False
+
+        # 本轮开始前保存上一轮状态
+        had_error_before = self._prev_had_net_error
+
+        # 检测恢复: 前次错误 + 本轮成功(目前尚未执行任何网络请求,默认成功)
+        if had_error_before and not self.last_run_had_net_error:
+            if self.logger:
+                self.logger.warning("[network-recovery] 检测到网络恢复,触发 mini_heal 补齐数据")
+            try:
+                from tools.daily_db_heal import mini_heal
+                mini_heal(self.account_name, self.logger)
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"[network-recovery] mini_heal 失败: {e}")
+
+        # 更新状态供下一轮使用
+        self._prev_had_net_error = self.last_run_had_net_error
+
     def _sync_balance_after_exit(self) -> None:
         """平仓结算后把本地余额对齐 OKX 真值,吸收充值/提现等本地感知不到的资金变动。
         用 cashBal(现金余额,不含未实现盈亏),有持仓也能安全同步 ——
@@ -273,6 +296,10 @@ class Reconciler:
         """跑一轮对账。返回本轮结算的 trade 数（含 entry 回填与 exit 结算）。"""
         self.last_run_had_net_error = False
         self._last_pending_algo_ids = None  # 每轮清空,避免 cleanup 异常时用到旧值
+
+        # P2优化: 网络恢复检测
+        self._check_network_recovery_and_heal()
+
         try:
             open_trades = self.db.list_open_trades(account=self.account_name)
         except Exception as e:
@@ -1175,6 +1202,8 @@ class Reconciler:
         2026-08-06 事故: BTC short SL 触发未成交, 现价已越过原 SL, 重挂被 OKX
         51278 拒绝, 每轮重试死循环 12 分钟无保护 → 价格越过触发价时改市价平仓。
 
+        P2增强: 每轮检查持仓与 db 的一致性, 发现"db open 但 OKX 无持仓"的孤儿单。
+
         判定链(全部来自 OKX 实时状态, 不依赖本地推断):
           1. db open trade 且 entry_time 有值(已入场)
           2. OKX 确认该 pair+posSide 真有持仓(pos != 0)
@@ -1194,6 +1223,22 @@ class Reconciler:
         if not entered:
             return
 
+        # P2增强: 按 pair 查询实际持仓,检测 db open 但 OKX 无持仓的孤儿单
+        pairs_to_check = {t.get("pair") for t in entered if t.get("pair")}
+        okx_positions: dict[tuple[str, str], float] = {}  # (pair, side) -> pos
+        for pair in pairs_to_check:
+            try:
+                pos_rows = self.okx.get_positions(instId=pair)
+                for p in pos_rows:
+                    side = str(p.get("posSide") or "").lower()
+                    pos_val = float(p.get("pos") or 0)
+                    if side in ("long", "short"):
+                        okx_positions[(pair, side)] = pos_val
+            except Exception as e:
+                self._mark_if_net_error(e)
+                if self.logger:
+                    self.logger.warning(f"[reconcile] _sweep_unprotected get_positions({pair}) failed: {e}")
+
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         for t in entered:
             tid = t.get("id")
@@ -1202,6 +1247,23 @@ class Reconciler:
             algo_id = str(t.get("okx_order_id") or "")
             if not pair or not algo_id or side not in ("long", "short"):
                 continue
+
+            # P2增强: 持仓校验 - db open 但 OKX 无持仓 → 孤儿单,触发 mini_heal
+            okx_pos = okx_positions.get((pair, side), 0)
+            if okx_pos == 0:
+                if self.logger:
+                    self.logger.error(
+                        f"[reconcile] [orphan-position] trade#{tid} {pair} {side} "
+                        f"db 显示 open 但 OKX 无持仓 → 触发 mini_heal 补齐历史数据"
+                    )
+                try:
+                    from tools.daily_db_heal import mini_heal
+                    mini_heal(self.account_name, self.logger)
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"[reconcile] mini_heal 失败: {e}")
+                continue  # 本轮跳过,等 mini_heal 同步后下轮处理
+
             if now_ms - self._rearm_at.get(tid, 0) < self._rearm_cooldown_ms:
                 continue
             try:

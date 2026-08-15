@@ -55,6 +55,21 @@ _INDEX_TRADES_ACC_ALGO_UNIQUE = (
     "ON trades(account, okx_order_id) WHERE okx_order_id IS NOT NULL;"
 )
 
+_SCHEMA_DRIFT_ALERTS = """
+CREATE TABLE IF NOT EXISTS drift_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    alert_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by TEXT
+);
+"""
+_INDEX_DRIFT_ALERTS_ACCOUNT = "CREATE INDEX IF NOT EXISTS idx_drift_alerts_account ON drift_alerts(account);"
+_INDEX_DRIFT_ALERTS_CREATED = "CREATE INDEX IF NOT EXISTS idx_drift_alerts_created ON drift_alerts(created_at);"
+
 
 class DB:
     def __init__(self, db_path: str | Path, busy_timeout: int = 30):
@@ -134,6 +149,11 @@ class DB:
                 # 不阻塞启动: 无索引时 insert_trade 退化为无幂等保护(与旧版一致),
                 # 清理重复后下次启动自动建上。清理: scripts/fix_orphan_trades.py 或手工去重。
                 pass
+
+            # P2: drift_alerts 表初始化
+            c.execute(_SCHEMA_DRIFT_ALERTS)
+            c.execute(_INDEX_DRIFT_ALERTS_ACCOUNT)
+            c.execute(_INDEX_DRIFT_ALERTS_CREATED)
 
     def insert_trade(
         self,

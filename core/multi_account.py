@@ -299,10 +299,29 @@ def build_runtime(cfg: AccountConfig, db: DB, base_logger) -> AccountRuntime:
         account_name=cfg.name,
         advanced=cfg.advanced_config,
     )
-    return AccountRuntime(
+
+    # P3优化: 初始化 Notifier（如果配置了 webhook）
+    notifier = None
+    try:
+        webhook_cfg = cfg.system_config.get('webhook', {})
+        if webhook_cfg.get('enabled') and webhook_cfg.get('url'):
+            from core.notifier import Notifier
+            notifier = Notifier(
+                webhook_url=webhook_cfg['url'],
+                channel=webhook_cfg.get('channel', 'generic'),
+                timeout=webhook_cfg.get('timeout', 5)
+            )
+            logger.info("[init] Webhook 通知已启用")
+    except Exception as e:
+        logger.warning(f"[init] Webhook 初始化失败: {e}")
+
+    runtime = AccountRuntime(
         cfg=cfg, okx=okx, db=db, account=account, strategy=strategy,
         order_manager=order_mgr, reconciler=reconciler, logger=logger,
     )
+    # 将 notifier 附加到 runtime（供 daily_db_heal 使用）
+    runtime.notifier = notifier
+    return runtime
 
 
 def _synthesize_default_account(top_cfg: dict) -> AccountConfig:

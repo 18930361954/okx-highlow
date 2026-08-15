@@ -30,6 +30,18 @@ system:
   db_path: data/trades.db
   daily_report_time_utc: "23:55"
 
+  # P3优化: Webhook 通知配置 (可选)
+  # 支持的渠道: dingtalk / feishu / slack / wecom / generic
+  # 留空则不发送通知
+  webhook:
+    enabled: false                    # 是否启用 Webhook 通知
+    url: ""                           # Webhook 地址 (钉钉/飞书/Slack/企业微信的 Webhook URL)
+    channel: "dingtalk"               # 通知渠道类型
+    timeout: 5                        # 请求超时时间（秒）
+    alert_threshold:                  # 告警阈值配置
+      balance_drift: 10.0             # 余额偏差告警阈值（USDT）
+      position_count_diff: 1          # 持仓数量偏差告警阈值
+
 account:
   env: demo
   td_mode: cross   # cross 全仓 / isolated 逐仓。建议 cross 避免 set_leverage 被旧 TP/SL 单卡住

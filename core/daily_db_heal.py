@@ -42,6 +42,17 @@ def daily_db_heal(runtime):
     logger.info("[daily-heal] 3/3 余额校验...")
     stats["balance_diff"] = _validate_balance(runtime)
 
+    # === 第四步：持仓快照备份（P3优化）===
+    logger.info("[daily-heal] 4/4 持仓快照备份...")
+    snapshot_path = None
+    try:
+        from core.position_snapshot import create_snapshot
+        snapshot_path = create_snapshot(runtime, snapshot_type="scheduled")
+        if snapshot_path:
+            logger.info(f"[daily-heal] 持仓快照已保存: {snapshot_path}")
+    except Exception as e:
+        logger.debug(f"[daily-heal] 持仓快照保存失败: {e}")
+
     # === 总结 ===
     logger.info(
         f"[daily-heal] ========== 每日 DB 自愈完成 =========="
@@ -52,6 +63,7 @@ def daily_db_heal(runtime):
         f"余额差: {stats['balance_diff']:.2f} USDT"
     )
 
+    stats['snapshot_path'] = snapshot_path
     return stats
 
 
@@ -141,16 +153,20 @@ def _mark_orphan_trades(runtime) -> int:
     return orphan_count
 
 
-def _recover_missing_trades(runtime, days=30) -> int:
+def _recover_missing_trades(runtime, days=30, rate_limit_delay=0.5) -> int:
     """从 OKX 历史持仓回填 db 缺失的交易
+
+    P3优化: 添加限速控制，避免触发 OKX API 限流
 
     Args:
         runtime: AccountRuntime 实例
         days: 回溯天数
+        rate_limit_delay: 每次 API 调用后的延迟（秒）
 
     Returns:
         回填的记录数量
     """
+    import time
     logger = runtime.logger
     since = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
 
@@ -158,6 +174,9 @@ def _recover_missing_trades(runtime, days=30) -> int:
 
     for pair in runtime.cfg.pairs:
         try:
+            # P3优化: API 调用前限速
+            time.sleep(rate_limit_delay)
+
             resp = runtime.okx._request('GET', '/api/v5/account/positions-history', params={
                 'instType': 'SWAP',
                 'instId': pair,
@@ -239,10 +258,37 @@ def _validate_balance(runtime) -> float:
             f"[daily-heal] 余额对比: db={db_balance:.2f} okx={okx_balance:.2f} 差={diff:.2f}"
         )
 
+        # P2优化: 数据漂移告警 - 余额偏差超过阈值时记录告警
         if abs(diff) > 10:
-            logger.warning(
-                f"[daily-heal] ⚠️ 余额偏差超过 10 USDT，可能有未记录交易！"
+            logger.error(
+                f"[daily-heal] ⚠️ 数据漂移告警: 余额偏差超过 10 USDT！"
+                f"db={db_balance:.2f} okx={okx_balance:.2f} 差={diff:+.2f}"
             )
+            # 记录告警到数据库
+            try:
+                from datetime import datetime
+                with runtime.db._conn() as c:
+                    c.execute("""
+                        INSERT INTO drift_alerts (account, alert_type, severity, message, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        runtime.name,
+                        'BALANCE_DRIFT',
+                        'HIGH' if abs(diff) > 50 else 'MEDIUM',
+                        f"余额偏差 {diff:+.2f} USDT (db={db_balance:.2f} okx={okx_balance:.2f})",
+                        datetime.now().isoformat()
+                    ))
+            except Exception as e:
+                logger.warning(f"[daily-heal] 记录漂移告警失败: {e}")
+
+            # P3优化: Webhook 通知
+            try:
+                from core.notifier import send_balance_sync_alert
+                notifier = getattr(runtime, 'notifier', None)
+                if notifier:
+                    send_balance_sync_alert(notifier, runtime.name, db_balance, okx_balance, diff)
+            except Exception as e:
+                logger.debug(f"[daily-heal] Webhook 通知失败: {e}")
 
         # 同步到 OKX 余额
         runtime.account.set_balance(okx_balance)
