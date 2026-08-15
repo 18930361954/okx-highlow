@@ -76,11 +76,13 @@ def _mark_orphan_trades(runtime) -> int:
     logger = runtime.logger
 
     # 查询 db 所有 open trades
-    open_trades = runtime.db.execute("""
-        SELECT id, pair, okx_order_id, signal_date
-        FROM trades
-        WHERE account=? AND exit_price IS NULL AND okx_order_id IS NOT NULL
-    """, (runtime.name,)).fetchall()
+    with runtime.db._conn() as conn:
+        rows = conn.execute("""
+            SELECT id, pair, okx_order_id, signal_date
+            FROM trades
+            WHERE account=? AND exit_price IS NULL AND okx_order_id IS NOT NULL
+        """, (runtime.name,)).fetchall()
+    open_trades = list(rows)
 
     if not open_trades:
         logger.info("[daily-heal] 无未平仓记录")
@@ -112,12 +114,13 @@ def _mark_orphan_trades(runtime) -> int:
                             f"[daily-heal] trade#{trade_id} {pair} {sig_date} "
                             f"OKX 已撤但 db 未标记，修复为 CANCELLED"
                         )
-                        runtime.db.execute("""
-                            UPDATE trades
-                            SET exit_price=0, exit_reason='CANCELLED',
-                                exit_time=datetime('now'), pnl=0
-                            WHERE id=?
-                        """, (trade_id,))
+                        with runtime.db._conn() as conn:
+                            conn.execute("""
+                                UPDATE trades
+                                SET exit_price=0, exit_reason='CANCELLED',
+                                    exit_time=datetime('now'), pnl=0
+                                WHERE id=?
+                            """, (trade_id,))
                         orphan_count += 1
                     elif state == 'effective':
                         # 仍有效但不在 pending 列表，可能是 API 延迟
@@ -127,12 +130,13 @@ def _mark_orphan_trades(runtime) -> int:
                             f"[daily-heal] trade#{trade_id} {pair} {sig_date} "
                             f"state={state}，标记为 ORPHAN"
                         )
-                        runtime.db.execute("""
-                            UPDATE trades
-                            SET exit_price=0, exit_reason='ORPHAN',
-                                exit_time=datetime('now'), pnl=0
-                            WHERE id=?
-                        """, (trade_id,))
+                        with runtime.db._conn() as conn:
+                            conn.execute("""
+                                UPDATE trades
+                                SET exit_price=0, exit_reason='ORPHAN',
+                                    exit_time=datetime('now'), pnl=0
+                                WHERE id=?
+                            """, (trade_id,))
                         orphan_count += 1
                 else:
                     # OKX 查不到订单（可能已删除）
@@ -140,12 +144,13 @@ def _mark_orphan_trades(runtime) -> int:
                         f"[daily-heal] trade#{trade_id} {pair} {sig_date} "
                         f"OKX 查不到订单，标记为 ORPHAN"
                     )
-                    runtime.db.execute("""
-                        UPDATE trades
-                        SET exit_price=0, exit_reason='ORPHAN',
-                            exit_time=datetime('now'), pnl=0
-                        WHERE id=?
-                    """, (trade_id,))
+                    with runtime.db._conn() as conn:
+                        conn.execute("""
+                            UPDATE trades
+                            SET exit_price=0, exit_reason='ORPHAN',
+                                exit_time=datetime('now'), pnl=0
+                            WHERE id=?
+                        """, (trade_id,))
                     orphan_count += 1
             except Exception as e:
                 logger.warning(f"[daily-heal] 查询 trade#{trade_id} 失败: {e}")
@@ -195,12 +200,13 @@ def _recover_missing_trades(runtime, days=30, rate_limit_delay=0.5) -> int:
                 close_time = datetime.fromtimestamp(close_ts/1000, tz=UTC).isoformat()
 
                 # 检查 db 是否有该持仓（宽松匹配：入场时间±5分钟）
-                existing = runtime.db.execute("""
-                    SELECT id FROM trades
-                    WHERE account=? AND pair=?
-                      AND abs(julianday(entry_time) - julianday(?)) < 0.0035
-                    LIMIT 1
-                """, (runtime.name, pair, open_time)).fetchone()
+                with runtime.db._conn() as conn:
+                    existing = conn.execute("""
+                        SELECT id FROM trades
+                        WHERE account=? AND pair=?
+                          AND abs(julianday(entry_time) - julianday(?)) < 0.0035
+                        LIMIT 1
+                    """, (runtime.name, pair, open_time)).fetchone()
 
                 if existing:
                     continue  # 已存在
@@ -211,27 +217,28 @@ def _recover_missing_trades(runtime, days=30, rate_limit_delay=0.5) -> int:
                     f"开仓={open_time[:16]} 平仓={close_time[:16]} pnl={pos.get('realizedPnl')}"
                 )
 
-                runtime.db.execute("""
-                    INSERT INTO trades (
-                        account, pair, side, signal_date, signal_bar,
-                        entry_price, exit_price, exit_reason,
-                        entry_time, exit_time,
-                        pnl, pnl_gross, fee, funding,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                """, (
-                    runtime.name, pair,
-                    'long' if pos['posSide'] == 'long' else 'short',
-                    'RECOVERED', 'UNKNOWN',
-                    float(pos.get('openAvgPx', 0)),
-                    float(pos.get('closeAvgPx', 0)),
-                    'RECOVERED',
-                    open_time, close_time,
-                    float(pos.get('realizedPnl', 0)),
-                    float(pos.get('pnl', 0)),
-                    abs(float(pos.get('fee', 0))),
-                    float(pos.get('fundingFee', 0))
-                ))
+                with runtime.db._conn() as conn:
+                    conn.execute("""
+                        INSERT INTO trades (
+                            account, pair, side, signal_date, signal_bar,
+                            entry_price, exit_price, exit_reason,
+                            entry_time, exit_time,
+                            pnl, pnl_gross, fee, funding,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    """, (
+                        runtime.name, pair,
+                        'long' if pos['posSide'] == 'long' else 'short',
+                        'RECOVERED', 'UNKNOWN',
+                        float(pos.get('openAvgPx', 0)),
+                        float(pos.get('closeAvgPx', 0)),
+                        'RECOVERED',
+                        open_time, close_time,
+                        float(pos.get('realizedPnl', 0)),
+                        float(pos.get('pnl', 0)),
+                        abs(float(pos.get('fee', 0))),
+                        float(pos.get('fundingFee', 0))
+                    ))
 
                 recovered_count += 1
 
