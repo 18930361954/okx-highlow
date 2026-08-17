@@ -77,6 +77,7 @@ accounts:
     group: 实盘
     enabled: true                     # ← 2026-08-17 实盘启动
     strategy_name: v3-mixed
+    strategy_start_date: "2026-08-17T00:00:00" # 实盘启动时间
     api_key: 241aad7c-62b4-4db5-a987-94b28112d550
     secret_key: A06DDE1F4CB061A4E1D63F7F29552548
     passphrase: Zdx19971226@@
@@ -97,6 +98,7 @@ accounts:
     group: 实盘
     enabled: true                     # ← 2026-08-17 实盘启动
     strategy_name: v3-mixed
+    strategy_start_date: "2026-08-17T00:00:00" # 实盘启动时间
     api_key: 2d212eea-0561-4244-9c3c-acd9d1aa306d
     secret_key: F3A978524CAD601A4540E4639887CB48
     passphrase: Zdx19971226@@
@@ -115,6 +117,7 @@ accounts:
     group: 实盘
     enabled: true                     # ← 2026-08-17 实盘启动
     strategy_name: v3-mixed
+    strategy_start_date: "2026-08-17T00:00:00" # 实盘启动时间
     api_key: e5917d75-6982-4648-96c0-82b85c256c63
     secret_key: 40BDEFE4A5AB98BB1759CCE969F50711
     passphrase: Zdx19971226@@
