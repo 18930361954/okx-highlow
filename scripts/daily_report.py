@@ -113,8 +113,8 @@ def generate_report(db, account, config, target_date: str | None = None,
     total_pnl = sum((t.get("pnl_gross") or ((t.get("pnl") or 0) + (t.get("fee") or 0) - (t.get("funding") or 0)))
                     for t in filled)
 
-    # 累计资金费: 全历史真实成交(TP/SL/EXIT)的 funding 汇总(带符号, 正=收/负=付)
-    _valid = {"TP", "SL", "EXIT"}
+    # 累计资金费: 全历史真实成交(TP/SL/EXIT/TIME)的 funding 汇总(带符号, 正=收/负=付)
+    _valid = {"TP", "SL", "EXIT", "TIME"}  # TIME=超时强平(v1.1.0), 是真实平仓必须计入
     lifetime_funding = sum(
         (t.get("funding") or 0) for t in all_trades
         if str(t.get("exit_reason") or "").upper() in _valid
@@ -308,8 +308,8 @@ def _summarize_account(db, rt_like, today: str) -> dict:
     wins = sum(1 for t in today_filled if (t.get("pnl") or 0) > 0)
     losses = sum(1 for t in today_filled if (t.get("pnl") or 0) < 0)
 
-    # 累计资金费: 全历史真实成交(TP/SL/EXIT)的 funding 汇总(带符号)
-    _valid = {"TP", "SL", "EXIT"}
+    # 累计资金费: 全历史真实成交(TP/SL/EXIT/TIME)的 funding 汇总(带符号)
+    _valid = {"TP", "SL", "EXIT", "TIME"}  # TIME=超时强平(v1.1.0), 是真实平仓必须计入
     lifetime_funding = sum(
         (t.get("funding") or 0) for t in all_trades
         if str(t.get("exit_reason") or "").upper() in _valid

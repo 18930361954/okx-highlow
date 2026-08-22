@@ -10,6 +10,11 @@ KEY_BALANCE = "current_balance"
 KEY_LOSSES = "consecutive_losses"
 KEY_COOLDOWN_UNTIL = "cooldown_until"
 KEY_FIXED_LOCKED = "fixed_mode_locked"
+# 起始本金(首次启动时落一次, 之后只由充提调整)。收益率与回撤的分母来源。
+# 不记的话只能用"当前余额 - 累计盈亏"倒推, 中途充值会让分母虚高、回撤被严重低估。
+KEY_BASELINE = "baseline_capital"
+# 历史峰值权益。回撤 = (峰值 - 当前) / 峰值。持久化才能跨重启保留。
+KEY_PEAK_EQUITY = "peak_equity"
 
 
 class AccountState:
@@ -73,6 +78,48 @@ class AccountState:
                 self.logger.info(
                     f"[切档] balance={balance:.2f} >= {self.fixed_threshold} → FIXED 永久锁定"
                 )
+
+    # ---------- 起始本金 / 峰值权益 (收益率与回撤的分母) ----------
+
+    def get_baseline(self) -> float:
+        """起始本金。0 = 还没落过(首次启动前)。"""
+        return self._get_float(KEY_BASELINE, 0.0)
+
+    def init_baseline(self, balance: float) -> bool:
+        """首次落起始本金。已有值就不动 —— 否则每次重启都会把当前余额
+        当成本金, 收益率永远显示 0%。返回是否真的写入。"""
+        if self.get_baseline() > 0 or balance <= 0:
+            return False
+        self.db.set_state(KEY_BASELINE, f"{balance:.6f}", account=self.account)
+        if self.logger:
+            self.logger.info(f"[baseline] 起始本金记为 {balance:.2f} USDT")
+        return True
+
+    def adjust_baseline(self, delta: float, reason: str = "") -> None:
+        """充值/提现时同步调整起始本金。
+        不调的话: 充 500 会被算成"赚了 500", 收益率虚高。"""
+        base = self.get_baseline()
+        if base <= 0:
+            return
+        new = max(0.0, base + delta)
+        self.db.set_state(KEY_BASELINE, f"{new:.6f}", account=self.account)
+        if self.logger:
+            self.logger.info(
+                f"[baseline] 起始本金 {base:.2f} → {new:.2f} "
+                f"({delta:+.2f}{' ' + reason if reason else ''})"
+            )
+
+    def get_peak_equity(self) -> float:
+        return self._get_float(KEY_PEAK_EQUITY, 0.0)
+
+    def update_peak_equity(self, equity: float) -> float:
+        """权益创新高则更新峰值。返回当前峰值。"""
+        peak = self.get_peak_equity()
+        if equity > peak:
+            self.db.set_state(KEY_PEAK_EQUITY, f"{equity:.6f}",
+                              account=self.account)
+            return equity
+        return peak
 
     def get_consecutive_losses(self) -> int:
         return self._get_int(KEY_LOSSES, 0)

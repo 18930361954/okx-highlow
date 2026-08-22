@@ -163,28 +163,36 @@ class App:
             self.mon_paned.add(frame, weight=weight)
             return st
 
+        # 收益率列: 本金=起始本金, 总收益率=累计净盈亏/本金, 今日%=今日净/本金,
+        # 均笔%=总收益率/笔数, 回撤%=从峰值权益跌下来多少(含持仓浮亏)
         self.tree_acc = add_pane(
             "账户概览 (按组折叠; 组行 = 组合计, 底部 env 合计)",
-            ("环境", "周期", "余额", "熔断", "挂单", "持仓", "今日净", "撤/过",
-             "总笔", "胜率", "净PnL", "手续费累", "资金费累", "盈亏比", "回撤%"),
+            ("环境", "周期", "本金", "余额", "权益", "总收益率", "今日%",
+             "熔断", "挂单", "持仓", "今日净", "撤/过",
+             "总笔", "胜率", "净PnL", "均笔%", "手续费累", "资金费累",
+             "盈亏比", "回撤%"),
             tree_column=True, weight=2)
         self.tree_acc.tree.heading("#0", text="组 / 账户")
 
+        # 持仓表: 回报率 = 未实现盈亏 / 该仓占用保证金 (这一笔自己的收益率)
         self.tree_pos = add_pane("当前持仓", (
-            "组", "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"))
+            "组", "账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL",
+            "未实现盈亏", "回报率", "占本金%"))
         self.tree_pos.tag_configure("unprotected", background="#ffd6d6")
 
         self.tree_pend = add_pane("待触发挂单", (
             "组", "账户", "品种", "周期", "方向", "触发价", "TP", "SL", "AlgoID"))
 
+        # 最近成交: 回报率 = 净盈亏 / 该笔保证金; 占本金% = 净盈亏 / 起始本金
         self.tree_recent = add_pane("最近成交", (
             "时间", "组", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
-            "名义PnL", "手续费", "资金费", "净PnL"), weight=2)
+            "名义PnL", "手续费", "资金费", "净PnL", "回报率", "占本金%"), weight=2)
 
     def _refresh_monitor(self, snap: list[dict]):
         from execution.position_monitor import (_bar_of, _compute_lifetime_stats,
                                                 _exit_reason_zh, _fmt_uptime,
-                                                _pending_tp_sl)
+                                                _pending_tp_sl, _pos_pct_cells,
+                                                _trade_pct_cells)
 
         total_bal = sum(a["balance"] for a in snap)
         total_net = sum(a["today_net"] for a in snap)
@@ -218,11 +226,20 @@ class App:
             tree.clear()
 
         def _acc_values(env, period, balance, in_cd, pendings, positions,
-                        today_net, cancelled, orphan, lt):
-            return (env, period, _fmt(balance), "是" if in_cd else "否",
+                        today_net, cancelled, orphan, lt, equity=0.0):
+            base = lt.get("baseline") or 0.0
+            eq = equity if equity > 0 else balance
+            today_pct = (today_net / base * 100) if base > 0 else 0.0
+            return (env, period,
+                    _fmt(base) if base > 0 else "-",
+                    _fmt(balance), _fmt(eq),
+                    f"{lt.get('return_pct', 0.0):+.2f}%" if base > 0 else "-",
+                    f"{today_pct:+.2f}%" if base > 0 else "-",
+                    "是" if in_cd else "否",
                     pendings, positions, _fmt_signed(today_net),
                     f"{cancelled}/{orphan}", lt["total"], f"{lt['win_rate']:.1f}%",
                     _fmt_signed(lt["net_pnl"]),
+                    f"{lt.get('avg_trade_pct', 0.0):+.3f}%" if lt["total"] else "-",
                     f"{lt.get('sum_fee', 0.0):.4f}", f"{lt.get('sum_funding', 0.0):+.4f}",
                     _pf_str(lt["profit_factor"]), f"{lt['max_dd_pct']:.1f}%")
 
@@ -230,7 +247,10 @@ class App:
             """一组/一个 env 的合计行 — 复用 _compute_lifetime_stats, 与账号行同口径。"""
             merged_trades = [t for a in accts for t in a["valid_trades"]]
             merged_bal = sum(a["balance"] for a in accts)
-            agg = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
+            agg = _compute_lifetime_stats(
+                merged_trades, current_balance=merged_bal,
+                baseline=sum(a.get("baseline") or 0.0 for a in accts),
+                equity=sum(a.get("equity") or 0.0 for a in accts))
             envs = sorted({a["env"] or "" for a in accts})
             kw = {"iid": iid} if iid else {}
             return self.tree_acc.insert(
@@ -241,7 +261,8 @@ class App:
                     sum(len(a["positions"]) for a in accts),
                     sum(a["today_net"] for a in accts),
                     sum(a.get("today_cancelled", 0) for a in accts),
-                    sum(a.get("today_orphan", 0) for a in accts), agg),
+                    sum(a.get("today_orphan", 0) for a in accts), agg,
+                    equity=sum(a.get("equity") or 0.0 for a in accts)),
                 tags=tags, open=True, **kw)
 
         # ---- 按组分块: 组节点行本身就是组合计 (折叠后仍看得到) ----
@@ -261,7 +282,8 @@ class App:
                     values=_acc_values(
                         a["env"], a["signal_bar"], a["balance"], a["in_cd"],
                         len(a["pendings"]), len(a["positions"]), a["today_net"],
-                        a.get("today_cancelled", 0), a.get("today_orphan", 0), lt),
+                        a.get("today_cancelled", 0), a.get("today_orphan", 0), lt,
+                        equity=a.get("equity") or 0.0),
                     tags=_pnl_tag(lt["net_pnl"]))
 
         # ---- env 合计留在最底部 (实盘/模拟盘口径不能混) ----
@@ -285,10 +307,13 @@ class App:
                         break
                 unprotected = not tp and not sl
                 tags = ("unprotected",) if unprotected else _pnl_tag(p.get("upl"))
+                # 回报率 = 浮动盈亏 / 该仓占用保证金(OKX imr); 占本金% = 浮动盈亏 / 起始本金
+                roi_cell, base_cell = _pos_pct_cells(p, a.get("baseline") or 0.0)
                 self.tree_pos.insert("", "end", values=(
                     g, a["name"], p.get("instId", ""), _dir_plain(p.get("posSide", "")),
                     p.get("pos", ""), p.get("avgPx", ""), p.get("last", ""),
-                    tp or "无!", sl or "无!", _fmt_signed(p.get("upl"))),
+                    tp or "无!", sl or "无!", _fmt_signed(p.get("upl")),
+                    roi_cell, base_cell),
                     tags=tags)
 
             for o in a["pendings"]:
@@ -304,19 +329,22 @@ class App:
         for a in snap:
             for r in a["valid_trades"]:
                 recent.append((_group_label(a.get("group") or ""), a["name"], r,
-                               a.get("pair_bars") or {}))
+                               a.get("pair_bars") or {}, a.get("baseline") or 0.0))
         recent.sort(key=lambda x: x[2].get("exit_time") or "", reverse=True)
-        for g, name, r, pbars in recent[:50]:
+        for g, name, r, pbars, base in recent[:50]:
             net = r.get("pnl") or 0
             fee = r.get("fee") or 0
             funding = r.get("funding") or 0
             gross = r.get("pnl_gross") or (net + fee - funding)
+            # 回报率 = 净盈亏 / 该笔保证金; 占本金% = 净盈亏 / 起始本金
+            roi_cell, base_cell = _trade_pct_cells(r, base)
             self.tree_recent.insert("", "end", values=(
                 (r.get("exit_time") or "")[:19], g, name, r.get("pair", ""),
                 _bar_of(r, pbars), _dir_plain(r.get("side", "")),
                 _fmt(r.get("entry_price")), _fmt(r.get("exit_price")),
                 _exit_reason_zh(r.get("exit_reason", "")), _fmt_signed(gross),
-                f"{fee:.4f}", f"{funding:+.4f}", _fmt_signed(net)),
+                f"{fee:.4f}", f"{funding:+.4f}", _fmt_signed(net),
+                roi_cell, base_cell),
                 tags=_pnl_tag(net))
 
         for tree in (self.tree_acc, self.tree_pos, self.tree_pend, self.tree_recent):

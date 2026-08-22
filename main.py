@@ -77,10 +77,18 @@ def _sync_balance_before_place(rt: AccountRuntime, held_pairs: set[str] | None) 
     local = rt.account.get_balance()
     if abs(okx_bal - local) < 0.01:
         return
+    # 无持仓时余额差额只能来自充提(盈亏已在平仓时结算过) → 同步调整起始本金,
+    # 否则充值 500 会被算成"赚了 500", 收益率虚高、回撤被稀释。
+    diff = okx_bal - local
+    if not held_pairs and abs(diff) >= 0.01:
+        try:
+            rt.account.adjust_baseline(diff, reason="充提同步")
+        except Exception as e:
+            logger.warning(f"[baseline] 充提调整失败: {e}")
     rt.account.set_balance(okx_bal)
     logger.info(
         f"[balance-sync] 挂单前本地 {local:.2f} → OKX {okx_bal:.2f} USDT "
-        f"(差 {okx_bal - local:+.2f}, 含充值/提现等外部变动)"
+        f"(差 {diff:+.2f}, 含充值/提现等外部变动)"
     )
 
 
@@ -304,6 +312,14 @@ def init_balance_if_needed(rt: AccountRuntime) -> None:
             rt.logger.info(f"[init] balance bootstrapped from OKX: {bal:.2f} USDT")
         except Exception as e:
             rt.logger.error(f"[init] cannot fetch balance: {e}")
+    # 起始本金只落一次(已有值不动), 作为收益率与回撤的分母
+    try:
+        bal = rt.account.get_balance()
+        if bal > 0:
+            rt.account.init_baseline(bal)
+            rt.account.update_peak_equity(bal)
+    except Exception as e:
+        rt.logger.warning(f"[baseline] 初始化失败: {e}")
 
 
 def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> dict:

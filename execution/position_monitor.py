@@ -12,7 +12,9 @@ from rich.table import Table
 _LIFETIME_CACHE_TTL_MS = 30_000  # 累计业绩 30s 缓存, 防每 5s render 都全表扫
 
 # 计入"累计业绩"的成交口径 (ORPHAN/CANCELLED 不算真实成交)
-_VALID_EXIT_REASONS = {"TP", "SL", "EXIT"}
+# 真实成交的离场原因。TIME = v1.1.0 起的持仓超时强平, 是真实平仓必须计入统计,
+# 漏了会让超时单在胜率/净盈亏/回撤里全部消失(本期验证的关键观察项)。
+_VALID_EXIT_REASONS = {"TP", "SL", "EXIT", "TIME"}
 
 
 UTC = timezone.utc
@@ -60,6 +62,7 @@ _EXIT_REASON_ZH = {
     "TP": "止盈",
     "SL": "止损",
     "EXIT": "平仓",
+    "TIME": "超时",
     "ORPHAN": "过期",
     "CANCELLED": "撤单",
 }
@@ -91,24 +94,38 @@ def _bar_of(row: dict, pair_bars: dict) -> str:
     return str(pair_bars.get(row.get("pair") or row.get("instId") or "", "") or "-")
 
 
-def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) -> dict:
-    """按传入的 trades 集合聚合业绩指标, 只统计真实成交(TP/SL/EXIT)。
+def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0,
+                            baseline: float = 0.0, equity: float = 0.0) -> dict:
+    """按传入的 trades 集合聚合业绩指标, 只统计真实成交(TP/SL/EXIT/TIME)。
+
+    baseline: 起始本金(收益率与回撤的分母)。0 → 退化为用"当前余额-累计盈亏"倒推。
+    equity:   当前权益(含持仓浮动盈亏)。给了就参与回撤计算 —— 只算已平仓的话,
+              持仓正在浮亏时回撤显示 0%, 是风险盲区。
 
     返回字段:
       raw: total, wins, losses, sum_win, sum_loss_abs, net_pnl, max_win, max_loss,
            sum_fee, sum_funding
-      derived: win_rate, avg_win, avg_loss, profit_factor, max_dd_pct
+      derived: win_rate, avg_win, avg_loss, profit_factor, max_dd_pct,
+               return_pct(累计收益率), avg_trade_pct(每笔均收益率),
+               cur_dd_pct(当前回撤)
     """
     valid = [t for t in trades
              if str(t.get("exit_reason") or "").upper() in _VALID_EXIT_REASONS]
     total = len(valid)
     if total == 0:
+        # 没成交单也可能有持仓浮亏 → 回撤仍要算
+        base0 = baseline if baseline > 0 else current_balance
+        eq0 = equity if equity > 0 else current_balance
+        dd0 = 0.0
+        if base0 > 0 and eq0 > 0 and eq0 < base0:
+            dd0 = (base0 - eq0) / base0 * 100
         return {"total": 0, "wins": 0, "losses": 0,
                 "sum_win": 0.0, "sum_loss_abs": 0.0, "net_pnl": 0.0,
                 "max_win": 0.0, "max_loss": 0.0,
                 "sum_fee": 0.0, "sum_funding": 0.0,
                 "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
-                "profit_factor": 0.0, "max_dd_pct": 0.0}
+                "profit_factor": 0.0, "max_dd_pct": dd0,
+                "return_pct": 0.0, "avg_trade_pct": 0.0, "cur_dd_pct": dd0}
 
     wins = [t for t in valid if (t.get("pnl") or 0) > 0]
     losses = [t for t in valid if (t.get("pnl") or 0) < 0]
@@ -130,29 +147,45 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
     max_win = max((t.get("pnl") or 0) for t in valid)
     max_loss = min((t.get("pnl") or 0) for t in valid)
 
-    # 回撤%: 按 exit_time 排序 cumulative pnl → peak → dd。
-    # 基准权益 = 估算初始余额 + peak 时的累计 pnl。
-    # 初始余额估算: 当前余额 - 全部累计 pnl (无法拿到历史 balance 时的近似)。
-    sorted_by_time = sorted(valid, key=lambda t: t.get("exit_time") or "")
-    cum = 0.0
-    peak = 0.0
-    max_dd_abs = 0.0
-    peak_cum_at_max_dd = 0.0
-    for t in sorted_by_time:
-        cum += t.get("pnl") or 0
-        if cum > peak:
-            peak = cum
-        dd = peak - cum
-        if dd > max_dd_abs:
-            max_dd_abs = dd
-            peak_cum_at_max_dd = peak
-    initial_est = max(0.0, current_balance - cum) if current_balance > 0 else 0.0
-    peak_equity = initial_est + peak_cum_at_max_dd
-    if peak_equity > 0:
-        max_dd_pct = max_dd_abs / peak_equity * 100
+    # ---------- 分母: 起始本金 ----------
+    # 优先用持久化的 baseline(充提时已同步调整)。没有则退化为"当前余额 - 累计盈亏"
+    # 倒推 —— 该近似在中途充提时会失真, 所以 baseline 是首选。
+    if baseline > 0:
+        base = baseline
+    elif current_balance > 0:
+        base = max(0.0, current_balance - net_pnl)
     else:
-        # 无余额上下文: 用 peak cum 自身当分母, 至少能反映相对回撤幅度
-        max_dd_pct = (max_dd_abs / peak_cum_at_max_dd * 100) if peak_cum_at_max_dd > 0 else 0.0
+        base = 0.0
+
+    # ---------- 回撤: 按时间走一遍权益曲线 ----------
+    # 权益 = 起始本金 + 该时点累计已实现盈亏。末尾再用 equity(含浮动盈亏)收一次,
+    # 否则持仓正在浮亏时回撤显示 0%(旧实现的风险盲区)。
+    sorted_by_time = sorted(valid, key=lambda t: t.get("exit_time") or "")
+    cum = sum(t.get("pnl") or 0 for t in sorted_by_time)
+    max_dd_pct = 0.0
+    cur_dd_pct = 0.0
+    if base > 0:
+        # base<=0 说明起始本金与余额都取不到 → 无法算"账户跌了几成"。
+        # 此时绝不能拿累计利润当分母: 峰值利润 50 跌到 20 会显示 60%,
+        # 而账户其实是从 150 涨到 170(赚钱的), 那个数字纯属误导。
+        run = 0.0
+        eq_peak = base
+        for t in sorted_by_time:
+            run += t.get("pnl") or 0
+            eq = base + run
+            eq_peak = max(eq_peak, eq)
+            max_dd_pct = max(max_dd_pct, (eq_peak - eq) / eq_peak * 100)
+        # 当前权益: 传了 equity(含持仓浮动) 用它, 否则用起始本金+已实现盈亏
+        cur_eq = equity if equity > 0 else (base + cum)
+        eq_peak = max(eq_peak, cur_eq)
+        cur_dd_pct = (eq_peak - cur_eq) / eq_peak * 100 if eq_peak > 0 else 0.0
+        max_dd_pct = max(max_dd_pct, cur_dd_pct)
+
+    # ---------- 收益率 ----------
+    # 累计收益率 = 累计净盈亏 / 起始本金。用起始本金而非当前余额做分母 ——
+    # 后者会让同样的盈亏在余额涨跌时显示不同的收益率。
+    return_pct = (net_pnl / base * 100) if base > 0 else 0.0
+    avg_trade_pct = return_pct / total if total else 0.0
 
     return {
         "total": total, "wins": len(wins), "losses": len(losses),
@@ -163,7 +196,69 @@ def _compute_lifetime_stats(trades: list[dict], current_balance: float = 0.0) ->
         "avg_win": avg_win, "avg_loss": avg_loss,
         "profit_factor": profit_factor,
         "max_dd_pct": max_dd_pct,
+        "return_pct": return_pct,
+        "avg_trade_pct": avg_trade_pct,
+        "cur_dd_pct": cur_dd_pct,
+        "baseline": base,
     }
+
+
+def _colorize_pct(s: str) -> str:
+    """给 '+1.23%' / '-4.56%' 这类字符串上色。'-' 原样返回。"""
+    if not s or s == "-":
+        return s or "-"
+    if s.startswith("+"):
+        return f"[green]{s}[/green]"
+    if s.startswith("-"):
+        return f"[red]{s}[/red]"
+    return s
+
+
+def _pos_pct_cells(p: dict, baseline: float = 0.0) -> tuple[str, str]:
+    """持仓行的两个百分比单元格。
+
+    回报率  = 浮动盈亏 / 该仓占用保证金(OKX imr) —— 这一笔自己赚亏了几成本金。
+              OKX 已给 uplRatio, 优先直接用(口径与 OKX 界面一致)。
+    占本金% = 浮动盈亏 / 起始本金 —— 这一笔对整个账户的影响有多大。
+    """
+    try:
+        upl = float(p.get("upl") or 0)
+    except (TypeError, ValueError):
+        return "-", "-"
+
+    roi = "-"
+    try:
+        ratio = p.get("uplRatio")
+        if ratio not in (None, ""):
+            roi = f"{float(ratio) * 100:+.2f}%"
+        else:
+            imr = float(p.get("imr") or 0)
+            if imr > 0:
+                roi = f"{upl / imr * 100:+.2f}%"
+    except (TypeError, ValueError):
+        roi = "-"
+
+    base_cell = f"{upl / baseline * 100:+.2f}%" if baseline > 0 else "-"
+    return roi, base_cell
+
+
+def _trade_pct_cells(r: dict, baseline: float = 0.0) -> tuple[str, str]:
+    """成交行的两个百分比单元格。
+
+    回报率  = 净盈亏 / 该笔保证金 —— 这一笔赚亏了几成本金。
+    占本金% = 净盈亏 / 起始本金 —— 这一笔对整个账户的影响。
+    """
+    try:
+        net = float(r.get("pnl") or 0)
+    except (TypeError, ValueError):
+        return "-", "-"
+    try:
+        margin = float(r.get("margin") or 0)
+    except (TypeError, ValueError):
+        margin = 0.0
+    roi = f"{net / margin * 100:+.2f}%" if margin > 0 else "-"
+    base_cell = f"{net / baseline * 100:+.2f}%" if baseline > 0 else "-"
+    return roi, base_cell
 
 
 def _pending_tp_sl(o: dict) -> tuple[str, str]:
@@ -344,9 +439,24 @@ class PositionMonitor:
                 today_filled, today_pnl, today_fee, today_funding, today_net = [], 0.0, 0.0, 0.0, 0.0
                 today_orphan, today_cancelled = 0, 0
 
+            # 起始本金(收益率与回撤的分母) + 当前权益(含持仓浮动盈亏)
+            try:
+                baseline = rt.account.get_baseline()
+            except Exception:
+                baseline = 0.0
+            upl_sum = 0.0
+            for _p in positions:
+                try:
+                    upl_sum += float(_p.get("upl") or 0)
+                except (TypeError, ValueError):
+                    pass
+            equity = bal + upl_sum
+
             # 累计业绩 (30s 缓存)
             valid_trades = self._valid_trades_for(rt)
-            lifetime = _compute_lifetime_stats(valid_trades, current_balance=bal)
+            lifetime = _compute_lifetime_stats(
+                valid_trades, current_balance=bal,
+                baseline=baseline, equity=equity)
 
             results.append({
                 "rt": rt,
@@ -362,6 +472,9 @@ class PositionMonitor:
                 "pendings": pendings,
                 "protect_algos": protect_algos,
                 "positions": positions,
+                "baseline": baseline,
+                "equity": equity,
+                "upl_sum": upl_sum,
                 "today_filled": today_filled,
                 "today_pnl": today_pnl,
                 "today_fee": today_fee,
@@ -420,14 +533,36 @@ class PositionMonitor:
             f"[bold]资金费(今/累)[/bold] {total_today_funding:+.4f}/{total_lifetime_funding:+.4f}   "
             f"[bold]净盈亏[/bold] {_fmt2(total_today_net)}"
         )
+        # 全账户合计收益率行: 本金/权益/总收益率/今日%/回撤
+        total_base = sum(a.get("baseline") or 0.0 for a in snap)
+        total_eq = sum(a.get("equity") or 0.0 for a in snap)
+        total_upl = sum(a.get("upl_sum") or 0.0 for a in snap)
+        total_life_net = sum(a["lifetime"].get("net_pnl", 0.0) for a in snap)
+        if total_base > 0:
+            ret_all = total_life_net / total_base * 100
+            today_all = total_today_net / total_base * 100
+            dd_all = max((a["lifetime"].get("cur_dd_pct", 0.0) for a in snap),
+                         default=0.0)
+            header.add_row(
+                f"[bold]总本金[/bold] {total_base:,.2f}   "
+                f"[bold]总权益[/bold] {total_eq:,.2f}   "
+                f"[bold]浮动盈亏[/bold] {_fmt2(total_upl)}   "
+                f"[bold]总收益率[/bold] {_colorize_pct(f'{ret_all:+.2f}%')}   "
+                f"[bold]今日收益率[/bold] {_colorize_pct(f'{today_all:+.2f}%')}   "
+                f"[bold]当前回撤[/bold] {dd_all:.1f}%"
+            )
 
         # === 账户概览 (当前状态 + 全历史业绩合并成一张) ===
         # 列少了些冷字段: 连亏/今日笔/名义PnL/手续费/资金费/盈单/亏单/平均盈亏/最大盈亏。
         # 详细看每日报告 (docs/daily_reports/report_YYYY-MM-DD.md)。
         acc_tbl = Table(title="账户概览 (当前 + 全历史)", show_header=True,
                         header_style="bold cyan", expand=True)
-        for c in ("账户", "环境", "周期", "余额", "熔断", "pending", "持仓",
-                  "今日净", "撤/过", "总笔", "胜率", "净PnL", "盈亏比", "回撤%"):
+        # 收益率列: 本金=起始本金, 权益=余额+持仓浮动, 总收益率=累计净盈亏/本金,
+        # 今日%=今日净/本金, 均笔%=总收益率/笔数, 回撤%=从峰值权益跌下来多少
+        for c in ("账户", "环境", "周期", "本金", "余额", "权益", "总收益率",
+                  "今日%", "熔断", "pending", "持仓",
+                  "今日净", "撤/过", "总笔", "胜率", "净PnL", "均笔%",
+                  "盈亏比", "回撤%"):
             acc_tbl.add_column(c, no_wrap=True)
 
         def _pf_str(pf: float) -> str:
@@ -440,23 +575,47 @@ class PositionMonitor:
             s = _fmt2(v)
             return f"[{style}]{s}[/{style}]" if style else s
 
+        def _pct_cell(v: float, digits: int = 2) -> str:
+            style = "green" if v > 0 else ("red" if v < 0 else "")
+            s = f"{v:+.{digits}f}%"
+            return f"[{style}]{s}[/{style}]" if style else s
+
+        def _dd_cell(v: float) -> str:
+            """回撤越深越红: >=40% 红, >=20% 黄。对齐日报的减仓/停手阈值。"""
+            s = f"{v:.1f}%"
+            if v >= 40:
+                return f"[red]{s}[/red]"
+            if v >= 20:
+                return f"[yellow]{s}[/yellow]"
+            return s
+
         def _add_acc_row(name: str, env: str, period: str, balance: float,
                          in_cd: bool, pendings: int, positions: int,
                          today_net: float, cancelled: int, orphan: int,
-                         lifetime: dict, bold: bool = False) -> None:
+                         lifetime: dict, bold: bool = False,
+                         equity: float = 0.0) -> None:
             cd = "[red]是[/red]" if in_cd else "[green]否[/green]"
             name_cell = f"[bold]{name}[/bold]" if bold else name
+            base = lifetime.get("baseline") or 0.0
+            eq = equity if equity > 0 else balance
+            today_pct = (today_net / base * 100) if base > 0 else 0.0
             acc_tbl.add_row(
                 name_cell, env, period,
-                f"{balance:,.2f}", cd,
+                f"{base:,.2f}" if base > 0 else "-",
+                f"{balance:,.2f}", f"{eq:,.2f}",
+                _pct_cell(lifetime.get("return_pct", 0.0)) if base > 0 else "-",
+                _pct_cell(today_pct) if base > 0 else "-",
+                cd,
                 str(pendings), str(positions),
                 _pnl_cell(today_net),
                 f"{cancelled}/{orphan}",
                 str(lifetime["total"]),
                 f"{lifetime['win_rate']:.1f}%",
                 _pnl_cell(lifetime["net_pnl"]),
+                _pct_cell(lifetime.get("avg_trade_pct", 0.0), 3)
+                if lifetime["total"] else "-",
                 _pf_str(lifetime["profit_factor"]),
-                f"{lifetime['max_dd_pct']:.1f}%",
+                _dd_cell(lifetime["max_dd_pct"]),
             )
 
         # 按 env 分组: real 在前, demo 在后
@@ -475,13 +634,17 @@ class PositionMonitor:
                     a["in_cd"], len(a["pendings"]), len(a["positions"]),
                     a["today_net"], a.get("today_cancelled", 0),
                     a.get("today_orphan", 0), a["lifetime"],
+                    equity=a.get("equity") or 0.0,
                 )
             # env 合计: 合并 valid_trades 重算 lifetime
             merged_trades = []
             for a in accts:
                 merged_trades.extend(a["valid_trades"])
             merged_bal = sum(a["balance"] for a in accts)
-            agg_life = _compute_lifetime_stats(merged_trades, current_balance=merged_bal)
+            agg_life = _compute_lifetime_stats(
+                merged_trades, current_balance=merged_bal,
+                baseline=sum(a.get("baseline") or 0.0 for a in accts),
+                equity=sum(a.get("equity") or 0.0 for a in accts))
             merged_pending = sum(len(a["pendings"]) for a in accts)
             merged_pos = sum(len(a["positions"]) for a in accts)
             merged_today_net = sum(a["today_net"] for a in accts)
@@ -492,10 +655,11 @@ class PositionMonitor:
                 False, merged_pending, merged_pos,
                 merged_today_net, merged_cancelled, merged_orphan,
                 agg_life, bold=True,
+                equity=sum(a.get("equity") or 0.0 for a in accts),
             )
 
         if not snap:
-            acc_tbl.add_row("(无账户)", "", "", "", "", "", "", "", "", "", "", "", "", "")
+            acc_tbl.add_row("(无账户)", *([""] * 18))
 
         # === 挂单表 (全账户合并,带账户名列) ===
         pending_tbl = Table(title="待触发挂单 (全账户)", show_header=True,
@@ -520,7 +684,9 @@ class PositionMonitor:
         # === 当前持仓表 ===
         pos_tbl = Table(title="当前持仓 (全账户)", show_header=True,
                          header_style="magenta", expand=True)
-        for c in ("账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL", "未实现盈亏"):
+        # 回报率 = 浮动盈亏/该仓保证金; 占本金% = 浮动盈亏/起始本金
+        for c in ("账户", "品种", "方向", "张数", "均价", "现价", "TP", "SL",
+                  "未实现盈亏", "回报率", "占本金%"):
             pos_tbl.add_column(c, no_wrap=True)
         any_pos = False
         for a in snap:
@@ -544,31 +710,35 @@ class PositionMonitor:
                 # 无保护单 = 裸奔, 红色警示 (2026-07-30 OCO 触发未成交事故可视化)
                 if not tp and not sl:
                     tp = sl = "[red]无![/red]"
+                roi_s, base_s = _pos_pct_cells(p, a.get("baseline") or 0.0)
                 pos_tbl.add_row(
                     a["name"], str(p.get("instId", "")), _dir_zh(p.get("posSide", "")),
                     str(p.get("pos", "")), str(p.get("avgPx", "")),
                     str(p.get("last", "")), tp or "-", sl or "-", upl_cell,
+                    _colorize_pct(roi_s), _colorize_pct(base_s),
                 )
         if not any_pos:
-            pos_tbl.add_row("(无)", "", "", "", "", "", "", "", "")
+            pos_tbl.add_row("(无)", *([""] * 10))
 
         # === 最近成交表 ===
         # 全账户 · 全历史真实成交(TP/SL/EXIT), 按 exit_time 倒序, 取最近 N 条
         all_recent: list[tuple[str, dict, dict]] = []
         for a in snap:
             for r in a["valid_trades"]:
-                all_recent.append((a["name"], r, a.get("pair_bars") or {}))
+                all_recent.append((a["name"], r, a.get("pair_bars") or {},
+                                   a.get("baseline") or 0.0))
         all_recent.sort(key=lambda x: x[1].get("exit_time") or "", reverse=True)
         total = len(all_recent)
         shown = all_recent[:self.recent_trades_limit]
         title = f"最近成交 (全账户) · 显示 {len(shown)}/{total} 条"
         trade_tbl = Table(title=title,
                           show_header=True, header_style="green", expand=True)
+        # 回报率 = 净盈亏/该笔保证金; 占本金% = 净盈亏/起始本金
         for c in ("时间", "账户", "品种", "周期", "方向", "入场", "出场", "原因",
-                  "名义 PnL", "手续费", "资金费", "净 PnL"):
+                  "名义 PnL", "手续费", "资金费", "净 PnL", "回报率", "占本金%"):
             trade_tbl.add_column(c, no_wrap=True)
         any_t = False
-        for aname, r, pbars in shown:
+        for aname, r, pbars, base in shown:
             any_t = True
             # db.pnl 已是净口径; 名义 = 净 + 手续费 - 资金费(funding 带符号, 收入为正)
             net = r.get("pnl") or 0
@@ -580,15 +750,17 @@ class PositionMonitor:
             style = "green" if net > 0 else ("red" if net < 0 else "")
             net_str = _fmt2(net)
             net_cell = f"[{style}]{net_str}[/{style}]" if style else net_str
+            roi_s, base_s = _trade_pct_cells(r, base)
             trade_tbl.add_row(
                 (r.get("exit_time") or "")[:19], aname,
                 r.get("pair", ""), _bar_of(r, pbars), _dir_zh(r.get("side", "")),
                 str(r.get("entry_price", "")), str(r.get("exit_price", "")),
                 _exit_reason_zh(r.get("exit_reason", "")),
                 _fmt2(pnl), f"{fee:.4f}", f"{funding:+.4f}", net_cell,
+                _colorize_pct(roi_s), _colorize_pct(base_s),
             )
         if not any_t:
-            trade_tbl.add_row("(无)", "", "", "", "", "", "", "", "", "", "", "")
+            trade_tbl.add_row("(无)", *([""] * 13))
 
         # === 组装 (空表隐藏, 省行给非空表) ===
         outer = Table.grid(expand=True)
