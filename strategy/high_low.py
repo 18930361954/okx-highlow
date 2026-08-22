@@ -56,6 +56,8 @@ class HighLowStrategy:
         # 单笔张数封顶(与回测口径一致):BTC 1000, ETH/SOL 5000。
         # pair_overrides.max_contracts 可覆盖。类型 float 以支持 0.01 张精度。
         self.max_contracts_map = s.get("max_contracts") or {}
+        # 持仓超时倍数(信号桶时长的倍数)。0 = 不启用。pair_overrides 可覆盖。
+        self.max_hold_bars = float(s.get("max_hold_bars", 0) or 0)
         self.logger = logger
 
     def max_contracts_for(self, pair: str) -> float | None:
@@ -97,6 +99,19 @@ class HighLowStrategy:
     def mode_for(self, pair: str) -> str:
         """公开版:外部(scheduler/report)需要拿 pair 级 mode。"""
         return self._mode_for(pair)
+
+    def max_hold_bars_for(self, pair: str) -> float:
+        """持仓超时倍数(信号桶时长的倍数)。0/缺省 = 不启用超时强平。
+
+        回测在信号桶末按收盘价强平, 实盘 daily_cancel 只撤未成交挂单、持仓一直持到
+        TP/SL, 单边行情下逆势单会从"桶末小亏"变成"打满 SL"。这个配置把回测的
+        EOB 语义以时间止损形式补回来。"""
+        ov = self.pair_overrides.get(pair) or {}
+        v = ov.get("max_hold_bars", self.max_hold_bars)
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            return 0.0
 
     def reentry_floats_for(self, pair: str) -> list[float]:
         """pair 的日内重挂浮动序列。若无配置或为空 → 返回 []（不启用重挂）。

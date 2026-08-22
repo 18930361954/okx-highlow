@@ -197,6 +197,10 @@ class Reconciler:
         self.last_run_had_net_error: bool = False
         # trade_id → 上次重挂保护的时间戳 ms (防 pending 索引延迟导致重复挂)
         self._rearm_at: dict[int, int] = {}
+        # 本进程内已发出超时平仓请求的 trade_id。市价平仓单没有 TP/SL 字段,
+        # 结算时会被 _infer_exit_reason_by_price 按价格就近误判成 TP/SL —— 据此改标 TIME。
+        # 进程重启会丢(平仓与结算通常隔一轮 20s, 同进程内), 丢了只影响 exit_reason 标签。
+        self._timeout_closed: set[int] = set()
 
     @staticmethod
     def _match_position_history(rows: list[dict], side: str, close_px: float,
@@ -448,9 +452,14 @@ class Reconciler:
                     if fill_px <= 0:
                         continue
                     reason = _infer_exit_reason(exit_)
+                    # 超时强平是市价单, 没有 TP/SL 字段, 按价格就近会被误判成 TP/SL。
+                    # 本进程发过超时平仓请求的直接标 TIME —— 也顺带避免误触发 reentry。
+                    if t.get("id") in self._timeout_closed:
+                        reason = "TIME"
+                        self._timeout_closed.discard(t.get("id"))
                     # 字段兜底失败落到 "EXIT" 时：按 pair 级 tp/sl_pct + 平仓价距离分类。
                     # 关键：SL 分类正确才能触发 _try_reentry。
-                    if reason == "EXIT" and self.strategy is not None:
+                    elif reason == "EXIT" and self.strategy is not None:
                         entry_px = float(t.get("entry_price") or 0)
                         try:
                             tp_pct, sl_pct = self.strategy.tp_sl_for(t.get("pair", ""))
@@ -574,6 +583,10 @@ class Reconciler:
         # 活仓保护兜底: TP/SL OCO 触发后落地限价单未成交 → 撤残单重挂 OCO
         # (2026-07-30 ETH V 反事故: TP 触发未成交, OCO 一次性消耗, SL 裸奔 10h)。
         self._sweep_unprotected_positions()
+
+        # 持仓超时强平: 补回回测的桶末平仓语义, 防单边行情逆势单持到打满 SL。
+        # 放在保护兜底之后 —— 先确保有 TP/SL 保护, 再判超时。
+        self._sweep_hold_timeout()
 
         # 尾部僵尸兜底: 主匹配跑完后,algoId 仍死、bucket 已过、未 entry filled 的 → ORPHAN
         self._sweep_zombie_open()
@@ -1373,6 +1386,87 @@ class Reconciler:
                 if self.logger:
                     self.logger.warning(
                         f"[reconcile] [protect] trade#{tid} {pair} 保护检查失败"
+                        f"(下轮重试): {e}"
+                    )
+
+    def _sweep_hold_timeout(self) -> None:
+        """持仓超时强平: 活仓持有时长超过 max_hold_bars × 信号桶时长 → 市价平仓。
+
+        回测在信号桶末按收盘价强平(EOB), 实盘 daily_cancel 只撤未成交挂单、已成交
+        持仓一直持到 TP/SL。单边行情下逆势单因此从"桶末小亏"变成"打满 SL":
+        2026-08-19 起 ETH +34% 那波, BTC 1D 空单实际持仓 47 小时、SOL 6H 空单 17 小时,
+        各腿盈亏比 1:4~1:8, 一笔满 SL 吃掉 4~8 笔盈利。
+
+        这里把 EOB 语义以时间止损形式补回来 —— 不依赖桶边界, 按 entry_time 起算。
+        平仓走 close_position(autoCxl=True) 连带撤掉 TP/SL OCO, 避免裸单残留;
+        db 不在这里写 exit —— 平仓单会进 orders-history, 下轮 run_once 主匹配正常
+        回填 exit_price/pnl(用 OKX 真值), 与 TP/SL 平仓走同一条结算路径。
+        """
+        strat = getattr(self, "strategy", None)
+        if strat is None or not hasattr(strat, "max_hold_bars_for"):
+            return
+        try:
+            open_trades = self.db.list_open_trades(account=self.account_name)
+        except Exception:
+            return
+        entered = [t for t in open_trades if t.get("entry_time")]
+        if not entered:
+            return
+
+        now = datetime.now(UTC)
+        for t in entered:
+            tid = t.get("id")
+            pair = t.get("pair")
+            side = str(t.get("side") or "").lower()
+            if not pair or side not in ("long", "short"):
+                continue
+            try:
+                mult = float(strat.max_hold_bars_for(pair))
+            except Exception:
+                continue
+            if mult <= 0:
+                continue  # 该 pair 未启用超时强平
+
+            bucket_secs = _BUCKET_SECS.get(self._signal_bar_for(pair), 86400)
+            limit_secs = bucket_secs * mult
+            try:
+                entry_dt = datetime.fromisoformat(str(t["entry_time"]))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=UTC)
+            except (ValueError, TypeError, KeyError):
+                continue
+            held = (now - entry_dt.astimezone(UTC)).total_seconds()
+            if held < limit_secs:
+                continue
+
+            # 冷却复用 _rearm_at: 平仓请求已发出但 OKX 持仓/orders-history 尚未同步时,
+            # 防止下一轮(20s)重复发平仓请求。
+            now_ms = int(now.timestamp() * 1000)
+            if now_ms - self._rearm_at.get(tid, 0) < self._rearm_cooldown_ms:
+                continue
+            try:
+                pos_rows = self.okx.get_positions(instId=pair)
+                pos = next((p for p in pos_rows
+                            if str(p.get("posSide") or "").lower() == side
+                            and float(p.get("pos") or 0) != 0), None)
+                if pos is None:
+                    continue  # 已无持仓: 平仓匹配流程会处理
+                mgn_mode = str(pos.get("mgnMode") or "cross")
+                self.okx.close_position(pair, mgn_mode, posSide=side)
+                self._rearm_at[tid] = now_ms
+                self._timeout_closed.add(tid)
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] [timeout] trade#{tid} {pair} {side} 持仓 "
+                        f"{held/3600:.1f}h ≥ {limit_secs/3600:.1f}h "
+                        f"({mult:g}×{self._signal_bar_for(pair)}) → 已市价平仓, "
+                        f"等对账回填盈亏"
+                    )
+            except Exception as e:
+                self._mark_if_net_error(e)
+                if self.logger:
+                    self.logger.warning(
+                        f"[reconcile] [timeout] trade#{tid} {pair} 超时平仓失败"
                         f"(下轮重试): {e}"
                     )
 

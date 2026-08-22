@@ -1319,3 +1319,148 @@ def test_expire_orphan_normal_state_no_missed_fill_log(tmp_path, caplog):
     r2._expire_as_orphan(row2)
     assert [t for t in db.list_trades(limit=5)
             if t["okx_order_id"] == "E1"][0]["exit_reason"] is None
+
+
+# ==================== 持仓超时强平 (_sweep_hold_timeout) ====================
+
+class FakeStrategyTimeout:
+    """最小 stub: 提供 max_hold_bars_for + signal_bar_for + tp_sl_for。"""
+
+    def __init__(self, max_hold_bars=0.5, signal_bar="6H"):
+        self._mult = max_hold_bars
+        self._bar = signal_bar
+
+    def max_hold_bars_for(self, pair):
+        return self._mult
+
+    def signal_bar_for(self, pair=None):
+        return self._bar
+
+    def tp_sl_for(self, pair):
+        return (0.008, 0.030)
+
+
+def _mk_held_trade(db, held_hours, algo_id="T1", pair="SOL-USDT-SWAP",
+                   side="short"):
+    """插一条已入场、持仓 held_hours 小时的 open trade。"""
+    entry_dt = datetime.now(UTC) - timedelta(hours=held_hours)
+    return db.insert_trade(
+        signal_date="2026-08-18T06:00Z", pair=pair, side=side,
+        entry_price=76.8, margin=10.0, mode="PCT", okx_order_id=algo_id,
+        entry_time=entry_dt.isoformat(), signal_bar="6H",
+    )
+
+
+def _timeout_pos(pair="SOL-USDT-SWAP", side="short", pos="10"):
+    return {"instId": pair, "posSide": side, "pos": pos, "mgnMode": "cross"}
+
+
+def test_timeout_closes_position_past_limit(tmp_path):
+    """6H 桶 × 0.5 = 3h 上限; 持仓 17h → 市价平仓。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=17)
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0.5, "6H"))
+    r._sweep_hold_timeout()
+    assert len(okx.closed_positions) == 1
+    assert okx.closed_positions[0]["instId"] == "SOL-USDT-SWAP"
+    assert okx.closed_positions[0]["posSide"] == "short"
+
+
+def test_timeout_holds_within_limit(tmp_path):
+    """持仓 2h < 3h 上限 → 不平。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=2)
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0.5, "6H"))
+    r._sweep_hold_timeout()
+    assert okx.closed_positions == []
+
+
+def test_timeout_disabled_when_mult_zero(tmp_path):
+    """max_hold_bars=0 → 功能关闭, 无论持多久都不平 (向后兼容默认)。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=99)
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0, "6H"))
+    r._sweep_hold_timeout()
+    assert okx.closed_positions == []
+
+
+def test_timeout_noop_without_strategy(tmp_path):
+    """未注入 strategy → 静默跳过, 不抛。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=99)
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=None)
+    r._sweep_hold_timeout()
+    assert okx.closed_positions == []
+
+
+def test_timeout_exit_labeled_TIME_not_SL(tmp_path):
+    """超时平仓是市价单(无 TP/SL 字段), 结算时必须标 TIME ——
+    否则会被 _infer_exit_reason_by_price 按价格就近误判成 SL 并触发 reentry。"""
+    db, acc = _fresh(tmp_path)
+    tid = _mk_held_trade(db, held_hours=17, algo_id="T9")
+    okx = FakeOKX(positions=[_timeout_pos()])
+    strat = FakeStrategyTimeout(0.5, "6H")
+    r = Reconciler(okx, db, acc, CONFIG, strategy=strat)
+
+    r._sweep_hold_timeout()
+    assert len(okx.closed_positions) == 1
+    assert tid in r._timeout_closed
+
+    # 下一轮: 平仓单进 orders-history, 走主匹配结算。市价单无 category 字段,
+    # 平仓价 79.3 贴近 short SL(76.8×1.03=79.1) → 不标 TIME 就会被判成 SL。
+    # fillTime 必须晚于 entry_time(动态算的 now-17h), 否则 Step2 时间窗口不认。
+    entry_ms = int((datetime.now(UTC) - timedelta(hours=17)).timestamp() * 1000)
+    okx.positions = []
+    okx.history_by_pair = {"SOL-USDT-SWAP": [
+        {"algoId": "T9", "fillPx": "76.8", "fillTime": str(entry_ms),
+         "reduceOnly": "false", "pnl": "0"},
+        {"ordId": "X9", "algoId": "", "fillPx": "79.3",
+         "fillTime": str(entry_ms + 3600_000), "reduceOnly": "true",
+         "posSide": "short", "pnl": "-18"},
+    ]}
+    r.run_once()
+    t = [x for x in db.list_trades(limit=10) if x["id"] == tid][0]
+    assert t["exit_reason"] == "TIME"
+    assert tid not in r._timeout_closed  # 标记已消费
+
+
+def test_timeout_cooldown_prevents_duplicate_close(tmp_path):
+    """平仓请求已发出但 OKX 持仓未同步 → 下一轮不重复发平仓。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=17)
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0.5, "6H"))
+    r._sweep_hold_timeout()
+    r._sweep_hold_timeout()  # 持仓仍在(OKX 未同步), 冷却内不重复
+    assert len(okx.closed_positions) == 1
+
+
+def test_timeout_skips_trade_without_entry_time(tmp_path):
+    """未入场(挂单中)的 trade 不参与超时判定。"""
+    db, acc = _fresh(tmp_path)
+    _mk_open_trade(db, algo_id="P1", pair="SOL-USDT-SWAP")  # entry_time=None
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0.5, "6H"))
+    r._sweep_hold_timeout()
+    assert okx.closed_positions == []
+
+
+def test_timeout_bucket_length_scales_limit(tmp_path):
+    """1D 桶 × 0.5 = 12h 上限: 持仓 10h 不平, 13h 平。"""
+    db, acc = _fresh(tmp_path)
+    _mk_held_trade(db, held_hours=10, algo_id="D1")
+    okx = FakeOKX(positions=[_timeout_pos()])
+    r = Reconciler(okx, db, acc, CONFIG, strategy=FakeStrategyTimeout(0.5, "1D"))
+    r._sweep_hold_timeout()
+    assert okx.closed_positions == []
+
+    db2, acc2 = _fresh(tmp_path / "b")
+    _mk_held_trade(db2, held_hours=13, algo_id="D2")
+    okx2 = FakeOKX(positions=[_timeout_pos()])
+    r2 = Reconciler(okx2, db2, acc2, CONFIG, strategy=FakeStrategyTimeout(0.5, "1D"))
+    r2._sweep_hold_timeout()
+    assert len(okx2.closed_positions) == 1
