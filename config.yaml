@@ -2,16 +2,14 @@ strategy:
   # 顶层 = 兜底默认。每个账户会在 accounts[].strategy 里覆盖 signal_bar 和三币 tp/sl/float。
   # 顶层不再挂 pair_overrides,避免污染每账户配置(以前的"3 币安全档"已迁移到每账户)。
   pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
-  position_pct: 0.10                  # 每笔仓位 10% 保证金,3 币满仓时占 30% 保证金
-  leverage: 100                       # 默认 100x;SOL 由 pair_overrides 覆盖到 50x (实盘 API 上限)
+  position_pct: 0.05                  # 全部账户统一 5% 仓位（2026-08-23 用户决策，基于回测数据对比）
+  leverage: 100                       # 默认 100x;SOL 模拟盘由 pair_overrides 覆盖到 50x (模拟盘 API 上限)
   float_pct: 0.0015                   # 兜底,每账户会覆盖
   tp_pct: 0.012
   sl_pct: 0.005
   trend_filter: true
   max_consecutive_losses: 3
   cooldown_hours: 24
-  fixed_mode_threshold: 800000
-  fixed_mode_margin: 1000
   signal_time_utc: "00:00"
   # 多币下单之间的间隔(秒)。防 OKX algo 单并发限流导致 51149 下单超时。
   place_gap_sec: 1.0
@@ -29,7 +27,8 @@ strategy:
   # 换算: 6H 腿=3h, 4H 腿=2h, 12H 腿=6h, 1D 腿=12h。
   max_hold_bars: 0.5
 
-  # 单笔张数封顶(与回测口径一致)
+  # 单笔张数封顶 (2026-08-23: 按 OKX 100倍档位上限，超过自动降杠杆)
+  # 回测验证: 张数上限比固定保证金封顶收益高 10~12 个月化百分点
   # BTC 1000 张 × 0.01 = 10 BTC/笔;ETH 5000 张 × 0.1 = 500 ETH/笔;SOL 5000 张 × 1 = 5000 SOL/笔
   # 每账户 pair_overrides 可加 max_contracts 单独覆盖
   max_contracts:
@@ -97,8 +96,7 @@ accounts:
     env_adapt: real
     pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
-      # 组合 A 单独 5% 仓位(2026-07-29 决策): 10% 下回测 MDD 60.4% 穿硬停线, 5% 下 31.1%
-      position_pct: 0.05
+      # 组合 A: 全部改为5%仓位(2026-08-23 用户决策,基于回测数据对比)
       signal_bar: 6H
       mode: trend
       pair_overrides:
@@ -164,9 +162,7 @@ accounts:
     env_adapt: demo
     pairs: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
     strategy:
-      # 组合 A 单独 5% 仓位(2026-07-29 用户决策): 10% 下回测 MDD 60.4% 穿 -50% 硬停线
-      # (v1 崩盘同款回撤深度), 5% 下 MDD 31.1% 且 2026 年收益反而更高(+33.9%→+36.8%)。B/C 维持 10%。
-      position_pct: 0.05
+      # 组合 A: 全部改为5%仓位(2026-08-23 用户决策,基于回测数据对比)
       signal_bar: 6H
       mode: trend
       pair_overrides:
