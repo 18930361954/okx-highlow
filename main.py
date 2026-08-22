@@ -472,7 +472,30 @@ def start_bot(config: dict, base_logger, db: DB, with_monitor: bool = True) -> d
         misfire_grace_time=300, coalesce=True, max_instances=1, replace_existing=True,
     )
 
+    # API Key 周检: 每周一 02:30 UTC 探活 config 里全部账户的 key(含停用的)。
+    # OKX Key 有有效期, 过期后挂单/平仓/对账全瘫; 等信号触发才发现可能已有裸仓。
+    from core.apikey_health import run_weekly_check
+
+    def weekly_apikey_check():
+        try:
+            run_weekly_check(config, base_logger)
+        except Exception as e:
+            base_logger.error(f"[apikey-check] 失败: {e}")
+
+    sched.add_job(
+        weekly_apikey_check,
+        trigger=CronTrigger(day_of_week="mon", hour=2, minute=30, timezone=UTC),
+        id="weekly_apikey_check",
+        misfire_grace_time=3600, coalesce=True, max_instances=1, replace_existing=True,
+    )
+
     sched.start()
+
+    # 启动时立刻探活一次 —— 不等到周一。key 过期最怕的就是"重启后才发现"。
+    try:
+        weekly_apikey_check()
+    except Exception as e:
+        base_logger.error(f"[apikey-check] 启动探活失败: {e}")
 
     # 启动全量对账: 修复断网/重启/OKX错误期间的所有不一致
     from core.startup_reconcile import startup_full_reconcile
@@ -573,6 +596,7 @@ _SUBCOMMANDS = {
     "refill-fees":    "scripts.refill_fees",
     "cleanup":        "scripts.cleanup_before_restart",
     "env":            "scripts.switch_env",
+    "check-keys":     "scripts.check_api_keys",
 }
 
 _USAGE = """HighLow Bot v{version}
@@ -587,6 +611,7 @@ fix-orphan      校验并标记未成交 ORPHAN  [--trade-ids 1,2 --apply]
 refill-fees     补拉历史 pnl/fee 真值    [--account 名称 --dry-run]
 cleanup         重启前清场(撤单+ORPHAN)
 env             切换环境                [demo | live] (缺省显示当前状态)
+check-keys      探活全部账户 API Key     [--notify] (含停用账户)
 
 各子命令支持 --help 查看完整参数。"""
 

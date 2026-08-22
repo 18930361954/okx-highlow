@@ -35,6 +35,7 @@ hiddenimports = [
     "scripts.cleanup_before_restart",
     "scripts.cancel_stale_algos",
     "scripts.switch_env",
+    "scripts.check_api_keys",
 ]
 
 _excludes = [
